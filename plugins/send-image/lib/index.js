@@ -23,6 +23,7 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
+import { registerScreenshotRoute } from './screenshot-route.js'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
@@ -225,7 +226,59 @@ export function renderResult(value) {
   return `发送失败：${typeof value?.error === 'string' && value.error.trim().length > 0 ? value.error : '未知原因'}`
 }
 
-function apply(ctx) {
+/**
+ * 工具的实际动作：准备图片（脚本）→ 交给 Host 的附件服务发布。
+ *
+ * 拆出来是为了让 `apply` 只剩"挂哪些入口"，也为了测试能不经过注册表直接跑这一条路径。
+ */
+async function executeSendImage(ctx, args) {
+  const source = resolveSource(args)
+  if (!source.ok) return source
+
+  const script = scriptPath()
+  if (!script) {
+    return {
+      ok: false,
+      error: '找不到采集脚本（send-image.mjs），这个插件本应自带它。'
+        + '请重新安装 dsh-plugin-send-image（例如 dsh plugin add dsh-plugin-send-image）；'
+        + '若只是手工删过文件，重装即可恢复。',
+    }
+  }
+
+  // Capture and validation live in the script (the screencapture/pngpaste
+  // quirks, the screen-recording permission message). It prints one JSON
+  // descriptor and never touches the session: publishing is this tool's job,
+  // which is what keeps the picture out of the user's side of the
+  // transcript.
+  let prepared
+  try {
+    const { stdout } = await run(process.execPath, buildArgs(args, script), {
+      env: process.env,
+      timeout: 120_000,
+    })
+    const line = String(stdout).trim().split('\n').filter(Boolean).at(-1)
+    prepared = JSON.parse(line)
+  } catch (error) {
+    const detail = [error?.stdout, error?.stderr, error?.message]
+      .filter((part) => typeof part === 'string' && part.trim().length > 0)
+      .join('\n')
+      .trim()
+    return { ok: false, error: detail || '准备图片失败' }
+  }
+
+  try {
+    return await publish({
+      attachments: ctx.attachments,
+      prepared,
+      caption: args?.caption,
+    })
+  } finally {
+    discardPrepared(prepared)
+  }
+}
+
+/** 面向 agent 的工具：始终在模型的工具表里。 */
+function registerTool(ctx) {
   ctx.tools.register({
     name: 'send_image',
     description,
@@ -243,51 +296,30 @@ function apply(ctx) {
         return parts
       },
     },
-    async execute(args) {
-      const source = resolveSource(args)
-      if (!source.ok) return source
+    execute: (args) => executeSendImage(ctx, args),
+  })
+}
 
-      const script = scriptPath()
-      if (!script) {
-        return {
-          ok: false,
-          error: '找不到采集脚本（send-image.mjs），这个插件本应自带它。'
-            + '请重新安装 dsh-plugin-send-image（例如 dsh plugin add dsh-plugin-send-image）；'
-            + '若只是手工删过文件，重装即可恢复。',
-        }
-      }
-
-      // Capture and validation live in the script (the screencapture/pngpaste
-      // quirks, the screen-recording permission message). It prints one JSON
-      // descriptor and never touches the session: publishing is this tool's job,
-      // which is what keeps the picture out of the user's side of the
-      // transcript.
-      let prepared
+/**
+ * 宿主半边：agent 工具 + 用户侧截图路由。
+ *
+ * 路由必须**同时**注入 `connection`：围栏服务只在被注入的作用域里取得到（`ctx.get('connection')`
+ * 在插件作用域返回 undefined，001 记过这个坑）。分开注入的写法会让围栏永远取不到、把每个请求都
+ * 判成"不可用"而 403——路由看起来注册成功，实际不可用。
+ *
+ * 生命期：路由的 disposer 交给 `scope.effect`，插件被禁用时路由随之撤销（热插拔的一半在宿主侧）。
+ */
+function apply(ctx) {
+  registerTool(ctx)
+  ctx.inject?.(['webServer', 'connection'], (scope) => {
+    const dispose = registerScreenshotRoute(scope, { logger: ctx.logger })
+    scope.effect?.(() => () => {
       try {
-        const { stdout } = await run(process.execPath, buildArgs(args, script), {
-          env: process.env,
-          timeout: 120_000,
-        })
-        const line = String(stdout).trim().split('\n').filter(Boolean).at(-1)
-        prepared = JSON.parse(line)
-      } catch (error) {
-        const detail = [error?.stdout, error?.stderr, error?.message]
-          .filter((part) => typeof part === 'string' && part.trim().length > 0)
-          .join('\n')
-          .trim()
-        return { ok: false, error: detail || '准备图片失败' }
+        dispose()
+      } catch {
+        /* route table already torn down */
       }
-
-      try {
-        return await publish({
-          attachments: ctx.attachments,
-          prepared,
-          caption: args?.caption,
-        })
-      } finally {
-        discardPrepared(prepared)
-      }
-    },
+    }, 'send-image: screenshot route')
   })
 }
 
