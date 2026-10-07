@@ -723,3 +723,34 @@ test('C-04 臂 2：连接器重连时，中转广播"这台回不来了"只放�
   assert.equal(agent.devices.has('dev_B'), true, 'B 只是手机不在，不许被误伤')
   assert.equal(agent.streams.byDevice('dev_B').length, 1, 'B 的 $events 值班流必须原样留着')
 })
+
+/**
+ * 热插拔（003）：`stop()` 是"禁用插件"这条路上最后一道收尾。宿主把 effect 的清理函数跑掉之后，
+ * 这个 agent 必须一条资源都不留——心跳定时器、relay socket、DSH 客户端、值班流。
+ */
+test('stop() puts everything down: heartbeat, socket, DSH client, device streams', async () => {
+  const { agent, dsh, socket } = makeAgent()
+  await agent.handleRelayFrame(attach('dev_1'))
+  await agent.handleRelayFrame({ t: 'open', id: '1', endpoint: '$events', args: {}, deviceId: 'dev_1' })
+  // 模拟"已连上并跑起心跳"的状态：心跳是连接成功之后才开的定时器。
+  agent.state = 'connected'
+  let heartbeatTicked = false
+  agent._heartbeat = setInterval(() => { heartbeatTicked = true }, 1000)
+
+  await agent.stop()
+
+  assert.equal(agent._heartbeat, undefined, '心跳定时器必须被清掉')
+  assert.equal(agent.socket, undefined, 'relay socket 必须从 agent 上摘掉')
+  assert.equal(socket.closed, true, 'relay socket 必须被关闭')
+  assert.equal(dsh.closed, true, 'DSH 客户端也必须收掉')
+  assert.equal(agent.devices.size, 0, '设备记录随 agent 一起释放')
+  assert.equal(agent.state, 'stopped')
+  assert.equal(heartbeatTicked, false, '清掉之后心跳不能再跑（否则就是泄漏）')
+})
+
+test('stop() is idempotent: a second call is a no-op, not a throw', async () => {
+  const { agent } = makeAgent()
+  await agent.stop()
+  await assert.doesNotReject(() => agent.stop())
+  assert.equal(agent.state, 'stopped')
+})
