@@ -148,6 +148,20 @@ test('the composer gets one button that names the shortcut', () => {
   assert.match(element.props.title, /⌥⌘S/)
   assert.match(element.props.title, /拖拽选择矩形范围/)
   assert.equal(element.props['aria-label'], '截图并附上（⌥⌘S）')
+  assert.equal(element.props.className, 'dsh-send-image-button', '按钮靠 class 拿样式，不是内联样式')
+})
+
+test('the button carries the same hover/focus treatment as the official composer buttons', () => {
+  const { document, nodes } = makeDom()
+  const { api } = loadBundle({ document })
+  const { ctx } = makeCtx()
+  api.apply(ctx)
+  const css = nodes.find((node) => node.id === STYLE_ID).textContent
+  // 与官方输入区按钮同一套 token：悬停底色、聚焦环、统一的圆角
+  assert.match(css, /\.dsh-send-image-button:hover:not\(:disabled\)\{[^}]*--dsw-alias-interactive-bg-hover/)
+  assert.match(css, /\.dsh-send-image-button:focus-visible\{[^}]*--dsw-focus-ring-color/)
+  assert.match(css, /\.dsh-send-image-button\{[^}]*--dsw-radius-sm/)
+  assert.doesNotMatch(css, /dsh-send-image-button[^}]*background:#/, '别写死颜色，跟随主题变量')
 })
 
 test('a cancelled capture says nothing and attaches nothing', async () => {

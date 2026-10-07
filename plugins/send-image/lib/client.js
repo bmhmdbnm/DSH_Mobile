@@ -48,28 +48,29 @@ const ARIA = '截图并附上（⌥⌘S）'
 const SLOT_NAME = 'conversation.input.left'
 const SLOT_ID = 'send-image-screenshot'
 const STYLE_ID = 'dsh-send-image-style'
+const BUTTON_CLASS = 'dsh-send-image-button'
 /** 提示浮层自己消失的时间；插件被禁用时不等它，直接撤掉。 */
 const TOAST_MS = 9000
 
-const BUTTON_STYLE = {
-  display: 'inline-flex',
-  alignItems: 'center',
-  height: '28px',
-  padding: '0 8px',
-  border: 'none',
-  borderRadius: '8px',
-  background: 'transparent',
-  color: 'inherit',
-  cursor: 'pointer',
-  font: 'inherit',
-  fontSize: '13px',
-}
-
+/**
+ * 注入的样式表。按钮那几条**照抄**输入区里官方按钮的观感（工作区 / 智能体预设 / 模型选择器
+ * 用的同一套 token）：同样的圆角、字号、字重、内距，`hover` 换成官方的
+ * `--dsw-alias-interactive-bg-hover`，键盘聚焦给同一条 focus ring。用官方 CSS 变量而不是写死颜色，
+ * 这样跟随主题，也跟旁边按钮在深浅色下表现一致；变量缺失时有兜底值（插件是独立发布的，可能装在没有
+ * 这些 token 的宿主上）。
+ */
 const CSS = [
   '#dsh-send-image-toast{position:fixed;z-index:2147483647;left:50%;transform:translateX(-50%);',
   'bottom:88px;max-width:min(560px,86vw);padding:10px 14px;border-radius:10px;',
   'background:rgba(32,32,36,.96);color:#fff;font-size:13px;line-height:1.5;',
   'box-shadow:0 8px 28px rgba(0,0,0,.28)}',
+  '.dsh-send-image-button{border-radius:var(--dsw-radius-sm,8px);min-height:28px;',
+  'color:var(--dsw-alias-label-primary,inherit);background:none;border:none;cursor:pointer;',
+  'align-items:center;gap:4px;padding:0 8px;font:inherit;font-size:13px;font-weight:500;',
+  'line-height:20px;display:inline-flex}',
+  '.dsh-send-image-button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(15,17,21,.06))}',
+  '.dsh-send-image-button:focus-visible{outline:none;box-shadow:0 0 0 2px var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4176e6))}',
+  '.dsh-send-image-button:disabled{color:var(--dsw-alias-label-quaternary,inherit);cursor:default}',
 ].join('')
 
 /** 出问题时只写日志，绝不把异常抛出插件边界。 */
@@ -221,10 +222,10 @@ function registerButton(ctx, state, React) {
         state.session = props?.sessionId ?? state.session
         return React.createElement('button', {
           type: 'button',
+          className: BUTTON_CLASS,
           title: TITLE,
           'aria-label': ARIA,
           onClick: () => state.runCapture(),
-          style: BUTTON_STYLE,
         }, '⌥⌘S')
       },
     ))
