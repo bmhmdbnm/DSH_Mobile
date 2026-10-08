@@ -34,9 +34,9 @@
       "requiresCopyIn": true
     },
     "l3": {
-      "title": "macOS 客体 VM",
+      "title": "干净环境",
       "entry": "npm run lane:l3",
-      "isolation": "Apple silicon 上的 macOS 客体虚拟机，与宿主环境完全隔离",
+      "isolation": "干净环境：macOS 客体 VM、真实干净机器或干净 CI runner（owner 2026-10-08：在真实环境里跑）",
       "canVerify": [
         "干净机器上从零启用的整条流程（装 App、装连接器、登记、配对、连上）",
         "官方桌面版宿主在\"没装过任何东西\"时的行为",
@@ -44,7 +44,8 @@
       ],
       "cannotVerify": [
         "改动每次都跑（成本高，只用于需要干净机器的结论）",
-        "多台设备并发的规模化结论"
+        "多台设备并发的规模化结论",
+        "非交互地登录 Apple ID（TestFlight 安装那一步仍需人工）"
       ],
       "requiresCopyIn": false
     }

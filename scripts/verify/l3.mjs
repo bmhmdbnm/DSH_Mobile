@@ -15,8 +15,8 @@ import { join } from 'node:path'
 
 export const lane = {
   id: 'l3',
-  title: 'macOS 客体 VM',
-  isolation: 'Apple silicon 上的 macOS 客体虚拟机，与宿主环境完全隔离',
+  title: '干净环境',
+  isolation: '干净环境：macOS 客体 VM / 真实干净机器 / 干净 CI runner（在真实环境里跑）',
   requiresCopyIn: false,
   doctor: doctorL3,
   scenarios: {},
@@ -27,10 +27,11 @@ export function doctorL3({ env = process.env } = {}) {
   const checks = []
   const tart = whichBinary('tart')
   checks.push({
-    name: 'tart 在',
+    name: 'tart 在（本机 VM 路线的前提）',
     ok: Boolean(tart),
     detail: tart ?? 'PATH 上找不到 tart',
-    fix: tart ? undefined : 'brew install cirruslabs/cli/tart',
+    // L3 不要求本机装虚拟机：真实干净机器 / 干净 CI runner 都算，见 README
+    fix: tart ? undefined : '要本机起 VM：brew install cirruslabs/cli/tart；否则在那台干净机器上装本仓库后直接 `npm run lane:l3 -- run --scenario <name>`',
   })
   const images = tart ? run(tart, ['list']) : undefined
   const templates = (images?.stdout ?? '').split('\n').map((line) => line.trim()).filter(Boolean)
@@ -38,7 +39,7 @@ export function doctorL3({ env = process.env } = {}) {
     name: '至少一个 macOS guest 模板',
     ok: templates.length > 0,
     detail: templates[0] ?? 'tart list 为空',
-    fix: '准备一台干净 macOS guest（`tart clone` 自模板），一次性实例跑完即销毁',
+    fix: '准备一个干净环境：本机 `tart clone` 一份 guest 模板，或用真实干净机器 / 干净 CI runner',
   })
   const homedirOk = existsSync(join(env.HOME || homedir(), 'Library'))
   checks.push({

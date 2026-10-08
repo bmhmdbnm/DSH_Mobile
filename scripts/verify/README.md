@@ -11,7 +11,7 @@
 |---|---|---|---|
 | `l1` 同机隔离 | 同一台 Mac、同一份二进制；临时 `HOME`/`DSH_HOME` + 一次性档案 | 宿主起停、插件挂载、连接器与插件单测、端点发现 | 干净机器上的首次启用 |
 | `l2` Linux 容器 | Linux guest 里的容器卷，**代码复制进卷** | 协议层纯函数、插件与脚本单测、web 宿主、relay（含真 Caddy） | 官方桌面版（`.app` 跑不进 Linux）、iOS App |
-| `l3` macOS 客体 VM | Apple silicon 上的 macOS guest | 干净机器从零启用的整条流程、桌面版宿主 | 每次都跑（成本高） |
+| `l3` 干净环境 | 客体 VM / 真实干净机器 / 干净 CI runner | 干净机器从零启用的整条流程、桌面版宿主 | 每次都跑（成本高）；非交互登录 Apple ID |
 
 渠道 ≠ 通道：端到端结论只能在 `l3` 取得，`l1`/`l2` 的证据不得冒充它。
 
@@ -45,15 +45,24 @@ docker pull node:22-bookworm-slim # 确认拉得动（本机直连 Docker Hub �
 是悬空链接、dockerd 会去问 `[::1]:53`。所以这两件事每次都靠上面那条脚本补，
 doctor 则以 `docker info` 自报为准（不看配置文件，免得得到假结论）。
 
-**L3（macOS 客体 VM）**
+**L3（干净环境，在真实环境里跑）**
+
+三种实现都算，任选其一（owner 2026-10-08 决定：不要求本机装虚拟机）：
 
 ```bash
+# a) 本机客体 VM（最方便，但吃磁盘：镜像 ~25.5 GB 压缩 / 50 GB 稀疏盘）
 brew install cirruslabs/cli/tart
 tart clone <干净 guest 模板> dsh-lane-l3      # 一次性实例，跑完删掉
+npm run lane:l3 -- run --scenario onboarding-from-scratch
+
+# b) 真实干净机器（保真最好：能带真机、走真实网络）
+#    在那台机器上装本仓库后直接跑同一条命令
+
+# c) 干净 CI runner（macos-26，Xcode 预装；本地零磁盘，但只有仿真器）
 ```
 
-guest 模板要自己准备一份（干净系统 + 不装任何本项目的东西）；Apple 的 macOS 许可允许在
-Apple 硬件上额外跑虚拟机做开发测试（上限 2 台，具体条款以本机许可为准）。
+本机没装 VM 工具时 `lane:doctor` 会如实报阻塞——这不是"这一级不存在"，而是"本机这条实现不可用"；
+此时要么用 b/c，要么在改动记录里写 `L3: 未跑 — <理由>`（门禁会原样打印，不许静默跳过）。
 
 ## 纪律
 
