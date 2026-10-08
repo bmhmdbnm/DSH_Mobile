@@ -790,3 +790,66 @@ test('新方法只在被调用时才出现，旧方法不受能力声明影响',
   const methods = dsh.calls.filter((entry) => entry.kind === 'rpc').map((entry) => entry.method)
   assert.deepEqual(methods, ['session/list'])
 })
+
+// ── 链路自愈（2026-10-09 真机连不上的两个根因） ─────────────────────────────
+
+// 走真连接路径的 socket 必须实现 `onMessage/onError/onClose`（`#session()` 直接调用它们）。
+class ConnectedSocket extends FakeSocket {
+  onMessage(handler) { this.messageHandler = handler; return this }
+  onError(handler) { this.errorHandler = handler; return this }
+  onClose(handler) { this.closeHandler = handler; return this }
+}
+
+test('看门狗：单次心跳停摆时也会把卡住的会话拆掉重连', async () => {
+  let connects = 0
+  const sockets = []
+  const warnings = []
+  const agent = new MobileLinkAgent({
+    dshClient: new FakeDsh(),
+    logger: { debug() {}, info() {}, warn(message) { warnings.push(message) }, error() {} },
+    relayUrl: 'ws://relay.test',
+    agentId: 'agt_1',
+    agentSecret: 'as_1',
+    // 心跳故意设得极慢：这条用例要证明的是**光靠看门狗**也能恢复。
+    // 看门狗的检查周期有 1 秒下限（生产里不该更密），所以这里等 1.4 秒。
+    heartbeatMs: 60000, pongTimeoutMs: 30, watchdogMs: 40,
+    connectImpl: async () => {
+      connects += 1
+      const socket = new ConnectedSocket()
+      sockets.push(socket)
+      return socket
+    },
+  })
+  agent.identity = { agentId: 'agt_1', agentSecret: 'as_1', relayUrl: 'ws://relay.test' }
+  agent.needsEnroll = false   // 测试环境没有身份文件：直接按"已登记"跑链路
+  await agent.start()
+  // 看门狗 1 秒醒一次动手，之后还有一次退避重连，所以等 3 秒才能看到第二次连接。
+  await new Promise((resolve) => setTimeout(resolve, 3000))
+  await agent.stop()
+  assert.ok(connects >= 2, `看门狗应该重建过连接（实际 ${connects} 次）`)
+  assert.ok(warnings.some((message) => message.includes('看门狗')),
+    `看门狗应该报出它动手了（实际日志：${warnings.join(' | ') || '空'}）`)
+  assert.ok(sockets[0].closed, '卡住的那条 socket 应该被拆掉')
+})
+
+test('重复实例：新 Link 启动会先停掉上一个（热更不会留下两条连接）', async () => {
+  const opts = () => ({
+    dshClient: new FakeDsh(),
+    logger: { debug() {}, info() {}, warn() {}, error() {} },
+    relayUrl: 'ws://relay.test',
+    agentId: 'agt_1',
+    agentSecret: 'as_1',
+    connectImpl: async () => new FakeSocket(),
+  })
+  const first = new MobileLinkAgent(opts())
+  first.identity = { agentId: 'agt_1', agentSecret: 'as_1', relayUrl: 'ws://relay.test' }
+  first.needsEnroll = false
+  await first.start()
+  const second = new MobileLinkAgent(opts())
+  second.identity = { agentId: 'agt_1', agentSecret: 'as_1', relayUrl: 'ws://relay.test' }
+  second.needsEnroll = false
+  await second.start()
+  assert.equal(first.state, 'stopped', '旧实例应该被停掉')
+  assert.notEqual(second.state, 'stopped')
+  await second.stop()
+})

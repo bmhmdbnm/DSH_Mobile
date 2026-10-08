@@ -8,6 +8,16 @@ import { EventEmitter } from 'node:events'
 
 import { DshClient } from './dsh-client.js'
 import { agentEndpoint, decodeFrame, encodeFrame, nextBackoff, normalizeRelayUrl, pongFor } from './dlp.js'
+
+/**
+ * 进程级登记表：**同一个进程里只允许有一条到中转的 agent 连接**。
+ *
+ * 为什么需要它：插件热更会重新求值模块、再建一个 Link，而旧的实例还占着那条连接
+ * （中转只认一个 agent 会话）。新实例于是连不上、手机那侧"连上了却没有链路"。
+ * 2026-10-09 00:00–00:42 真机连不上就是这个：连接器 43 分钟没回来。
+ * 挂在 `globalThis` 上是因为模块重载会把模块作用域清掉，只有进程级才留得住。
+ */
+const LIVE_AGENT = Symbol.for('dsh.mobile-link.live-agent')
 import { enrollAgent, enrollCommand, inviteFrom } from './enroll.js'
 import { handoffFromEndpoint, writeHandoff } from './handoff.js'
 import { statusSnapshot } from './status.js'
@@ -46,6 +56,7 @@ export class MobileLinkAgent extends EventEmitter {
     relayUrl, agentId, agentSecret, agentName, stateFile, dshUrl,
     logger = console, heartbeatMs = 20000, pongTimeoutMs = 60000, maxBackoffMs = 30000,
     random = Math.random, now = Date.now, dshClient, connectImpl = wsConnect, enabled = true,
+    watchdogMs = 180000,
     inviteCode, fetchImpl = fetch, env = process.env,
     // 手机不在时替它攒下来的提问条数上限（见 router.js）；环境变量给部署用，
     // 构造参数给测试用。**没有"留多久"这个旋钮**：`$events` 一直留到设备被撤销。
@@ -57,6 +68,7 @@ export class MobileLinkAgent extends EventEmitter {
     this.heartbeatMs = heartbeatMs
     this.pongTimeoutMs = pongTimeoutMs
     this.maxBackoffMs = maxBackoffMs
+    this.watchdogMs = watchdogMs
     this.random = random
     this.now = now
     this.connectImpl = connectImpl
@@ -103,6 +115,9 @@ export class MobileLinkAgent extends EventEmitter {
     this._inbox = Promise.resolve()
     this._lastPong = 0
     this._loop = undefined
+    this._loopActive = false
+    this._watchdog = undefined
+    this._lastProgressAt = 0
     this._abort = new AbortController()
 
     // The mux is shared by every device, so its events are wired once here.
@@ -202,6 +217,17 @@ export class MobileLinkAgent extends EventEmitter {
       this.emit('status')
       return this
     }
+    // 先把上一个实例停掉（热更留下的那条连接）：不停的话两个实例会抢同一个 agent 会话，
+    // 表现就是"手机连上中转、却等不到任何回复"。
+    const previous = globalThis[LIVE_AGENT]
+    if (previous && previous !== this) {
+      try {
+        await previous.stop()
+      } catch {
+        /* 旧实例停不掉也不能挡住新的 */
+      }
+    }
+    globalThis[LIVE_AGENT] = this
     if (this._loop) return this
     this._stopping = false
     this._abort = new AbortController()
@@ -209,15 +235,22 @@ export class MobileLinkAgent extends EventEmitter {
     this.state = 'connecting'
     // 解析器可能在上一次会话里就已经装好；这里补一次本机发现（失败无妨）。
     void this.refreshLocal()
+    this._lastProgressAt = this.now()
+    this.#startWatchdog()
+    this._loopActive = true
     this._loop = this.#run().catch((error) => {
       this.lastError = messageOf(error)
       this.state = 'failed'
       this.emit('status')
+    }).finally(() => {
+      this._loopActive = false
     })
     return this
   }
 
   async stop() {
+    this.#stopWatchdog()
+    if (globalThis[LIVE_AGENT] === this) globalThis[LIVE_AGENT] = undefined
     this._stopping = true
     this._abort.abort()
     this.#teardownSocket('agent stopped')
@@ -327,6 +360,7 @@ export class MobileLinkAgent extends EventEmitter {
     this.socket = socket
     this.state = 'connected'
     this.connectedAt = this.now()
+    this._lastProgressAt = this.now()
     this.lastError = undefined
     this.router.lastError = undefined
     this._lastPong = this.now()
@@ -363,6 +397,54 @@ export class MobileLinkAgent extends EventEmitter {
     await new Promise((resolve) => {
       this._sessionClosed = resolve
     })
+  }
+
+  /**
+   * 看门狗：**与单次会话的心跳无关**的兜底。
+   *
+   * 心跳只在"连上之后"跑，而且会话卡死时它依赖 `setInterval` 还在（热更把它换掉就没了）。
+   * 看门狗每 `heartbeatMs` 看一次"链路最近有没有进展"：
+   *  * 已连上但超过 `pongTimeoutMs` 没动静 ⇒ 强制拆掉这条 socket（会话随即返回、进重连）；
+   *  * **循环已经不在了**（`_loopActive === false`，典型是热更换掉了实例）⇒ 重新拉起循环。
+   * 正常重连退避期间（循环还在、状态是 connecting/backoff）它什么都不做，只在
+   * 超过 `watchdogMs` 仍无进展时把 socket 拆掉重来一次，避免"半开连接永远挂着"。
+   */
+  #startWatchdog() {
+    this.#stopWatchdog()
+    // 检查频率：至少在"判定超时"的窗口里看两次，最多 5 秒一次、最少 1 秒一次。
+    // 不能跟着 `heartbeatMs` 走——心跳间隔设得大（例如测试里 60s）会让看门狗也 20s 才醒一次。
+    const every = Math.max(1000, Math.min(Math.floor(this.pongTimeoutMs / 2) || 1000, 5000))
+    this._watchdog = setInterval(() => {
+      if (this._stopping || this.enabled === false) return
+      const idle = this.now() - this._lastProgressAt
+      if (!this._loopActive) {
+        this.lastError = `链路循环不在了（看门狗重拉，空闲 ${Math.round(idle / 1000)}s）`
+        this.logger.warn?.(`mobile-link: ${this.lastError}`)
+        this._loop = undefined
+        this._lastProgressAt = this.now()
+        void this.start()
+        return
+      }
+      if (this.state === 'connected' && idle > this.pongTimeoutMs) {
+        this.lastError = `relay 超过 ${Math.round(idle / 1000)}s 没有动静（看门狗拆连接）`
+        this.logger.warn?.(`mobile-link: ${this.lastError}`)
+        this.#teardownSocket(this.lastError)
+        this._lastProgressAt = this.now()
+        return
+      }
+      if (this.state !== 'connected' && idle > this.watchdogMs) {
+        this.lastError = `链路 ${Math.round(idle / 1000)}s 没有进展（看门狗重建连接）`
+        this.logger.warn?.(`mobile-link: ${this.lastError}`)
+        this.#teardownSocket(this.lastError)
+        this._lastProgressAt = this.now()
+      }
+    }, every)
+    this._watchdog.unref?.()
+  }
+
+  #stopWatchdog() {
+    if (this._watchdog) clearInterval(this._watchdog)
+    this._watchdog = undefined
   }
 
   #startHeartbeat() {
@@ -443,9 +525,12 @@ export class MobileLinkAgent extends EventEmitter {
 
   /** Route one frame from the relay. */
   async handleRelayFrame(frame) {
+    // 中转来的任何一帧都算"链路有进展"——看门狗据此区分"半开连接"与"正在正常工作"。
+    this._lastProgressAt = this.now()
     if (!frame || typeof frame !== 'object') return
     if (frame.t === 'pong') {
       this._lastPong = this.now()
+      this._lastProgressAt = this.now()
       return
     }
     if (frame.t === 'ping') {
