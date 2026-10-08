@@ -27,6 +27,34 @@ npm run check:lanes -- --changed-from changed.txt --json   # CI 用
 
 退出码：`0` 齐备；`1` 缺证据或某级 `blocked`/`fail`；`2` 工具自身错误（矩阵坏、入口漂移）。
 
+## 三级各自的前提与补救
+
+`npm run lane:doctor` 会逐项列出；不可用时按它给的 `nextStep` 做。下面是人做的那几步：
+
+**L2（Linux 容器）**
+
+```bash
+brew install colima docker
+colima start                      # 默认就是 vz + virtiofs；内存/CPU 见 ~/.colima/default/colima.yaml
+sh scripts/verify/l2-vm-setup.sh  # 补镜像源 + 修 VM 的 resolv.conf，然后重启 docker
+docker pull node:22-bookworm-slim # 确认拉得动（本机直连 Docker Hub 超时，必须走镜像源）
+```
+
+两个坑写在 `test/CAPABILITY-GAPS.md` 的「环境-8」：colima 每次启动会重写
+`/etc/docker/daemon.json`（它不支持 `registry-mirrors` 键），而镜像里的 `/etc/resolv.conf`
+是悬空链接、dockerd 会去问 `[::1]:53`。所以这两件事每次都靠上面那条脚本补，
+doctor 则以 `docker info` 自报为准（不看配置文件，免得得到假结论）。
+
+**L3（macOS 客体 VM）**
+
+```bash
+brew install cirruslabs/cli/tart
+tart clone <干净 guest 模板> dsh-lane-l3      # 一次性实例，跑完删掉
+```
+
+guest 模板要自己准备一份（干净系统 + 不装任何本项目的东西）；Apple 的 macOS 许可允许在
+Apple 硬件上额外跑虚拟机做开发测试（上限 2 台，具体条款以本机许可为准）。
+
 ## 纪律
 
 - **不碰真实数据**：`l1` 只读真实档案当模板（`cpSync` 复制到临时目录），跑完用

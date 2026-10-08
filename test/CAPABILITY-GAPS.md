@@ -299,3 +299,26 @@
   ① 产品侧：设置页的设备列表限高或折叠（列表长度不随数据无限增长，滚动才有确定行为）；
   ② harness 侧：`scroll_to` 改成「等到内容稳定再滚」（连续两次元素树快照一致才开始），
      并区分「列表还在变」与「确实滚不到」两种失败。
+
+## 环境-8 L2 容器：镜像源与 DNS 会被 colima 重置 ⏳ 有脚本
+
+- **症状**：容器拉不动镜像。两种失败叠在一起：`failed to resolve reference ... dial tcp: lookup
+  registry-1.docker.io on [::1]:53: connection refused`（DNS），以及直连 `registry-1.docker.io`
+  本就超时。
+- **原因**：① colima **每次启动都会重写** VM 里的 `/etc/docker/daemon.json`，而 colima 0.10.3
+  的配置里没有 `registry-mirrors` 这个键——手工写进去的镜像源会被清掉；② 镜像里的
+  `/etc/resolv.conf` 是**悬空**符号链接（systemd-resolved 没跑），dockerd 于是去问 `[::1]:53`；
+  而且 Go 的解析器会把 resolv.conf 缓存住，所以补写之后**必须重启 dockerd**。
+- **解法**：`sh scripts/verify/l2-vm-setup.sh`（幂等：补镜像源、重写 resolv.conf、重启 docker）。
+  跑完 `docker info --format '{{json .RegistryConfig.Mirrors}}'` 应看到镜像源。
+- **注意**：`lane:l2` 的 doctor 以 dockerd 自报（`docker info`）为准，不看 colima 的配置文件——
+  按文件判断会得到假结论。
+
+## 判据-13 共享挂载不转发 inotify，会让"文件监听"类结论假阴性 ⏳ 已知，用机制规避
+
+- **症状**：在容器里 `fs.watch` 一个**共享挂载**（virtiofs/9p/sshfs）的目录，宿主侧改文件时
+  容器里一个事件都收不到——看起来像"宿主没有热更"，其实是观测手段失效。
+- **证据**：`npm run lane:l2 -- run --scenario selfcheck` 里的**反向对照**：同一个 watcher 放在
+  容器卷上能看到 `rename,change`，放在共享挂载上由宿主写入则是 `(none)`。
+- **解法**：L2 的硬约束是**代码复制进卷**（`docker cp` / `COPY`），不靠共享挂载；`selfcheck`
+  把这条对照固化成渠道自检，前提不成立就判 `blocked`，不给结论。
