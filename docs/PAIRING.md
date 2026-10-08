@@ -23,7 +23,7 @@
 | 中转 `agents` 表 | 存在，且 `agentSecret` **只存哈希** |
 | 中转 `accounts` 表 | 存在（`agents_account` 索引），但**未启用** |
 | 配对码 | 中转 `POST /pair/code` 签发（一次性、默认 10 分钟）；连接器 `/mobile-link/pair-code` 取用，手机 `/pair/claim` 兑换 |
-| 二维码 | 连接器 `GET /mobile-link/qr` 出图，内容是 `dsh://pair?relay=…&code=…`；App 扫码或手输配对码 |
+| 二维码 | 连接器 `GET /mobile-link/qr` 出图，内容是 `dsh://pair?relay=…&code=…`；App 扫码或手输配对码。同一张码会一直留在页面上（刷新不换），图案下方写明有效期；它被兑换掉或快过期时页面才换新的 |
 | 设备令牌 | 已签发，按 agent 归属，长期有效并随 `/pair/refresh` 轮换 |
 | 设备管理 | 中转 `GET /devices`、`POST /devices/revoke` + `admin.py device-list`；**App 设置页已可看已配对设备并撤销** |
 | 直连入口 | App 连接页**已去掉**，只保留中转配对；`dsh://direct` 仅 DEBUG 参数 |
@@ -95,6 +95,7 @@ App **必须做能力探测而非版本比较**：老连接器缺某个能力时
 ## 安全待办
 
 - `agentSecret` / `deviceToken` 已只存哈希（已具备）
-- 待确认：配对码有效期与一次性语义、失败限流（`_CLAIM_FAILURES` 已有）、
-  设备撤销后的令牌失效传播
+- 已定：配对码一次性、默认 10 分钟；失败原因在协议上分成 `pair/invalid-code` /
+  `pair/used-code` / `pair/expired-code`，限流见 `_CLAIM_FAILURES`
+- 待确认：设备撤销后的令牌失效传播
 - 待确认：中转上的会话数据是否落盘（当前为纯转发，应保持不落盘）

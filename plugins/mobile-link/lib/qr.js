@@ -551,11 +551,19 @@ export function qrMatrix(text, { mask } = {}) {
  * One path element rather than thousands of rects: small enough to print in a
  * terminal response, and it renders identically. The four-module quiet zone is
  * not decoration — scanners need it to find the symbol at all.
+ *
+ * `caption` draws one line under the symbol. It exists because a pairing code
+ * expires and the page is only a picture: without the line, "还剩多久" is
+ * something a person has to guess, and a guess is what leads to scanning a code
+ * that is already gone. The font stack names the CJK faces explicitly — the
+ * default SVG font renders the caption as boxes on some systems.
  */
-export function qrSvg(text, { scale = 8, quietZone = 4, dark = '#111111', light = '#ffffff', mask } = {}) {
+export function qrSvg(text, { scale = 8, quietZone = 4, dark = '#111111', light = '#ffffff',
+                              mask, caption } = {}) {
   const matrix = qrMatrix(text, mask === undefined ? {} : { mask })
   const size = matrix.length
   const extent = (size + quietZone * 2) * scale
+  const captionHeight = caption ? Math.round(scale * 4.5) : 0
   const segments = []
   for (let row = 0; row < size; row += 1) {
     for (let column = 0; column < size; column += 1) {
@@ -565,12 +573,33 @@ export function qrSvg(text, { scale = 8, quietZone = 4, dark = '#111111', light 
       segments.push(`M${x} ${y}h${scale}v${scale}h-${scale}z`)
     }
   }
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${extent}" height="${extent}"`
-    + ` viewBox="0 0 ${extent} ${extent}" shape-rendering="crispEdges" role="img"`
+  const captionMarkup = caption
+    ? `<text x="${extent / 2}" y="${extent + Math.round(captionHeight * 0.7)}"`
+      + ` text-anchor="middle" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"`
+      + ` font-size="${Math.round(scale * 1.75)}" fill="${dark}">${escapeXml(caption)}</text>`
+    : ''
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${extent}" height="${extent + captionHeight}"`
+    + ` viewBox="0 0 ${extent} ${extent + captionHeight}" role="img"`
     + ` aria-label="DSH 配对二维码">`
-    + `<rect width="${extent}" height="${extent}" fill="${light}"/>`
-    + `<path d="${segments.join('')}" fill="${dark}"/>`
+    + `<rect width="${extent}" height="${extent + captionHeight}" fill="${light}"/>`
+    // crispEdges belongs to the symbol, not to the document: the caption is text,
+    // and rendering *that* without antialiasing is what makes it look broken.
+    + `<path d="${segments.join('')}" fill="${dark}" shape-rendering="crispEdges"/>`
+    + captionMarkup
     + '</svg>'
+}
+
+/**
+ * The five characters that cannot appear literally in XML text.
+ *
+ * The caption is built from a clock and a count, but it is a parameter, so it is
+ * escaped here rather than trusted: an unescaped `&` produces an SVG the browser
+ * refuses to render at all — a pairing screen that shows nothing.
+ */
+function escapeXml(value) {
+  return String(value).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;',
+  }[ch]))
 }
 
 /**

@@ -158,8 +158,26 @@ test('the SVG is a standalone square with a four-module quiet zone', () => {
   // A light background plus one path: without the background the quiet zone
   // would be transparent, and a scanner on a dark surface would not see it.
   assert.match(svg, /<rect width="\d+" height="\d+" fill="#ffffff"\/>/)
-  assert.match(svg, /<path d="M[^"]+" fill="#111111"\/>/)
+  assert.match(svg, /<path d="M[^"]+" fill="#111111"[^>]*\/>/)
   assert.ok(!svg.includes('NaN') && !svg.includes('undefined'))
+})
+
+test('a caption sits under the symbol and grows the document, not the code', () => {
+  const plain = qrSvg('HELLO', { scale: 4 })
+  const captioned = qrSvg('HELLO', { scale: 4, caption: '有效期至 12:19（还剩 9 分钟）' })
+  const matrix = qrMatrix('HELLO')
+  const extent = (matrix.length + 8) * 4
+  // The symbol itself must not move or shrink: a caption that shifted the matrix
+  // would change what the camera sees.
+  assert.ok(captioned.includes(`<path d="${/<path d="([^"]+)"/.exec(plain)[1]}"`))
+  assert.match(captioned, new RegExp(`height="${extent + 18}"`))
+  assert.match(captioned, /<text [^>]*>有效期至 12:19（还剩 9 分钟）<\/text>/)
+  assert.ok(!plain.includes('<text'), '没有说明时不该凭空多出一行字')
+})
+
+test('a caption is escaped, because an unescaped & is an unrenderable page', () => {
+  const svg = qrSvg('HELLO', { caption: 'a & b <c>' })
+  assert.match(svg, />a &amp; b &lt;c&gt;<\/text>/)
 })
 
 test('the SVG contains one path segment per dark module', () => {

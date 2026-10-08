@@ -16,6 +16,11 @@ import { qrSvg } from './qr.js'
 
 const MAX_BODY_BYTES = 64 * 1024
 
+/// How much life a shown pairing code must still have before it is worth
+/// handing out again. Below this the page mints a new one: a code with seconds
+/// left is a scan that fails for a reason the person cannot see.
+const QR_REUSE_FLOOR_MS = 60 * 1000
+
 export function sendJson(res, status, payload) {
   res.statusCode = status
   res.setHeader('content-type', 'application/json; charset=utf-8')
@@ -55,9 +60,25 @@ export async function readJsonBody(req) {
 export function makeGuard(ctx, logger) {
   const connectionOf = () => (typeof ctx.get === 'function' ? ctx.get('connection') : undefined)
   return function guard(req, res, { requireFence = false } = {}) {
+    const connection = connectionOf()
+    const fence = connection?.requestRejection
+    // DSH's contract is "a status when refused, **undefined** when the request
+    // may proceed" — so undefined is a pass, not an absence. Reading it as an
+    // absence is what made every privileged route below answer 403 to everyone
+    // with a perfectly authenticated request: the pairing page and
+    // `POST /pair-code` never got past the guard. The service's own presence is
+    // the only thing that can tell "no fence to consult" apart from "fence says
+    // yes", so that is what is checked here.
+    if (typeof fence !== 'function') {
+      if (requireFence) {
+        sendJson(res, 403, { ok: false, message: 'the DSH connection service is unavailable; refusing a privileged request' })
+        return true
+      }
+      return false
+    }
     let rejection
     try {
-      rejection = connectionOf()?.requestRejection?.(req)
+      rejection = fence.call(connection, req)
     } catch (error) {
       logger.warn?.(`mobile-link: request fence failed: ${error}`)
       sendJson(res, 403, { ok: false, message: 'request rejected by the DSH fence' })
@@ -66,10 +87,6 @@ export function makeGuard(ctx, logger) {
     if (rejection !== undefined && rejection !== null) {
       res.statusCode = Number(rejection) || 403
       res.end()
-      return true
-    }
-    if (requireFence && rejection === undefined) {
-      sendJson(res, 403, { ok: false, message: 'the DSH connection service is unavailable; refusing a privileged request' })
       return true
     }
     return false
@@ -146,6 +163,35 @@ export function registerMobileLinkRoutes(ctx, { agent, logger, config = {} }) {
   //
   // `?format=json` returns the payload and the code without the picture, which
   // is what the automated tests use.
+  //
+  // One code stays on screen for its whole life instead of being re-minted on
+  // every page load. Rotating it on load is how a person ends up scanning a code
+  // the screen no longer shows, or the one their phone already spent, and then
+  // reporting "扫了没反应" — with a single visible code, the picture and the
+  // state can be checked against each other. `shown` is that one code.
+  let shown
+
+  const deviceCount = () => Number(agent.devices?.size ?? 0)
+
+  /// The code to keep showing, or undefined when a fresh one is warranted.
+  ///
+  /// Two ways it stops being usable: it is about to expire (a code handed out
+  /// with seconds left is a scan that fails for no reason the person can see),
+  /// or a device has appeared since it was minted — the only "the code was
+  /// spent" signal a connector gets, since a claim happens at the relay.
+  function heldQr() {
+    if (!shown) return undefined
+    if (Number(shown.minted.expiresAt) - Date.now() < QR_REUSE_FLOOR_MS) return undefined
+    if (shown.devicesAtMint !== deviceCount()) return undefined
+    return shown.minted
+  }
+
+  function remainingCaption(expiresAt) {
+    const minutes = Math.max(0, Math.round((Number(expiresAt) - Date.now()) / 60_000))
+    const clock = new Date(Number(expiresAt)).toTimeString().slice(0, 5)
+    return `有效期至 ${clock}（还剩 ${minutes} 分钟）`
+  }
+
   disposers.push(ctx.webServer.register({
     kind: 'exact',
     path: QR_ROUTE,
@@ -159,21 +205,26 @@ export function registerMobileLinkRoutes(ctx, { agent, logger, config = {} }) {
       }
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
       const ttlMs = ttlFrom(url.searchParams.get('ttlMs'), Number(config.pairTtlMs) || 10 * 60 * 1000)
-      let minted
-      try {
-        minted = await agent.mintPairCode({ ttlMs })
-      } catch (error) {
-        sendJson(res, 502, { ok: false, code: 'relay/unavailable', message: String(error?.message ?? error) })
-        return
+      let minted = heldQr()
+      const reused = minted !== undefined
+      if (!reused) {
+        try {
+          minted = await agent.mintPairCode({ ttlMs })
+        } catch (error) {
+          sendJson(res, 502, { ok: false, code: 'relay/unavailable', message: String(error?.message ?? error) })
+          return
+        }
+        shown = { minted, devicesAtMint: deviceCount() }
       }
       const payload = minted.qrPayload
+      const caption = remainingCaption(minted.expiresAt)
       const wantsJson = (url.searchParams.get('format') ?? '').toLowerCase() === 'json'
-      logger.info?.(`mobile-link: rendered a pairing QR for ${minted.agentId}`)
+      logger.info?.(`mobile-link: ${reused ? 're-rendered' : 'minted'} a pairing QR for ${minted.agentId}`)
       if (wantsJson) {
-        sendJson(res, 200, { ok: true, ...minted, svg: qrSvg(payload) })
+        sendJson(res, 200, { ok: true, ...minted, reused, svg: qrSvg(payload, { caption }) })
         return
       }
-      sendSvg(res, 200, qrSvg(payload))
+      sendSvg(res, 200, qrSvg(payload, { caption }))
     },
   }))
 

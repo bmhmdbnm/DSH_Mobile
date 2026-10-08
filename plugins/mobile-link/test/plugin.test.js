@@ -77,7 +77,12 @@ function fakeContext({ fence = 'allow', injectable = true } = {}) {
   const connection = fence === 'missing'
     ? undefined
     : {
-      requestRejection: () => (fence === 'allow' ? null : fence),
+      // DSH 的真实契约：拒绝时给状态码，**放行时给 undefined**
+      // （`Connection.requestRejection` 的实现就是 `isAuthenticated ? undefined : 401`）。
+      // 夹具必须照抄这一点——用 null 表示放行曾把一个真 bug 藏了起来：
+      // 插件把 undefined 当成"没有栅栏服务"，于是所有需要栅栏的路由对
+      // 已认证的浏览器请求一律 403，配对页和 `POST /pair-code` 谁都用不了。
+      requestRejection: () => (fence === 'allow' ? undefined : fence),
       authenticatedUrl: (base) => `${base}/?token=test-token`,
     }
   const get = (service) => (service === 'connection'
@@ -277,6 +282,73 @@ test('GET /mobile-link/qr rejects other methods', async () => {
   assert.equal(res.headers.allow, 'GET')
 })
 
+// 屏幕上那张码只在该换的时候换：刷新页面不该换掉它，被用掉或快过期了才换。
+// 这条是"扫了没反应"的一半原因——页面上那张和手机扫到的那张不是同一个状态。
+
+/** Runs `fn` with the prototype's `devices` map reporting a fixed size. */
+async function withDeviceCount(read, fn) {
+  const proto = plugin.MobileLinkAgent.prototype
+  const original = Object.getOwnPropertyDescriptor(proto, 'devices')
+  Object.defineProperty(proto, 'devices', { configurable: true, get: () => ({ size: read() }) })
+  try {
+    return await fn()
+  } finally {
+    Object.defineProperty(proto, 'devices', original)
+  }
+}
+
+test('GET /mobile-link/qr keeps one code until it is spent, then mints the next', async () => {
+  const { ctx, routes } = fakeContext()
+  plugin.apply(ctx, BASE_CONFIG)
+  let mints = 0
+  let devices = 0
+  // 第二张码只剩 30 秒：不足以再扫一次，页面应该自己换掉它。
+  const stub = async () => {
+    mints += 1
+    return {
+      ...MINTED,
+      expiresAt: Date.now() + (mints === 2 ? 30_000 : 600_000),
+      qrPayload: `${MINTED.qrPayload}-${mints}`,
+    }
+  }
+  const render = async () => {
+    const res = fakeResponse()
+    await routes.get('/mobile-link/qr').handler(fakeRequest('GET', undefined, '/mobile-link/qr'), res)
+    return res.body
+  }
+
+  await withMint(stub, () => withDeviceCount(() => devices, async () => {
+    const first = await render()
+    assert.equal(mints, 1)
+    assert.match(first, /有效期至 \d\d:\d\d/, '页面上要写清楚这张码还能用多久')
+    assert.equal(await render(), first, '同一张码在刷新时被换掉，人就会去扫屏幕上那张旧的')
+    assert.equal(mints, 1)
+
+    devices = 1 // 一台手机用它配上来了
+    const second = await render()
+    assert.equal(mints, 2, '码被用掉之后必须换一张')
+    assert.notEqual(second, first)
+
+    await render()
+    assert.equal(mints, 3, '剩下的时间不够再扫一次时也要换一张')
+  }))
+})
+
+test('GET /mobile-link/qr?format=json says whether the code was re-used', async () => {
+  const { ctx, routes } = fakeContext()
+  plugin.apply(ctx, BASE_CONFIG)
+  const render = async () => {
+    const res = fakeResponse()
+    await routes.get('/mobile-link/qr').handler(
+      fakeRequest('GET', undefined, '/mobile-link/qr?format=json'), res)
+    return JSON.parse(res.body)
+  }
+  await withMint(async () => ({ ...MINTED }), async () => {
+    assert.equal((await render()).reused, false)
+    assert.equal((await render()).reused, true)
+  })
+})
+
 test('detectHostForm reads evidence from the process, never from inherited env', () => {
   // 官方桌面版：入口脚本是私有的 dsh-desktop-host，或可执行文件在应用包里。
   assert.equal(plugin.detectHostForm({ argv: ['node', '/x/@deepseek-ai/dsh-desktop-host/lib/index.js'], execPath: '/usr/bin/node' }), 'desktop')
@@ -324,4 +396,21 @@ test('with no connection service the routes stay registered and the privileged o
   await routes.get('/mobile-link/qr').handler(fakeRequest('GET'), qr)
   assert.equal(qr.statusCode, 403, '铸造凭据的路由必须失败关闭')
   assert.match(qr.body, /connection service is unavailable/)
+})
+
+test('a fence that says yes (undefined) is a pass, not a missing service', async () => {
+  // 回归：DSH 放行时返回 undefined。以前这条被当成"栅栏服务不存在"，
+  // 结果是浏览器带着正确凭据打开 `/mobile-link/qr` 永远 403。
+  const { ctx, routes } = fakeContext({ fence: 'allow' })
+  plugin.apply(ctx, BASE_CONFIG)
+  await withMint(async () => ({ ...MINTED }), async () => {
+    const qr = fakeResponse()
+    await routes.get('/mobile-link/qr').handler(fakeRequest('GET', undefined, '/mobile-link/qr'), qr)
+    assert.equal(qr.statusCode, 200, '栅栏放行就必须放行')
+    assert.match(qr.body, /^<svg /)
+
+    const pair = fakeResponse()
+    await routes.get('/mobile-link/pair-code').handler(fakeRequest('POST', {}), pair)
+    assert.equal(pair.statusCode, 200, 'pair-code 同样必须能过')
+  })
 })
