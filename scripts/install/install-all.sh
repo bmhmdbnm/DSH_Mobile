@@ -11,13 +11,16 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 step() { printf '\n\033[1;36m>>>\033[0m %s\n' "$1"; }
 
-step "1/3 安装 skill"
+step "1/4 安装 skill"
 "$REPO/scripts/install/install-skills.sh"
 
-step "2/3 注册插件"
+step "2/4 注册插件"
 "$REPO/scripts/install/install-plugin.sh"
 
-step "3/3 检查"
+step "3/4 打开源码热更（改插件源码不用重启）"
+node "$REPO/scripts/dev/plugin-hmr.mjs" on
+
+step "4/4 检查"
 node -e "
 const { existsSync } = require('node:fs')
 const { homedir } = require('node:os')
@@ -39,4 +42,6 @@ if (!existsSync(skill)) process.exitCode = 1
 "
 
 printf '\n\033[1;33m需要重启 DSH 才会生效\033[0m（插件与 skill 在启动时加载）。\n'
+echo "重启一次之后：改插件源码（lib/*.js）保存即生效，不必再重启；新增/删除插件、改配置仍需重启。"
+echo "关掉源码热更：node $REPO/scripts/dev/plugin-hmr.mjs off（同样要重启一次）"
 echo "重启后验证：node $REPO/scripts/dev/dsh-probe.mjs status"
