@@ -53,17 +53,27 @@
     {
       "id": "protocol",
       "title": "协议层（DSHKit / DLP 编解码 / 契约向量）",
-      "globs": ["ios/DSHMobile/DSHKit/**", "test/contract/**", "docs/relay-contract.json", "docs/dsh-rpc-catalog.json"]
+      "globs": [
+        "ios/DSHMobile/DSHKit/**",
+        "test/contract/**",
+        "docs/relay-contract.json",
+        "docs/dsh-rpc-catalog.json"
+      ]
     },
     {
       "id": "plugin",
       "title": "自研插件（连接器与图片插件）",
-      "globs": ["plugins/**"]
+      "globs": [
+        "plugins/**"
+      ]
     },
     {
       "id": "host-web",
       "title": "宿主：命令行 web 版",
-      "globs": ["plugins/mobile-link/lib/dsh-client.js", "scripts/install/install-plugin.sh"]
+      "globs": [
+        "plugins/mobile-link/lib/dsh-client.js",
+        "scripts/install/install-plugin.sh"
+      ]
     },
     {
       "id": "host-desktop",
@@ -79,17 +89,28 @@
     {
       "id": "ios-app",
       "title": "iOS App",
-      "globs": ["ios/DSHMobile/DSHMobile/**", "ios/DSHMobile/DSHMobile.xcodeproj/**"]
+      "globs": [
+        "ios/DSHMobile/DSHMobile/**",
+        "ios/DSHMobile/DSHMobile.xcodeproj/**"
+      ]
     },
     {
       "id": "relay",
       "title": "中转 relay",
-      "globs": ["relay/**"]
+      "globs": [
+        "relay/**"
+      ]
     },
     {
       "id": "e2e",
       "title": "端到端链路（App → relay → 连接器 → 本机 DSH）",
-      "globs": ["test/cases/**", "test/tools/**", "test/run.sh", "docs/PAIRING.md", "docs/RELAY-PROTOCOL.md"]
+      "globs": [
+        "test/cases/**",
+        "test/tools/**",
+        "test/run.sh",
+        "docs/PAIRING.md",
+        "docs/RELAY-PROTOCOL.md"
+      ]
     }
   ],
   "matrix": [
@@ -151,9 +172,8 @@
     {
       "subject": "host-desktop",
       "lane": "l1",
-      "value": "required",
-      "reason": "桌面版宿主是推荐路径，能在隔离 HOME 起第二实例就优先在 L1 验",
-      "prerequisite": "前提待实测：隔离 HOME 下能否起第二个实例（见 research 决策 2 的三层退路）"
+      "value": "not-applicable",
+      "reason": "实测（lane:l1 --scenario desktop-instance）：隔离 HOME 下直接拉 app 二进制，进程立即退出，没有新宿主、临时 HOME 里也没有 Library/ 目录——桌面版的数据目录与单实例锁都不认 HOME，隔离只能靠 L3 的干净 guest"
     },
     {
       "subject": "host-desktop",

@@ -98,10 +98,11 @@ test('改动 → 被测对象：多命中取并集', () => {
   assert.deepEqual(matchSubjects(matrix, [CONNECTOR_FILE]), ['plugin'])
 })
 
-test('改动 → 必跑集合：连接器只要 L1+L2，安装路径要 L1+L3，App 只要 L1', () => {
+test('改动 → 必跑集合：连接器只要 L1+L2，安装路径要 L3，App 只要 L1', () => {
   const matrix = loadMatrix()
   assert.deepEqual(requiredLanes(matrix, [CONNECTOR_FILE]).required, ['l1', 'l2'])
-  assert.deepEqual(requiredLanes(matrix, [INSTALL_FILE]).required, ['l1', 'l3'])
+  // 桌面版宿主只有 L3 能验（隔离 HOME 起不来第二个实例，见 research 决策 2）
+  assert.deepEqual(requiredLanes(matrix, [INSTALL_FILE]).required, ['l3'])
   assert.deepEqual(requiredLanes(matrix, [APP_FILE]).required, ['l1'])
   assert.deepEqual(requiredLanes(matrix, ['docs/PRIVACY.md']).required, [])
 })
@@ -244,9 +245,15 @@ test('渠道入口：正常场景写出四态证据且能读回', async () => {
 test('CI 模式：L1/L2 由作业覆盖，L3 仍要声明（声明原样留痕，不是"验过"）', () => {
   const root = tempDir()
   try {
+    // CI 跑得了的格子（连接器 → L1+L2）：不再要求本机证据
+    const ci = gate({ changed: [CONNECTOR_FILE], evidenceRoot: root, ci: true })
+    assert.deepEqual(ci.required, ['l1', 'l2'])
+    assert.deepEqual(ci.covered, ['l1', 'l2'])
+    assert.equal(ci.exitCode, 0)
+
+    // CI 跑不了的格子（安装路径 → 桌面版 → L3）：必须留痕
     const bare = gate({ changed: [INSTALL_FILE], evidenceRoot: root, ci: true })
-    assert.deepEqual(bare.required, ['l1', 'l3'])
-    assert.ok(bare.covered.includes('l1'))
+    assert.deepEqual(bare.required, ['l3'])
     assert.deepEqual(bare.missing, ['l3'])
     assert.equal(bare.exitCode, 1)
 
