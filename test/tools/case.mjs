@@ -74,7 +74,16 @@ function fields(line) {
 /// Chinese while the engine keeps its mechanical directives.
 const ACTIONS = [
   { match: /^连接本机 DSH$/, to: () => ['launch connect=auto'] },
-  { match: /^不连接 DSH$/, to: () => ['launch connect=none'] },
+  // `不连接 DSH screen=sessions args="-DSHOpenScreen,connections,-DSHConnectURL,dsh://pair?…"`：
+  // 启动，但不按运行器自己那条连接链接走。
+  //
+  // 为什么需要：运行器总会先塞一个 `-DSHConnectURL`（DEBUG 直连），而 App 只读
+  // **第一个**——要把 `dsh://pair?relay=…&code=…` 这样的链接交给 App（例如核对
+  // 配对失败的三句文案），就必须连"别自己连"这一点一起能表达。`screen=` 用来挑
+  // 落点页面（页面根锚点由运行器按 screens 表核对）。两个参数都不写时行为与原来
+  // 完全一样。
+  { match: /^不连接 DSH(?:\s+screen=(\S+))?(?:\s+args=(\S+))?$/, to: (screen, args) =>
+      [`launch connect=none${screen ? ` screen=${screen}` : ''}${args ? ` args=${args}` : ''}`] },
   // `打开页面 settings args=-DSHDemoMode`: extra launch arguments for this page.
   // A page may need one the screen table cannot know about — `-DSHDemoMode`
   // swaps the deployment's real addresses for placeholders so the screenshot is

@@ -6,8 +6,12 @@
 # 之后在手机上打开安装链接点一下即可，不需要数据线，也不需要 Mac 与手机
 # 在同一个 Wi-Fi：安装包和清单都放在公网服务器上。
 #
-# 用法: ./scripts/release/deploy-ota.sh [--no-build]
-#   --no-build  复用已有的 .ipa，只重新上传（改安装页文案时用）
+# 用法: ./scripts/release/deploy-ota.sh [--no-build] [--skip-profile]
+#   --no-build      复用已有的 .ipa，只重新上传（改安装页文案时用）
+#   --skip-profile  直接用 Xcode 里已装好的那张开发描述文件，不找 ASC 要新的。
+#                   ASC 侧协议到期/未签时（`REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED`）
+#                   会连 `bundleIds` 都查不了，而签名这张描述文件本来能用到 2027 年，
+#                   这条退路让"只是改了几行文案也要发一版"不至于被卡住。
 #
 # 回滚：服务器上删除 /opt/dsh-relay/public/ios/ 即可，Caddy 路由仍在受管
 #       块里，`relay/deploy/deploy.sh --uninstall` 会一并移除。
@@ -42,7 +46,14 @@ PUBLIC_BASE="https://${HOST}/ios"
 OTA_PROFILE_NAME="${DSH_OTA_PROFILE:-DSH Mobile Development Push}"
 
 SKIP_BUILD=0
-[ "${1:-}" = "--no-build" ] && SKIP_BUILD=1
+SKIP_PROFILE=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-build) SKIP_BUILD=1 ;;
+    --skip-profile) SKIP_PROFILE=1 ;;
+    *) printf 'error: 未知参数 %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
 
 step() { printf '\n\033[1;36m>>>\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -76,8 +87,25 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   # 归档直接失败（"doesn't include the aps-environment entitlement"）。
   # 现在改为：这一步用 ASC API Key 打开 capability 并签一张带推送的开发描述文件，
   # 归档时按名字手工指定它（与 TestFlight 那条路同一套做法）。
-  step "准备开发描述文件（带 aps-environment）"
-  node "$ROOT/scripts/release/asc-dev-signing.mjs" profile
+  if [ "$SKIP_PROFILE" -eq 0 ]; then
+    step "准备开发描述文件（带 aps-environment）"
+    node "$ROOT/scripts/release/asc-dev-signing.mjs" profile
+  else
+    step "复用 Xcode 里已装好的描述文件「${OTA_PROFILE_NAME}」（--skip-profile）"
+    found=""
+    for dir in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
+               "$HOME/Library/MobileDevice/Provisioning Profiles"; do
+      [ -d "$dir" ] || continue
+      for file in "$dir"/*.mobileprovision; do
+        [ -e "$file" ] || continue
+        name=$(security cms -D -i "$file" 2>/dev/null | plutil -extract Name raw -o - - 2>/dev/null || true)
+        [ "$name" = "$OTA_PROFILE_NAME" ] && found="$file"
+      done
+    done
+    [ -n "$found" ] || die "本机没有名为「${OTA_PROFILE_NAME}」的描述文件：去掉 --skip-profile 让脚本去 ASC 签一张"
+    expiry=$(security cms -D -i "$found" | plutil -extract ExpirationDate raw -o - -)
+    echo "    用 ${found}（到期 ${expiry}）"
+  fi
 
   # 归档这一步 xcodebuild 的输出经过 tail 折叠，所以「没有任何输出」是正常的，
   # 不是卡住：一次 Release 归档通常 1~3 分钟。中途 Ctrl-C 会留下半成品和
