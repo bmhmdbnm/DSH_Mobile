@@ -1,17 +1,79 @@
 {
   "protocolVersion": 1,
   "maxFrameBytes": 33554432,
-  "capabilities": ["file-transfer", "events", "session-streams", "pair-code", "qr-pairing", "self-enroll", "git", "background-transfer"],
-  "deviceToAgent": ["req", "open", "cancel", "eventResult", "ping", "hello"],
-  "agentToDevice": ["res", "item", "end", "streamError", "event", "hostStatus", "pong", "error"],
-  "relayControl": ["deviceAttach", "deviceDetach"],
-  "agentControl": ["notify", "fsPutBegin", "fsPutChunk", "fsPutEnd", "fsPutAck", "fsPutDone", "fsGetBegin", "fsGetChunk", "fsGetEnd", "fsGetAck", "fsErr"],
-  "relayToAgentControl": ["fsGetCancel"],
+  "capabilities": [
+    "file-transfer",
+    "events",
+    "session-streams",
+    "pair-code",
+    "qr-pairing",
+    "self-enroll",
+    "git",
+    "background-transfer",
+    "history-window",
+    "session-search"
+  ],
+  "deviceToAgent": [
+    "req",
+    "open",
+    "cancel",
+    "eventResult",
+    "ping",
+    "hello"
+  ],
+  "agentToDevice": [
+    "res",
+    "item",
+    "end",
+    "streamError",
+    "event",
+    "hostStatus",
+    "pong",
+    "error"
+  ],
+  "relayControl": [
+    "deviceAttach",
+    "deviceDetach"
+  ],
+  "agentControl": [
+    "notify",
+    "fsPutBegin",
+    "fsPutChunk",
+    "fsPutEnd",
+    "fsPutAck",
+    "fsPutDone",
+    "fsGetBegin",
+    "fsGetChunk",
+    "fsGetEnd",
+    "fsGetAck",
+    "fsErr"
+  ],
+  "relayToAgentControl": [
+    "fsGetCancel"
+  ],
   "fetchBeginFields": {
-    "required": ["deviceId", "bid", "scopeId", "path", "offset"],
-    "optional": ["window", "replaces"]
+    "required": [
+      "deviceId",
+      "bid",
+      "scopeId",
+      "path",
+      "offset"
+    ],
+    "optional": [
+      "window",
+      "replaces"
+    ]
   },
-  "idFrames": ["req", "open", "cancel", "res", "item", "end", "streamError", "eventResult"],
+  "idFrames": [
+    "req",
+    "open",
+    "cancel",
+    "res",
+    "item",
+    "end",
+    "streamError",
+    "eventResult"
+  ],
   "errorFrame": {
     "shape": {
       "code": "string",
@@ -22,7 +84,11 @@
   },
   "defaultErrorCodes": {
     "connector": "gateway/failed",
-    "ios": ["relay/failed", "relay/stream-failed", "relay/error"]
+    "ios": [
+      "relay/failed",
+      "relay/stream-failed",
+      "relay/error"
+    ]
   },
   "closeCodes": {
     "4011": "quota/device-daily",
@@ -30,9 +96,22 @@
     "4008": "backpressure"
   },
   "hostStatusInfo": {
-    "producedByConnector": ["online", "agentId", "name", "dshPort", "protocol"],
-    "producedByRelay": ["online", "agentId", "name", "version"],
-    "readByIOS": ["online"]
+    "producedByConnector": [
+      "online",
+      "agentId",
+      "name",
+      "dshPort",
+      "protocol"
+    ],
+    "producedByRelay": [
+      "online",
+      "agentId",
+      "name",
+      "version"
+    ],
+    "readByIOS": [
+      "online"
+    ]
   },
   "framing": {
     "fragmentedOnly": "relay→device",
