@@ -4,6 +4,14 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。三处部署（App / 连接器 / 中转）的组合见
 [`docs/VERSIONING.md`](docs/VERSIONING.md)。
 
+## App 1.0（开发版 20261008.0623）— 2026-10-08
+
+- **配对失败分三种原因，各说各的话**：以前手机上只显示中转那一句英文
+  `invalid, used, or expired`，人和运维都无从下手。现在 `pair/invalid-code` /
+  `pair/used-code` / `pair/expired-code` 各配一句中文，并且三句都指向同一步动作：
+  回电脑刷新二维码页、扫新出现的那张（一张码只能配一台设备，配第二台要先让页面换新码）。
+  仿真器上用三种真实状态的码逐条核对过（用例 `TC-MOB-39`，三张截图无截断、无叠字）。
+
 ## App 1.0 — 2026-09-22
 
 iOS 客户端这一天的改动（TestFlight 构建 `20260922.1913` 起）：

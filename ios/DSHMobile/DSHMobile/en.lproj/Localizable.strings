@@ -607,3 +607,8 @@ It is registered as a workspace first, so a new group appears in the desktop sid
 "这个连接的凭据已失效，请重新配对" = "This connection's credential is no longer valid. Pair again.";
 "网络超时，可以再点一次发送" = "The network timed out. You can send it again.";
 "网络中断，可以再点一次发送" = "The network dropped. You can send it again.";
+
+/* 配对失败分三种原因（中转的 pair/used-code 等），各说清下一步 */
+"这个配对码已经用过了，请在电脑上刷新二维码页，扫新出现的那张" = "That pairing code has already been used. Refresh the QR page on your computer and scan the new one.";
+"这个配对码已经过期，请在电脑上刷新二维码页，扫新出现的那张" = "That pairing code has expired. Refresh the QR page on your computer and scan the new one.";
+"配对码不对，请核对电脑上显示的配对码" = "That pairing code is not right. Check the code shown on your computer.";

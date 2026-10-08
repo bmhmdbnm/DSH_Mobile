@@ -798,6 +798,15 @@ public final class ConnectionStore {
                 return String(localized: "电脑上的连接器不在线，请确认电脑开着 DSH 后再试")
             case "auth/invalid-token", "auth/unauthorized":
                 return String(localized: "这个连接的凭据已失效，请重新配对")
+            // 配对失败原来只有一句"配对码无效、已用或过期"，用户没法判断是打错了
+            // 还是拿着屏幕上那张旧码又扫了一次。中转现在把三种原因分开报（`pair/...`），
+            // 这里各给一句话，而且都说清下一步：回电脑刷新二维码页。
+            case "pair/used-code":
+                return String(localized: "这个配对码已经用过了，请在电脑上刷新二维码页，扫新出现的那张")
+            case "pair/expired-code":
+                return String(localized: "这个配对码已经过期，请在电脑上刷新二维码页，扫新出现的那张")
+            case "pair/invalid-code":
+                return String(localized: "配对码不对，请核对电脑上显示的配对码")
             default:
                 break
             }
