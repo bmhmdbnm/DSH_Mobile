@@ -5,6 +5,7 @@
  *   node scripts/dev/profile-parity.mjs            # 有差异即非零退出（默认，用于闸门）
  *   node scripts/dev/profile-parity.mjs --report   # 只报告，始终 0（人工看差异）
  *   node scripts/dev/profile-parity.mjs --json     # 机器可读
+ *   node scripts/dev/profile-parity.mjs --allow-missing   # 放过"某个宿主没装过"
  *
  * 为什么需要：官方桌面版用 `profiles/desktop`，命令行 web 版用 `profiles/web`，
  * 两个档案的**插件与配置互相独立**。只在一边做过的事，换宿主就会失效——实测过两次：
@@ -16,94 +17,44 @@
  * 检查三类：
  *   1. dependencies（装了哪些插件）
  *   2. dsh.profile.bundles（哪些 bundle 被启用）
- *   3. cordis.patch.yml 的顶层条目：**id 集合 + 规范化内容**
+ *   3. `cordis.patch.yml` 的顶层条目：**id 集合 + 规范化内容**
  *
- * 内容比较是"规范化文本比较"：注释、空行、行内多余空白、标量两端的引号都不参与，
- * 顺序参与。这样"改了一个超时值 / 删了一个模型 / 换了默认档"都会报出来，
- * 而纯粹的排版差异不会。刻意不引 YAML 依赖：仓库保持零新增依赖，
- * 而档案是我们自己写的、形状固定（顶层 `- id:` / `- insert:`）。
+ * 内容比较是"规范化文本比较"（见 `profile-patch.mjs`）：注释、空行、行内多余空白、
+ * 标量两端的引号都不参与，顺序参与。这样"改了一个超时值 / 删了一个模型 / 换了默认档"
+ * 都会报出来，而纯粹的排版差异不会。
  *
  * 退出码：0 = 对等；1 = 有差异**或某个档案整个不存在**（`--allow-missing` 可放过后者，
  * 用于只装了单宿主的机器）；2 = 工具自身出错。
  */
 
 import { existsSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
-const PROFILES = { web: join(HOME, 'profiles', 'web'), desktop: join(HOME, 'profiles', 'desktop') }
+import { HOST_OWNED, PROFILE_NAMES, blocksOf, dshHome, profileDir } from './profile-patch.mjs'
+
+const HOME = dshHome()
 const asJson = process.argv.includes('--json')
 const strict = !process.argv.includes('--report')
 const allowMissing = process.argv.includes('--allow-missing')
-
-/**
- * 只属于某一个档案的配置块：不算差异，但**出现在另一边**要报出来。
- *
- * - desktop：官方桌面版启动/保存设置时自己写的客户端设置，web 档案不需要；
- * - web：`ui-settings-general` 的「欢迎公告已确认版本」。owner 2026-10-08 决定不镜像到
- *   桌面版（它的正常归宿是用户点一次「继续」自动记录；见 specs/004-desktop-host-parity/spec.md FR-005）。
- */
-const HOST_OWNED = {
-  desktop: new Set(['ui-chat', 'ui-settings', 'ui-settings-account']),
-  web: new Set(['ui-settings-general']),
-}
 
 function readJson(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return undefined }
 }
 
-/** 规范化的内容行：去注释、去空行、去缩进、压缩空白、去标量两端引号。 */
-function canonical(lines) {
-  const out = []
-  for (const raw of lines) {
-    const line = raw.trim()
-    if (line === '' || line.startsWith('#')) continue
-    const collapsed = line.replace(/\s+/g, ' ').replace(/:\s*'([^']*)'$/, ': $1').replace(/:\s*"([^"]*)"$/, ': $1')
-    out.push(collapsed)
-  }
-  return out.join('\n')
-}
-
-/**
- * 顶层 patch 条目：`- id: <name>` 与 `- insert:` 各算一条。
- * 缩进的 `- id:`（insert 的子项）不切分。
- */
-function patchBlocks(path) {
-  if (!existsSync(path)) return []
-  const blocks = []
-  let current
-  for (const line of readFileSync(path, 'utf8').split('\n')) {
-    if (/^- id: /.test(line) || /^- insert:/.test(line)) {
-      if (current) blocks.push(current)
-      current = { head: line, lines: [line] }
-    } else if (current) {
-      current.lines.push(line)
-    }
-  }
-  if (current) blocks.push(current)
-  return blocks.map((block) => {
-    const named = /^- id: (\S+)/.exec(block.head)
-    if (named) return { id: named[1], body: canonical(block.lines) }
-    const inner = [...block.lines.join('\n').matchAll(/^\s+- id: (\S+)/gm)].map((m) => m[1])
-    return { id: `insert(${inner.join(', ')})`, body: canonical(block.lines), insert: true }
-  })
-}
-
-function profileState(dir) {
+function profileState(name) {
+  const dir = profileDir(name, HOME)
   if (!existsSync(join(dir, 'package.json'))) return undefined
   const manifest = readJson(join(dir, 'package.json'))
   return {
+    dir,
     deps: Object.keys(manifest?.dependencies ?? {}),
     bundles: manifest?.dsh?.profile?.bundles ?? [],
-    blocks: patchBlocks(join(dir, 'cordis.patch.yml')),
+    blocks: blocksOf(join(dir, 'cordis.patch.yml')),
   }
 }
 
-const missingProfiles = Object.entries(PROFILES).filter(([, dir]) => !existsSync(join(dir, 'package.json')))
-const states = Object.fromEntries(
-  Object.entries(PROFILES).map(([name, dir]) => [name, profileState(dir) ?? { deps: [], bundles: [], blocks: [] }]),
-)
+const states = Object.fromEntries(PROFILE_NAMES.map((name) => [name, profileState(name) ?? { deps: [], bundles: [], blocks: [] }]))
+const missingProfiles = PROFILE_NAMES.filter((name) => states[name].dir === undefined)
 
 const findings = []
 const hostOwnedSeen = { web: [], desktop: [] }
@@ -112,7 +63,7 @@ function setGaps(field, other, mine, side) {
   for (const item of other) {
     if (mine.has(item)) continue
     if (field === 'patches') {
-      const owner = Object.keys(HOST_OWNED).find((name) => HOST_OWNED[name].has(item) && name !== side)
+      const owner = PROFILE_NAMES.find((name) => name !== side && HOST_OWNED[name].has(item))
       if (owner) { hostOwnedSeen[owner].push(item); continue }
     }
     findings.push({ field, item, missingIn: side, kind: 'missing' })
@@ -129,22 +80,19 @@ if (missingProfiles.length === 0) {
     setGaps(field, desktop, web, 'web')
   }
 
-  {
-    const web = new Map(states.web.blocks.map((b) => [b.id, b]))
-    const desktop = new Map(states.desktop.blocks.map((b) => [b.id, b]))
-    setGaps('patches', web.keys(), new Set(desktop.keys()), 'desktop')
-    setGaps('patches', desktop.keys(), new Set(web.keys()), 'web')
-    for (const [id, block] of web) {
-      const other = desktop.get(id)
-      if (other && other.body !== block.body) findings.push({ field: 'patches', item: id, kind: 'drift' })
-    }
-    // 宿主专属块出现在另一边：不是缺块，是错位，照样要报。
-    for (const side of ['web', 'desktop']) {
-      const mine = states[side].blocks.map((b) => b.id)
-      for (const id of mine) {
-        const owner = Object.keys(HOST_OWNED).find((name) => HOST_OWNED[name].has(id))
-        if (owner && owner !== side) findings.push({ field: 'patches', item: id, kind: 'misplaced', owner, side })
-      }
+  const web = new Map(states.web.blocks.map((b) => [b.id, b]))
+  const desktop = new Map(states.desktop.blocks.map((b) => [b.id, b]))
+  setGaps('patches', web.keys(), new Set(desktop.keys()), 'desktop')
+  setGaps('patches', desktop.keys(), new Set(web.keys()), 'web')
+  for (const [id, block] of web) {
+    const other = desktop.get(id)
+    if (other && other.body !== block.body) findings.push({ field: 'patches', item: id, kind: 'drift' })
+  }
+  // 宿主专属块出现在另一边：不是缺块，是错位，照样要报。
+  for (const side of PROFILE_NAMES) {
+    for (const id of states[side].blocks.map((b) => b.id)) {
+      const owner = PROFILE_NAMES.find((name) => HOST_OWNED[name].has(id))
+      if (owner && owner !== side) findings.push({ field: 'patches', item: id, kind: 'misplaced', owner, side })
     }
   }
 }
@@ -158,6 +106,7 @@ function fixHint(finding) {
       ? `那条 \`- insert:\`（子项：${finding.item.slice('insert('.length, -1)}）整段`
       : `\`- id: ${finding.item}\` 那一段`
     return `把 ${from} 档案里 ${what}原文复制进 ${finding.missingIn}/cordis.patch.yml，再重启 ${host}`
+      + `（或一条命令：node scripts/dev/profile-parity-apply.mjs --write）`
   }
   if (finding.kind === 'missing' && finding.field === 'deps') {
     const cli = finding.missingIn === 'desktop' ? '应用包里的 dsh（npm 版拒绝管理 desktop 档案）' : 'dsh'
@@ -175,12 +124,13 @@ function fixHint(finding) {
 const ok = findings.length === 0 && (missingProfiles.length === 0 || allowMissing)
 
 if (asJson) {
-  process.stdout.write(`${JSON.stringify({ states, findings, missingProfiles: missingProfiles.map(([n]) => n) }, null, 2)}\n`)
+  process.stdout.write(`${JSON.stringify({ states, findings, missingProfiles }, null, 2)}\n`)
 } else {
-  for (const name of ['web', 'desktop']) {
+  for (const name of PROFILE_NAMES) {
     const s = states[name]
-    const skipped = missingProfiles.some(([n]) => n === name)
-    process.stdout.write(`${name}: ${skipped ? '档案不存在（跳过）' : `插件 ${s.deps.length} · bundle ${s.bundles.length} · 配置块 ${s.blocks.length}`}\n`)
+    process.stdout.write(missingProfiles.includes(name)
+      ? `${name}: 档案不存在（跳过）\n`
+      : `${name}: 插件 ${s.deps.length} · bundle ${s.bundles.length} · 配置块 ${s.blocks.length}\n`)
   }
   process.stdout.write('\n')
   if (hostOwnedSeen.desktop.length) {
@@ -202,7 +152,7 @@ if (asJson) {
       for (const f of findings) process.stdout.write(`  · ${f.item}：${fixHint(f)}\n`)
     }
     if (missingProfiles.length) {
-      process.stdout.write(`跳过的档案：${missingProfiles.map(([n]) => `${n}（没装过该宿主）`).join('、')}——对等检查只在两个档案都存在时有意义。\n`)
+      process.stdout.write(`跳过的档案：${missingProfiles.map((n) => `${n}（没装过该宿主）`).join('、')}——对等检查只在两个档案都存在时有意义。\n`)
     }
   }
 }
