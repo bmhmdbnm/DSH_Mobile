@@ -39,36 +39,42 @@ export async function runScenario({ registry, laneId, scenario, evidenceRoot = E
   const id = runId(new Date(), scenario)
   const outDir = join(evidenceRoot, laneId, id)
   mkdirSync(outDir, { recursive: true })
-  const startedAt = new Date().toISOString()
-  const base = { lane: laneId, runId: id, scenario, startedAt }
+  const base = { lane: laneId, runId: id, scenario, startedAt: new Date().toISOString() }
 
   if (definition === undefined) {
-    const verdict = blockedVerdict({
-      base,
-      reason: `渠道 ${laneId} 里没有场景 ${scenario}`,
-      nextStep: `可选场景：${Object.keys(lane.scenarios ?? {}).join('、') || '（还没有实现，见 specs/006-verify-lanes/tasks.md）'}`,
-      argv: ['lane', laneId, 'run', '--scenario', scenario],
+    return persist({
+      verdict: blockedVerdict({
+        base,
+        reason: `渠道 ${laneId} 里没有场景 ${scenario}`,
+        nextStep: `可选场景：${Object.keys(lane.scenarios ?? {}).join('、') || '（还没有实现，见 specs/006-verify-lanes/tasks.md）'}`,
+        argv: ['lane', laneId, 'run', '--scenario', scenario],
+      }),
+      evidenceRoot, outDir,
     })
-    writeEvidence({ root: evidenceRoot, verdict })
-    return verdict
   }
 
   const health = safeDoctor(lane, env)
   if (!health.available && !force) {
-    const verdict = blockedVerdict({
-      base,
-      reason: health.blockedReason,
-      nextStep: health.nextStep,
-      argv: ['lane', laneId, 'doctor'],
-      note: '自检未通过，未执行场景',
+    return persist({
+      verdict: blockedVerdict({
+        base,
+        reason: health.blockedReason,
+        nextStep: health.nextStep,
+        argv: ['lane', laneId, 'doctor'],
+        note: '自检未通过，未执行场景',
+      }),
+      evidenceRoot, outDir,
     })
-    writeEvidence({ root: evidenceRoot, verdict })
-    return verdict
   }
 
   log(`lane ${laneId}: 跑场景 ${scenario} → ${outDir}`)
   const result = await definition.run({ outDir, env, log, root: REPO_ROOT })
-  const verdict = {
+  return persist({ verdict: assembleVerdict({ base, laneId, scenario, result }), evidenceRoot, outDir })
+}
+
+/** 把场景返回的东西补成一份完整证据包。 */
+function assembleVerdict({ base, laneId, scenario, result }) {
+  return {
     ...base,
     status: result.status,
     commands: result.commands ?? [{ argv: ['lane', laneId, 'run', '--scenario', scenario], exitCode: 0 }],
@@ -79,7 +85,17 @@ export async function runScenario({ registry, laneId, scenario, evidenceRoot = E
     notes: result.note,
     finishedAt: new Date().toISOString(),
   }
-  writeEvidence({ root: evidenceRoot, verdict })
+}
+
+/** 写证据；不合法时把原始内容留在 outDir，别让几分钟的实跑白跑。 */
+function persist({ verdict, evidenceRoot, outDir }) {
+  try {
+    writeEvidence({ root: evidenceRoot, verdict })
+  } catch (error) {
+    const fallback = join(outDir, 'verdict.invalid.json')
+    writeFileSync(fallback, `${JSON.stringify(verdict, null, 2)}\n`)
+    throw new Error(`${error.message}\n  （原始证据已留在 ${fallback}）`)
+  }
   return verdict
 }
 

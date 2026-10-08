@@ -284,6 +284,26 @@ test('CI 模式：L1/L2 由作业覆盖，L3 仍要声明（声明原样留痕�
   }
 })
 
+test('缺证据时带出那一级的 doctor 原因（T031）', () => {
+  const root = tempDir()
+  try {
+    const registry = {
+      l3: {
+        title: '假渠道',
+        doctor: () => ({ available: false, checks: [], blockedReason: '没装 tart', nextStep: 'brew install circlabs/cli/tart' }),
+        scenarios: {},
+      },
+    }
+    const result = gate({ changed: [INSTALL_FILE], evidenceRoot: root, registry })
+    assert.equal(result.exitCode, 1)
+    assert.deepEqual(result.missing, ['l3'])
+    assert.equal(result.hints.l3.blockedReason, '没装 tart')
+    assert.ok(result.hints.l3.nextStep.includes('tart'))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('矩阵自己能被加载且合法（真实仓库这一份）', () => {
   const matrix = loadMatrix()
   assert.deepEqual(validateMatrix(matrix), [])

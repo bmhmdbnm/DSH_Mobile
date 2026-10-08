@@ -17,6 +17,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
 import { readEvidence } from '../verify/evidence.mjs'
+import { createRegistry } from '../verify/lane.mjs'
 import { REPO_ROOT, loadMatrix, requiredLanes, validateLaneEntries, validateMatrix } from '../verify/matrix.mjs'
 
 const DEFAULT_EVIDENCE_ROOT = join(REPO_ROOT, '.lanes', 'runs')
@@ -139,7 +140,7 @@ function parseArgs(argv) {
   return { changed, require, flags }
 }
 
-export function gate({ changed = [], from, require: forced = [], evidenceRoot = DEFAULT_EVIDENCE_ROOT, matrixPath, ci = false, l3Declaration = '' } = {}) {
+export function gate({ changed = [], from, require: forced = [], evidenceRoot = DEFAULT_EVIDENCE_ROOT, matrixPath, ci = false, l3Declaration = '', registry } = {}) {
   const matrix = loadMatrix(matrixPath)
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'))
   const issues = [...validateMatrix(matrix), ...validateLaneEntries(matrix, pkg.scripts ?? {})]
@@ -161,6 +162,35 @@ export function gate({ changed = [], from, require: forced = [], evidenceRoot = 
     required,
     ci,
     ...verdict,
+    hints: laneHints(verdict.missing, registry ?? safeRegistry()),
+  }
+}
+
+/**
+ * 缺证据时顺手问一句那一级"现在能不能跑"：缺工具就说缺什么、下一步装什么。
+ * 不这么做的话，使用者只会看到一行 MISS，得自己猜到"其实这一级根本没装"（T031）。
+ */
+function laneHints(missing, registry) {
+  const hints = {}
+  for (const lane of missing) {
+    const definition = registry?.[lane]
+    if (definition === undefined) continue
+    try {
+      const report = definition.doctor({ env: process.env })
+      if (!report.available) hints[lane] = { blockedReason: report.blockedReason, nextStep: report.nextStep }
+    } catch (error) {
+      hints[lane] = { blockedReason: `doctor 抛错：${error.message}`, nextStep: '先修 doctor 自身' }
+    }
+  }
+  return hints
+}
+
+/** 拿不到渠道定义时不要连累判定：提示是附加信息，不是判据。 */
+function safeRegistry() {
+  try {
+    return createRegistry()
+  } catch {
+    return {}
   }
 }
 
@@ -175,7 +205,11 @@ function format(result) {
     else if (result.exempt.some((item) => item.lane === lane)) {
       const item = result.exempt.find((entry) => entry.lane === lane)
       lines.push(`  声明    ${lane} — ${item.reason}（${why}）`)
-    } else lines.push(`  MISS    ${lane} — ${why}${result.stale[lane] ? `；${result.stale[lane]}` : ''}`)
+    } else {
+      const hint = result.hints?.[lane]
+      const suffix = hint ? `；这一级当前不可用：${hint.blockedReason} → ${hint.nextStep}` : ''
+      lines.push(`  MISS    ${lane} — ${why}${result.stale[lane] ? `；${result.stale[lane]}` : ''}${suffix}`)
+    }
   }
   for (const block of result.blocked) lines.push(`  BLOCKED ${block.lane} — ${block.reason}；下一步：${block.nextStep}`)
   if (!result.ok) {
