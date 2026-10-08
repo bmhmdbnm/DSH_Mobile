@@ -34,3 +34,26 @@
         enabled: true
         heartbeatMs: 20000
         reconnect: true
+
+# 手机端的「新建会话 → 浏览电脑目录」走 RPC `directoryPicker/list`，而这个方法**只有
+# browse 后端提供**。官方 `directory-picker-auto` 在 macOS / Windows + 回环地址下必然
+# 解析成 native（系统弹窗），于是任何 macOS/Windows 电脑上的手机都浏览不了目录——这是
+# 产品级缺陷，不是本机配置问题，所以在这里声明，而不是往某个 profile 的
+# cordis.patch.yml 里手抄（那个文件在 ~/.dsh 下，不在仓库里，换机/重装就会丢）。
+#
+# 官方在 `@deepseek-ai/dsh-web-app` 的 bundle patch 里写明了这种用法：
+#   "Mount -native or -browse directly in an overlay to pin the interaction."
+# 一个 context 只能挂一个后端，所以这里停掉 auto、直接挂 browse 的那一对
+# （host 后端 + 客户端界面）。代价：电脑端「选目录」从系统弹窗变成应用内浏览器。
+#
+# 插入按 id 去重：如果某个 profile 的 cordis.patch.yml 里还留着同样一段（本机 004
+# 之前的历史状态），两边同时写不会挂两次——已实测，客户端图里只出现一条。
+- id: directory-picker
+  name: '@deepseek-ai/dsh-host-directory-picker-auto'
+  disabled: true
+
+- insert:
+    - id: directory-picker-browse
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: directory-picker-browse-ui
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
