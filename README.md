@@ -51,7 +51,9 @@
      （普通 npm 版 `dsh` 会拒绝该档案，这是官方设计）。宿主形态的识别判据（双击图标启动还是敲命令启动）见
      [`docs/ONBOARDING.md`](docs/ONBOARDING.md)。
 3. 登记到中转：`dsh-mobile-link enroll --invite <邀请码> --relay wss://<中转地址>/dsh-link`
-4. 重启 DSH：`dsh web`
+4. 让连接器用上这个身份：重启一次宿主（`dsh web`），或在启动时就带上邀请码
+   （`DSH_MOBILE_LINK_INVITE=<邀请码> dsh web`）。**第 2 步装插件本身不需要重启**——命令行 web 宿主会
+   自己把新装的插件挂上；桌面版按应用内提示。
 5. 手机 App →「扫码配对」，扫描电脑上的二维码。二维码可在 DSH 界面的「移动端连接」打开，或访问
    `http://127.0.0.1:<端口>/mobile-link/qr`（端口看宿主启动时打印的那一行，或状态里的 `dsh.port`）。
 

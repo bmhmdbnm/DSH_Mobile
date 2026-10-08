@@ -163,15 +163,27 @@ dsh-mobile-link enroll --invite ABCD-EFGH-JKLM-NPQR --relay wss://<中转地址>
 成功后身份写在 `~/.dsh/mobile-link/agent.json`，**这台电脑以后不用再登记**。
 （也可以用环境变量代替参数：`DSH_MOBILE_LINK_INVITE=<码> dsh web`，适合写进服务配置。）
 
-### 第 4 步：重启 DSH
+### 第 4 步：让连接器用上刚登记的身份
 
-连接器是跑在 DSH 进程里的插件，**不重启等于没装**：
+**装插件本身不需要重启**：命令行 web 宿主会自己把新装的插件挂上（实测：装完不重启，连接器当场出现在
+宿主里，宿主进程都没换）。桌面版由应用自己管插件，按应用内的提示做。
+
+需要「重新加载一次」的是**登记**：连接器在没身份的时候会放弃那一轮运行，所以第 3 步登记完之后要让它
+重新读一次身份。两条路：
 
 ```bash
+# 路一：重启宿主（最省事，也是默认说法）
 ps -eo pid,lstart,command | grep 'bin/dsh web' | grep -v grep   # 看现在的进程
 # 退出 DSH 后重新启动
 dsh web
 ```
+
+```bash
+# 路二：启动时就把邀请码给它——登记与连接在同一次启动里完成，不用重启
+DSH_MOBILE_LINK_INVITE=<邀请码> dsh web
+```
+
+（路二就是第 3 步里的环境变量写法；中转地址也可以用 `DSH_RELAY_URL` 一起给。）
 
 ### 第 5 步：扫码配对
 
