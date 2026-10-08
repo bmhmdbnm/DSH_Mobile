@@ -16,6 +16,7 @@ import { FileInbox, FILE_BEGIN, FILE_CHUNK, FILE_END, isFileMethod } from './fil
 import { FileFetcher, FSGET_CANCEL } from './files-out.js'
 import { GitBridge, isGitMethod } from './git.js'
 import { isHelloMethod, helloPayload, parseClientInfo } from './hello.js'
+import { isHistoryMethod } from './history.js'
 
 /**
  * 后台大文件上传的桥接帧（relay → 连接器），名字见 `docs/relay-contract.json`
@@ -109,6 +110,9 @@ export class DeviceRouter {
       logger,
     })
     this.git = new GitBridge(logger)
+    // 历史窗口/检索（spec 007）：由 index.js 注入宿主 `sessionQuery` 后交给它。
+    // 没绑上就回 `link/unsupported`，手机端退回 `session/page`。
+    this.history = undefined
   }
 
   #changed() {
@@ -428,6 +432,24 @@ export class DeviceRouter {
           ok: false,
           error: errorObject(error?.code ?? 'git/failed', messageOf(error), error?.details ?? {}),
         }
+      }
+      this.send(deviceId, resultFrame(frame.id, result, deviceId))
+      return
+    }
+
+    // History reads run here too (spec 007): the Host owns a seq-exact reader but
+    // does not expose it on the remote surface the phone talks to. Answered
+    // locally when the injected `sessionQuery` is present; otherwise the phone is
+    // told plainly that the capability is missing, so it can keep using
+    // `session/page` instead of reading the failure as "no older history".
+    if (isHistoryMethod(frame.method)) {
+      let result
+      try {
+        result = this.history === undefined
+          ? { ok: false, error: errorObject('link/unsupported', 'history reads are unavailable on this connector') }
+          : await this.history.handle(frame.method, frame.args ?? {})
+      } catch (error) {
+        result = { ok: false, error: errorObject(error?.code ?? 'link/failed', messageOf(error), error?.details ?? {}) }
       }
       this.send(deviceId, resultFrame(frame.id, result, deviceId))
       return

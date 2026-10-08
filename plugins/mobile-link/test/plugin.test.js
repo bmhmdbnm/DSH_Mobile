@@ -111,8 +111,16 @@ test('apply registers every route through ctx.inject and starts the agent', () =
   const { ctx, routes, effects, injected } = fakeContext()
   plugin.apply(ctx, BASE_CONFIG)
   assert.deepEqual([...routes.keys()].sort(), ['/mobile-link/pair-code', '/mobile-link/qr', '/mobile-link/status'])
-  assert.deepEqual(injected, [['webServer'], ['webServer', 'connection']])
+  // `sessionQuery` is injected **optionally**: history reads fall back to
+  // `session/page` when the Host does not have the service (spec 007 FR-002).
+  assert.deepEqual(injected, [['webServer'], ['webServer', 'connection'], ['sessionQuery']])
   assert.ok(effects.some(([label]) => label.includes('DLP agent')))
+})
+
+test('the history probe route stays unregistered unless explicitly enabled', () => {
+  const { ctx, routes } = fakeContext()
+  plugin.apply(ctx, BASE_CONFIG)
+  assert.equal(routes.has('/mobile-link/history-probe'), false)
 })
 
 test('apply survives a missing webServer service', () => {

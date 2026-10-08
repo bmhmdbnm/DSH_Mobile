@@ -754,3 +754,39 @@ test('stop() is idempotent: a second call is a no-op, not a throw', async () => 
   await assert.doesNotReject(() => agent.stop())
   assert.equal(agent.state, 'stopped')
 })
+
+// ---------------------------------------------------------------------------
+// T057：旧 App + 新连接器。新能力（`history-window` / `session-search`）只是**多出来的两条**，
+// 旧手机走的 `session/page` / `session/follow` 必须一个字节都不变——不改写参数、不裁剪回复。
+// 这条是"新连接器不会把老 App 弄坏"的机器证据（真旧版 App 构建没法在本机跑，见 T057 的说明）。
+// ---------------------------------------------------------------------------
+
+test('session/page 与 session/follow 在新连接器上仍原样透传', async () => {
+  const { agent, dsh, socket } = makeAgent({
+    responses: { 'session/page': { ok: true, value: { events: [{ seq: 2445 }], hasMore: true } } },
+  })
+  await agent.handleRelayFrame(attach())
+  // 参数里带着 host 的 `{request: …}` 信封，连接器不许动它：
+  const args = { request: { address: { kind: 'session', sessionId: 's-1' }, beforeSeq: 2445, maxMessages: 60 } }
+  await agent.handleRelayFrame({ t: 'req', id: '11', method: 'session/page', args, deviceId: 'dev_1' })
+  const call = dsh.calls.find((entry) => entry.kind === 'rpc')
+  assert.equal(call.method, 'session/page')
+  assert.deepEqual(call.args, args, '参数被改写了')
+  assert.deepEqual(socket.last('res').value, { events: [{ seq: 2445 }], hasMore: true }, '回复被裁剪了')
+
+  // 流式那条也一样：endpoint 与 args 原样交给 host。
+  const open = { t: 'open', id: '12', endpoint: 'session/follow',
+    args: { request: { address: { kind: 'session', sessionId: 's-1' } } }, deviceId: 'dev_1' }
+  await agent.handleRelayFrame(open)
+  const forwarded = dsh.opens().find((entry) => entry.endpoint === 'session/follow')
+  assert.deepEqual(forwarded.args, open.args)
+})
+
+test('新方法只在被调用时才出现，旧方法不受能力声明影响', async () => {
+  const { agent, dsh } = makeAgent()
+  await agent.handleRelayFrame(attach())
+  // 握手声明的能力里多了两条（`hello.js`），但这不该让连接器去碰旧方法的路由：
+  await agent.handleRelayFrame({ t: 'req', id: '13', method: 'session/list', args: { request: {} }, deviceId: 'dev_1' })
+  const methods = dsh.calls.filter((entry) => entry.kind === 'rpc').map((entry) => entry.method)
+  assert.deepEqual(methods, ['session/list'])
+})

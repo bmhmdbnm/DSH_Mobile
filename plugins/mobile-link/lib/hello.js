@@ -57,6 +57,10 @@ function readManifestVersion() {
 export const SERVER_CAPABILITIES = [
   'file-transfer', 'events', 'session-streams', 'pair-code', 'qr-pairing', 'self-enroll', 'git',
   'background-transfer',
+  // history-window: the connector answers `_link/sessionWindow` (exact seq window);
+  // session-search: it answers `_link/sessionFind` (in-session literal search). The
+  // phone switches channels on these and falls back to `session/page` without them.
+  'history-window', 'session-search',
 ]
 
 export function isHelloMethod(method) {

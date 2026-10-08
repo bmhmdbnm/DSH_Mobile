@@ -28,6 +28,7 @@
 
 import { MobileLinkAgent } from './link.js'
 import { registerMobileLinkRoutes } from './routes.js'
+import { createHistoryService } from './history.js'
 
 /** Cordis function-plugin name (the loader row id is separate). */
 export const name = 'mobile-link'
@@ -116,10 +117,10 @@ function startAgent(ctx, agent, logger) {
 }
 
 /** 三条本机 HTTP 路由；只依赖 `webServer`，缺了也不影响链路。 */
-function registerRoutes(ctx, agent, logger, config) {
+function registerRoutes(ctx, agent, logger, config, history) {
   try {
     ctx.inject(['webServer'], (scope) => {
-      const disposers = registerMobileLinkRoutes(scope, { agent, logger, config })
+      const disposers = registerMobileLinkRoutes(scope, { agent, logger, config, history })
       scope.effect?.(() => () => {
         for (const dispose of disposers) {
           try {
@@ -155,6 +156,22 @@ function wireEndpointResolver(ctx, agent, logger) {
 }
 
 /**
+ * 把宿主的会话查询服务交给历史能力（**可选注入**）。
+ *
+ * 拿不到就保持"不支持"：宿主里没有这个服务（旧版本）时，历史能力回 `link/unsupported`，
+ * 手机端继续走 `session/page`。这条注入刻意独立于链路本身——注入失败不影响连接器运行。
+ */
+function wireSessionQuery(ctx, history, logger) {
+  try {
+    ctx.inject(['sessionQuery'], (scope) => {
+      history.bindQuery(scope.sessionQuery)
+    })
+  } catch (error) {
+    logger.warn?.(`mobile-link: session query unavailable (history falls back): ${error}`)
+  }
+}
+
+/**
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {Record<string, unknown>} rawConfig
  */
@@ -162,10 +179,13 @@ export function apply(ctx, rawConfig) {
   const config = { ...DEFAULTS, ...asRecord(rawConfig) }
   const logger = ctx.logger ?? console
   const agent = buildAgent(config, logger)
+  const history = createHistoryService({ logger })
+  agent.setHistoryService?.(history)
 
   startAgent(ctx, agent, logger)
-  registerRoutes(ctx, agent, logger, config)
+  registerRoutes(ctx, agent, logger, config, history)
   wireEndpointResolver(ctx, agent, logger)
+  wireSessionQuery(ctx, history, logger)
   logger.info?.(`mobile-link: ready (relay ${config.relayUrl})`)
 }
 

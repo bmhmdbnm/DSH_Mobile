@@ -85,6 +85,9 @@ export class MobileLinkAgent extends EventEmitter {
     this.identity = undefined
     /** Which host form we are running in (`desktop` / `web` / `unknown`); set by the plugin. */
     this.hostForm = 'unknown'
+    /// 历史读取（spec 007）：宿主 `sessionQuery` 就绪后由插件挂上；没挂上时
+    /// 路由回 `link/unsupported`，手机继续走 `session/page`。
+    this.setHistoryService = (service) => { this.router.history = service }
     this.relay = undefined
     this.socket = undefined
     this.state = 'idle'
