@@ -35,6 +35,9 @@ struct TranscriptListRepresentable: UIViewRepresentable {
     let onBudgetCheck: (Int) -> Int
     /// `-DSHProbeOlderScroll` 的 uikit 驱动轮数（0 = 不驱动）。
     let driveRounds: Int
+    /// 驱动开始前调用：真实手指上滑会把"跟随中"关掉，驱动必须做同样的事，
+    /// 否则"回到底部"按钮永远不会出现（2026-10-08 实测：探针里 `following=1`、按钮不可见）。
+    let onDriveBegin: () -> Void
     /// 该回收这些行（宿主判定，调用方执行）。
     let onReclaim: ([String]) -> Void
     /// 这些 seq 需要内容（调用方从本地库读回来后调用 `coordinator.rehydrate(items:)`）。
@@ -63,6 +66,7 @@ struct TranscriptListRepresentable: UIViewRepresentable {
             coordinator?.onNeedRehydrate?(seqs)
         }
         context.coordinator.onNeedRehydrate = onNeedRehydrate
+        context.coordinator.onDriveBegin = onDriveBegin
         context.coordinator.startDriveIfNeeded(rounds: driveRounds)
         context.coordinator.maybeForceRehydrate(host: host)
         hostRef.wrappedValue = host
@@ -126,6 +130,7 @@ struct TranscriptListRepresentable: UIViewRepresentable {
         var onNearTop: (() -> Void)?
         var onDiagnostic: ((String, [String: String]) -> Void)?
         var onBudgetCheck: ((Int) -> Int)?
+        var onDriveBegin: (() -> Void)?
         var onNeedRehydrate: (([Int]) -> Void)?
         /// 本地库取回内容之后，把行交回宿主水合（真实路径的入口）。
         private var forcedRehydrate = false
@@ -196,6 +201,7 @@ struct TranscriptListRepresentable: UIViewRepresentable {
             driveStarted = true
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(6))   // 与 007 的驱动一致：等首屏钉底
+                self?.onDriveBegin?()
                 for round in 1...rounds {
                     guard let self, let host = self.host else { return }
                     // 先回到新的一头再往上滑：宿主只在"离开顶端 120pt 以上"之后才重新武装
@@ -268,7 +274,15 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
     private func setUp() {
         var configuration = UICollectionLayoutListConfiguration(appearance: .plain)
         configuration.showsSeparators = false
-        let layout = UICollectionViewCompositionalLayout.list(using: configuration)
+        // 行间距按"原来紧挨着"来：list 的 section 内边距、行内 hosting 的默认 margins 叠起来
+        // 会多出一圈空白（2026-10-08 真机反馈：思考过程/工具件之间隔得太开）。三处一起清零。
+        let layout = UICollectionViewCompositionalLayout { _, environment in
+            let section = NSCollectionLayoutSection.list(using: configuration,
+                                                         layoutEnvironment: environment)
+            section.contentInsets = .zero
+            section.interGroupSpacing = 0
+            return section
+        }
         collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
         collectionView.translatesAutoresizingMaskIntoConstraints = false
         collectionView.alwaysBounceVertical = true
@@ -287,6 +301,7 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
             cell.contentConfiguration = UIHostingConfiguration {
                 self.makeRow?(item) ?? AnyView(Color.clear)
             }
+            .margins(.all, 0)
         }
         dataSource = UICollectionViewDiffableDataSource<String, String>(
             collectionView: collectionView
@@ -350,6 +365,14 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
                                    "ms": String(format: "%.0f", layoutMs),
                                    "reason": reason])
         settle(anchorId: anchorId ?? "-", moved: residual)
+        // 补完一页之后如果读者还贴在顶部，就**继续要下一页**：真实手指一直往上拉时内容不再移动，
+        // `scrollViewDidScroll` 也就不会再报"靠近顶端"，只在第一页之后停住
+        // （2026-10-08 真机反馈："仍不能无限拉，中断了"）。这里由宿主自己续上，
+        // 次数交给调用方的"还有没有更早"兜底（到日志开头就不再要）。
+        if distanceToTop() < Self.tolerance * 2 {
+            nearTopArmed = true
+            onNearTop?()
+        }
     }
 
     /// 按预算丢弃最老的已读行（spec 008 的 FR-002）。
@@ -417,16 +440,33 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         ])
     }
 
+    /// 视口距内容顶端的距离（点）。
+    func distanceToTop() -> CGFloat {
+        collectionView.contentOffset.y + collectionView.adjustedContentInset.top
+    }
+
     /// 驱动用：把视口送到内容顶端（`-DSHProbeOlderScroll` 的 uikit 版）。
     func scrollToTop() {
         collectionView.setContentOffset(CGPoint(x: 0, y: -collectionView.adjustedContentInset.top),
                                         animated: false)
     }
 
-    /// 钉到底部（打开会话与跟随中）。
+    /// 钉到底部（打开会话、跟随中、以及"回到底部"按钮）。
     func scrollToBottom() {
         guard let last = rows.last?.id else { return }
         scrollTo(id: last)
+        // 诊断：按钮点了到底有没有把视口带走（真机反馈过"点了不生效"）。
+        // 前后各报一次——只报"调用时"的距离说明不了问题，要看**滚完之后**还剩多远。
+        let before = distanceToTop()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard let self else { return }
+            self.diagnostic("list.scrollToBottom", [
+                "before": String(format: "%.0f", before),
+                "after": String(format: "%.0f", self.distanceToTop()),
+                "items": String(self.rows.count),
+            ])
+        }
     }
 
     // MARK: - 回收 / 再水合（US3：FR-004/FR-005/SC-004）

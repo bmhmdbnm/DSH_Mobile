@@ -271,7 +271,13 @@ struct ChatView: View {
             if !isFollowing, !model.timeline.items.isEmpty {
                 Button {
                     isFollowing = true
-                    scrollToBottom(proxy, animated: true)
+                    // 新宿主下 `ScrollViewProxy` 不在它的视图树里，走 proxy 等于没反应
+                    // （2026-10-08 真机反馈：点了不生效）。
+                    if ProbeVariants.listHost == "uikit" {
+                        listHostRef?.scrollToBottom()
+                    } else {
+                        scrollToBottom(proxy, animated: true)
+                    }
                 } label: {
                     HStack(spacing: DSHTheme.Spacing.hairline) {
                         Image(systemName: "arrow.down")
@@ -431,6 +437,10 @@ struct ChatView: View {
                     return count
                 },
                 driveRounds: ViewportProbe.olderScrollRounds ?? 0,
+                onDriveBegin: {
+                    isFollowing = false
+                    userScrolled = true
+                },
                 onReclaim: { ids in
                     // 回收只是把行的重内容换掉；行与高度都留着（FR-003/FR-005）。
                     listHostRef?.apply(.reclaim(ids))
