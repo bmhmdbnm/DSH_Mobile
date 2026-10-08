@@ -48,11 +48,16 @@
     "gen:connector-baseline": "node scripts/dev/gen-connector-baseline.mjs",
     "sync:send-image-script": "node scripts/dev/sync-send-image-script.mjs",
     "restart": "node scripts/dev/dsh-restart.mjs",
-    "test:scripts": "node --test scripts/dev/dsh-restart.test.mjs scripts/dev/check-contracts.test.mjs scripts/dev/check-plugin-hotplug.test.mjs scripts/dev/plugin-hmr.test.mjs scripts/dev/profile-parity.test.mjs scripts/dev/profile-parity-apply.test.mjs scripts/dev/relay-devices.test.mjs test/tools/relaypair.test.mjs skills/send-image/send-image.test.mjs",
+    "test:scripts": "node --test scripts/dev/dsh-restart.test.mjs scripts/dev/check-contracts.test.mjs scripts/dev/check-plugin-hotplug.test.mjs scripts/dev/plugin-hmr.test.mjs scripts/dev/profile-parity.test.mjs scripts/dev/profile-parity-apply.test.mjs scripts/dev/relay-devices.test.mjs scripts/dev/check-lanes.test.mjs test/tools/relaypair.test.mjs skills/send-image/send-image.test.mjs",
     "check:structure": "node scripts/dev/check-structure.mjs",
     "check:parity": "node scripts/dev/profile-parity.mjs",
     "parity:apply": "node scripts/dev/profile-parity-apply.mjs",
     "check:hotplug": "node scripts/dev/check-plugin-hotplug.mjs",
+    "check:lanes": "node scripts/dev/check-lanes.mjs",
+    "lane:doctor": "node scripts/verify/lane.mjs doctor",
+    "lane:l1": "node scripts/verify/lane.mjs l1",
+    "lane:l2": "node scripts/verify/lane.mjs l2",
+    "lane:l3": "node scripts/verify/lane.mjs l3",
     "plugin:hmr": "node scripts/dev/plugin-hmr.mjs"
   }
 }

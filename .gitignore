@@ -65,6 +65,11 @@ specs/
 docs/artifacts/screenshots/
 test/fixtures/media/
 
+# 三级验证渠道（006）的运行证据：每次跑渠道都会写一份，属过程产物。
+# 结构与判定见 specs/006-verify-lanes/；契约在 scripts/verify/ 与
+# specs/006-verify-lanes/contracts/verdict.schema.json。
+.lanes/
+
 # 密钥与私钥文件：任何目录都不入库（含 sidecars/ 下 llm-key-router 的 keys*.txt）
 # 注意：不要用 credentials* / *secret* 这类宽泛模式——
 # docs/artifacts/samples/credentials_describe.json 是入库样本，会被误伤。
