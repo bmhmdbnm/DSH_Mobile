@@ -41,6 +41,35 @@ public struct DSHClient: Sendable {
         )
     }
 
+    /// Reads one **exact** backward window from the connector (spec 007).
+    ///
+    /// The caller must have seen `history-window` in the link handshake's
+    /// capabilities; on a connector without it the call comes back as
+    /// `link/unsupported`, and the caller keeps using `session/page`. Nothing here
+    /// retries or falls back: which channel a session uses is the pager's
+    /// decision, not a property of one request.
+    public func historyWindow(_ request: HistoryWindowRequest) async throws -> HistoryWindowValue {
+        try await carrier.unary(
+            method: "_link/sessionWindow",
+            args: request,
+            as: HistoryWindowValue.self
+        )
+    }
+
+    /// Searches inside one session through the connector (spec 007).
+    ///
+    /// Caller must have seen `session-search` in the handshake; without it the
+    /// connector answers `link/unsupported` and the caller keeps the on-device
+    /// search over what is already loaded. Nothing here falls back on its own:
+    /// which search a session offers is the sheet's decision (FR-015/FR-036).
+    public func sessionFind(_ request: HistorySearchRequest) async throws -> HistorySearchValue {
+        try await carrier.unary(
+            method: "_link/sessionFind",
+            args: request,
+            as: HistorySearchValue.self
+        )
+    }
+
     /// Follows a session live, yielding an opening snapshot then durable events.
     public func follow(_ request: SessionFollowRequest) async -> AsyncThrowingStream<SessionFollowFrame, any Error> {
         let raw = await carrier.stream(endpoint: "session/follow", args: RequestArgs(request: request))

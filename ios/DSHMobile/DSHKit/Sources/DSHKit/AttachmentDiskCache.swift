@@ -37,10 +37,10 @@ public struct AttachmentDiskCache {
     /// 文件名 = 附件 id + 内容标识。同 id 换了内容就是另一个文件，不会拿到旧图。
     private func url(scope: String, attachmentId: String, variant: String?) -> URL {
         let name = variant == nil
-            ? SessionTranscriptCache.slug(attachmentId)
-            : "\(SessionTranscriptCache.slug(attachmentId))-\(SessionTranscriptCache.slug(variant!))"
+            ? PathSlug.slug(attachmentId)
+            : "\(PathSlug.slug(attachmentId))-\(PathSlug.slug(variant!))"
         return root
-            .appendingPathComponent(SessionTranscriptCache.slug(scope), isDirectory: true)
+            .appendingPathComponent(PathSlug.slug(scope), isDirectory: true)
             .appendingPathComponent(name, isDirectory: false)
     }
 

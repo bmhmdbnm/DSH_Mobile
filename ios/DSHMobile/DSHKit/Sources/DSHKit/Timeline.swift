@@ -531,6 +531,25 @@ public struct ChatTimeline: Sendable {
         }
     }
 
+    /// Drops the oldest rows to keep the in-memory window inside its budget.
+    ///
+    /// Only the **rows** go: the pager's "is there older history" is untouched, and
+    /// the records themselves stay in the local store, so scrolling back up reads
+    /// them from disk instead of the network (spec 007 FR-035). Returns the number
+    /// of rows actually dropped.
+    @discardableResult
+    public mutating func dropOldestRows(_ count: Int) -> Int {
+        guard count > 0, !items.isEmpty else { return 0 }
+        let dropped = min(count, items.count)
+        items.removeFirst(dropped)
+        reindexTools()
+        return dropped
+    }
+
+    /// The seq of the topmost row, i.e. how far back the reader can scroll without
+    /// a local read-back.
+    public var firstSeq: Int? { items.first?.seq }
+
     private mutating func reindexTools() {
         toolIndex.removeAll(keepingCapacity: true)
         for (index, item) in items.enumerated() {

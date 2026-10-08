@@ -92,7 +92,7 @@ public struct SessionListSnapshotStore {
     /// 一台电脑一份。以前是全局单文件，换电脑之后冷启动会把上一台的列表当成
     /// "上次数据"画出来——两台电脑的会话 id 本来就可能撞（fork/clone）。
     private func url(scope: String) -> URL {
-        let name = "session-list-\(SessionTranscriptCache.slug(scope)).json"
+        let name = "session-list-\(PathSlug.slug(scope)).json"
         return directory.appendingPathComponent(name, isDirectory: false)
     }
 

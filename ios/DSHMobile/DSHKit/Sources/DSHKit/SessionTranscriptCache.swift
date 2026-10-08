@@ -125,13 +125,10 @@ public struct SessionTranscriptCache {
             .appendingPathComponent("\(Self.slug(sessionId)).older.json", isDirectory: false)
     }
 
+    /// Kept while this type is being retired: the rule itself now lives in
+    /// `PathSlug` so the three caches cannot drift apart (constitution VI).
     public static func slug(_ value: String) -> String {
-        let allowed = value.map { character -> Character in
-            character.isLetter || character.isNumber || character == "-" || character == "_"
-                ? character : "_"
-        }
-        let text = String(allowed)
-        return text.isEmpty ? "unknown" : String(text.prefix(120))
+        PathSlug.slug(value)
     }
 
     // MARK: - Reading and writing
