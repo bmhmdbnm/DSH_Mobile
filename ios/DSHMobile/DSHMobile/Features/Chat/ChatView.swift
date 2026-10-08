@@ -71,16 +71,37 @@ struct ChatView: View {
     @State private var olderPump: Task<Void, Never>?
     /// 已经处理过的补页代数，用来把"头部插入"从"尾部追加"里分出来。
     @State private var handledPrepend = 0
+    /// 延后的窗口裁剪（见 `onChange(of: items.count)` 的注释）。
+    @State private var trimWindowTask: Task<Void, Never>?
+    /// 每完成一次锚定就 +1。补页那一侧靠它等"**这一次**插页的锚定跑完"，
+    /// 而不是等一个可能属于上一页的 `prependAnchorTask`（2026-10-08 实测：等错了对象，
+    /// 于是 `kept` 量在锚定之前，把已经锚住的页记成 0）。
+    @State private var anchorCompletions = 0
     /// 搜索面板是否打开。
     @State private var isSearching = false
     /// 搜索面板选中的那条（行 id）：转写页滚动到它并短暂高亮。
-    @State private var searchJumpId: String?
+    @State private var searchJumpHit: TranscriptSearchHit?
+    /// 正在为跳转换窗口（这期间不让"钉底/补页"插手，否则会把刚换好的窗口又拽回去）。
+    @State private var rebalancing = false
+    /// 新宿主（uikit）的跳转目标：换窗口之后由宿主的 `scrollToItem` 落点，
+    /// 不再走 SwiftUI 的 `ScrollViewProxy`（spec 008 的 US2）。
+    @State private var listJumpId: String?
+    /// 新宿主的引用（回收/水合要从外面把行交回去）。
+    @State private var listHostRef: TranscriptListHost?
     /// 刚刚跳过去、正在高亮的那一行。
     @State private var highlightedItemId: String?
     /// 高亮的清除任务（连续跳转时上一次要取消）。
     @State private var highlightTask: Task<Void, Never>?
     /// 补页前视口里最上面那条消息的 id：补完要把它锚回视口顶部（见 `anchorAfterPrepend`）。
     @State private var prependAnchor: String?
+    /// 记下这次补页**发起时**读者是不是贴在顶部。
+    ///
+    /// 不能用"插入完成后 sentinelNearTop"来判断：插入本身就会把哨兵挤出视口，
+    /// 于是锚定的四次重试会被 `onDisappear` 全部挡掉——2026-10-08 实测 `older.pump kept=0`
+    /// 就是这么来的（视口留在了新内容上）。发起时在顶部 ⇒ 补完必须锚回来。
+    @State private var prependAnchorAtTop = false
+    /// 补页**之前**的滚动几何（偏移 / 内容高），用来判断锚定有没有收敛。
+    @State private var prependBaseline: (offset: CGFloat, content: CGFloat)?
     /// 那一次锚定的重试序列。
     @State private var prependAnchorTask: Task<Void, Never>?
     /// Owned here rather than in the composer so the transcript can re-pin
@@ -159,7 +180,7 @@ struct ChatView: View {
             ModelPickerSheet(model: model)
         }
         .sheet(isPresented: $isSearching) {
-            TranscriptSearchSheet(model: model) { id in searchJumpId = id }
+            TranscriptSearchSheet(model: model) { hit in searchJumpHit = hit }
         }
         .sheet(item: $readingMessage) { message in
             MessageTextSheet(message: message)
@@ -239,10 +260,13 @@ struct ChatView: View {
                 if value.translation.height > 24 {
                     isFollowing = false
                     userScrolled = true
+                    // 读者往新的一头拖：在飞的那一页没必要补了（FR-016 的"反向滚动取消"）。
+                    cancelOlderPump(reason: "reverse")
                 }
             }
         )
         .overlay(alignment: .top) { olderLoadingPill }
+        .overlay(alignment: .top) { olderRetryBar }
         .overlay(alignment: .bottomTrailing) {
             if !isFollowing, !model.timeline.items.isEmpty {
                 Button {
@@ -293,13 +317,16 @@ struct ChatView: View {
             ViewportProbe.resume()
             scrollToBottom(proxy, animated: false)
         }
-        .onChange(of: searchJumpId) { _, id in
-            guard let id else { return }
-            jumpToItem(id, proxy: proxy)
+        .onChange(of: searchJumpHit) { _, hit in
+            guard let hit else { return }
+            Task { @MainActor in await jumpToHit(hit, proxy: proxy) }
         }
         // 探针驱动（`-DSHProbeOlderScroll`）：仿真器里没法对转写页做手势滑动，
         // 所以"往上滑"这一段由 App 自己代劳，其余全是产品代码。
-        .task { await runOlderScrollDrive(proxy) }
+        // 新宿主自带驱动（coordinator 里那份），**旧的 SwiftUI 驱动必须让位**：
+        // 它会去置 `isFollowing=false, userScrolled=true`，把 uikit 路径的 `pinToBottom` 打成假，
+        // 于是预算检查永远"算得出来但不该丢"（2026-10-08 实测：`list.budget count=14 pin=0`）。
+        .task { if ProbeVariants.listHost != "uikit" { await runOlderScrollDrive(proxy) } }
         // 离开转写页就暂停探针采样：退回列表后"转写区"没有任何内容可量，
         // 继续采只会把列表记成"会话区白了"。
         .onDisappear { ViewportProbe.pause() }
@@ -311,11 +338,12 @@ struct ChatView: View {
             olderPump = nil
             highlightTask?.cancel()
             highlightedItemId = nil
-            searchJumpId = nil
+            searchJumpHit = nil
             prependAnchorTask?.cancel()
             prependAnchorTask = nil
             prependAnchor = nil
             sentinelNearTop = false
+            cancelOlderPump(reason: "switch")
             // 注意：**不要**把 `topDistance` 清掉。它是滚动几何的事实，不是会话状态；
             // 而"首次布局时内容还是空的、视口就停在顶部"这种情况，几何值此后**再也不变**，
             // 清了就永远补不回来（2026-09-24 实测：清了之后补页和钉底一起失灵）。
@@ -323,6 +351,10 @@ struct ChatView: View {
             evaluateTopDistance(proxy)
         }
         .onChange(of: model.timeline.items.count) { _, count in
+            // 窗口预算：只在读者跟着尾部时裁，而且**延后一拍**——打开会话时 `pinOnOpen`
+            // 会在 0/120/300ms 连发几次 `scrollTo`，此刻缩短 items 会让在飞的目标 index path
+            // 失效，UIKit 直接 SIGABRT（2026-10-08 run 20261008-202231 实测）。
+            scheduleWindowTrim()
             ViewportProbe.setContent(items: count, streaming: model.timeline.streaming?.text.count ?? 0)
             // 内容变了要重判一次：首次快照落地时"视口停在内容顶部"这件事本身
             // 不产生滚动几何变化，只靠回调会漏（见 `topDistance`）。
@@ -363,7 +395,58 @@ struct ChatView: View {
     /// 修饰符链里，编译器会报"表达式太复杂"。
     @ViewBuilder
     private func stackContainer(_ proxy: ScrollViewProxy) -> some View {
-        if ProbeVariants.lazyStack {
+        if ProbeVariants.listSpike {
+            // spike 屏（spec 008 Phase 0）：不读会话，纯造数据量位移与并发。
+            TranscriptListSpikeView()
+        } else if ProbeVariants.listHost == "uikit" {
+            // spec 008 US1：新列表宿主渲染真会话。行视图直接复用本视图的 `row(_:)`，
+            // 所以两条路的视觉是同一套代码（验收口径：等价，不追逐像素）。
+            TranscriptListRepresentable(
+                items: model.timeline.items,
+                makeRow: { AnyView(row($0)) },
+                pinToBottom: isFollowing && !userScrolled,
+                onDiagnostic: { name, fields in ViewportProbe.note(name, fields, force: true) },
+                onNearTop: { Task { await model.loadOlder() } },
+                onScroll: { distance in
+                    topDistance = distance
+                    let near = distance < Self.sentinelApproach
+                    if near != sentinelNearTop {
+                        sentinelNearTop = near
+                        ViewportProbe.note("older.sentinel", [
+                            "distance": String(format: "%.0f", distance),
+                            "near": near ? "1" : "0",
+                            "following": isFollowing ? "1" : "0",
+                            "items": String(model.timeline.items.count),
+                        ])
+                    }
+                },
+                onBudgetCheck: { visibleRows in
+                    // 跟随尾部时才丢：读者不在尾巴上时丢东西会把他正在看的行抽走。
+                    guard isFollowing, !userScrolled else { return 0 }
+                    // 保留带按**屏**算：至少留住两屏，否则丢弃之后内容比一屏还短，
+                    // 看起来像会话被截断（run 20261008-230106 的 T037）。
+                    let keep = max(24, visibleRows * 2)
+                    let count = model.rowsToDropForBudget(keepLast: keep)
+                    if count > 0 { model.dropOldestRows(count) }
+                    return count
+                },
+                driveRounds: ViewportProbe.olderScrollRounds ?? 0,
+                onReclaim: { ids in
+                    // 回收只是把行的重内容换掉；行与高度都留着（FR-003/FR-005）。
+                    listHostRef?.apply(.reclaim(ids))
+                },
+                onNeedRehydrate: { seqs in
+                    Task { @MainActor in
+                        let items = await model.items(forSeqs: seqs)
+                        guard !items.isEmpty else { return }
+                        listHostRef?.rehydrate(items: items)
+                    }
+                },
+                jumpToId: listJumpId,
+                hostRef: $listHostRef
+            )
+            .accessibilityIdentifier("chat.transcript.list")
+        } else if ProbeVariants.lazyStack {
             // 复现用：换回懒加载容器（`-DSHProbeVariants lazy-stack`）。
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: DSHTheme.Spacing.standard) {
@@ -395,6 +478,19 @@ struct ChatView: View {
         ForEach(model.timeline.items) { item in row(item) }
         tail
         bottomMarker
+    }
+
+    /// 延后一拍再裁窗口（见 `onChange(of: items.count)` 的注释）。
+    ///
+    /// 抽成独立方法还有一个实际原因：把 Task 直接写在 `onChange` 闭包里会让
+    /// SwiftUI 的类型推断超时（2026-10-08 实测 "unable to type-check this expression"）。
+    private func scheduleWindowTrim() {
+        trimWindowTask?.cancel()
+        trimWindowTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(1500))
+            guard !Task.isCancelled, !isPinningOnOpen, olderPump == nil, prependAnchorTask == nil else { return }
+            model.trimWindowIfNeeded(readerIsFollowing: isFollowing && !userScrolled)
+        }
     }
 
     /// 顶部哨兵：读者滑到最上面就自动补更早的一页。**没有按钮**。
@@ -439,10 +535,55 @@ struct ChatView: View {
             .onDisappear { sentinelNearTop = false }
     }
 
+    /// 取页失败时的重试条：浮在转写区顶部，不进内容（行高恒定，见 `olderSentinel`）。
+    ///
+    /// 为什么必须有：取页失败曾经是**完全静默**的——`hasOlder` 被写成 false，读者只看到
+    /// "再也翻不动了"，没有任何可点的东西（spec 007 FR-004/FR-007）。这里给一句
+    /// 能行动的话和一个按钮，失败就不再是死路。
+    @ViewBuilder
+    private var olderRetryBar: some View {
+        if let reason = model.olderFailure {
+            Button {
+                ViewportProbe.note("older.retry.tap", ["reason": reason], force: true)
+                Task { await model.retryOlder() }
+            } label: {
+                HStack(spacing: DSHTheme.Spacing.hairline) {
+                    Image(systemName: "arrow.clockwise")
+                    Text("读取更早的记录失败，点按重试")
+                }
+                .font(DSHTheme.Typography.micro)
+                .foregroundStyle(DSHTheme.labelPrimary)
+                .padding(.horizontal, DSHTheme.Spacing.tight)
+                .padding(.vertical, 6)
+                .background(DSHTheme.layer3, in: Capsule())
+                .overlay(Capsule().stroke(DSHTheme.border2, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("chat.older.retry")
+            .padding(.top, DSHTheme.Spacing.hairline)
+            .transition(.opacity)
+            // 诊断：把重试条真正布局出来的尺寸与位置落盘。用例 53 的截图一直抓到"加载态"，
+            // 有了这行就能区分"抓拍时机不巧"与"它在树上但没被画出来/被遮住"。
+            .background(
+                GeometryReader { geometry in
+                    Color.clear.onAppear {
+                        ViewportProbe.note("older.retryBar", [
+                            "w": String(format: "%.0f", geometry.size.width),
+                            "h": String(format: "%.0f", geometry.size.height),
+                            "y": String(format: "%.0f", geometry.frame(in: .global).minY),
+                        ], force: true)
+                    }
+                }
+            )
+        }
+    }
+
     /// 补页进行中的提示：浮在转写区顶部，不进内容（行高恒定，见 `olderSentinel`）。
     @ViewBuilder
     private var olderLoadingPill: some View {
-        if model.isLoadingOlder {
+        // 已经失败过就不再显示"正在加载"：那会让人以为还在忙，而实际上要等的是他自己点一下
+        // （或 3 秒后那一次自动补试）。两者互斥，屏幕上也才看得出"现在是失败态"。
+        if model.isLoadingOlder, model.olderFailure == nil {
             HStack(spacing: DSHTheme.Spacing.hairline) {
                 ProgressView().controlSize(.mini)
                 Text("正在加载更早的消息…")
@@ -558,6 +699,15 @@ struct ChatView: View {
             if isFollowing, !userScrolled { scrollToBottom(proxy, animated: false, force: true) }
             return
         }
+        // 预加载的"可见余量"：离顶部还有一屏（`prefetchMargin`）就开始惦记补页，
+        // 真正触发仍在 `sentinelApproach`（哨兵行进视口）。两条线分开的理由是
+        // **取消**——读者掉头往下时，靠 `prefetchMargin` 才有个明确的"可以放弃"的界限。
+        if distance >= Self.sentinelApproach, distance <= Self.prefetchMargin, !model.isLoadingOlder {
+            ViewportProbe.note("prefetch.near", [
+                "distance": String(format: "%.0f", distance),
+                "margin": String(format: "%.0f", Self.prefetchMargin),
+            ])
+        }
         let near = distance < Self.sentinelApproach
         if near != sentinelNearTop {
             sentinelNearTop = near
@@ -604,6 +754,11 @@ struct ChatView: View {
     private func pumpOlder(_ proxy: ScrollViewProxy) {
         guard ownsTranscript, sentinelNearTop, model.hasOlder, !model.isLoadingOlder,
               olderPump == nil else { return }
+        // 已经失败过就先别自动再试：否则"重试条出现 → 布局变化把哨兵推回来 → 又发一页 →
+        // 失败清掉 olderFailure → 胶囊出现 → 失败 → 重试条再出现"会一直翻来覆去
+        // （2026-10-08 用例 53 实测：探针里重试条 7.68s 就布局好了，8.5s 的截图却是加载态）。
+        // 失败之后由读者点重试条，或由那一次自动补试收尾。
+        guard model.olderFailure == nil else { return }
         olderPump = Task { @MainActor in
             defer { olderPump = nil }
             for _ in 0..<Self.maxOlderBurst {
@@ -611,10 +766,27 @@ struct ChatView: View {
                 let anchor = model.timeline.items.first?.id
                 let before = ViewportProbe.scrollFacts
                 let count = model.timeline.items.count
-                await model.loadOlder()
-                guard model.timeline.items.count > count else { return }
+                // 锚点在 await 之前落位：插入会在同一帧触发 onChange(items.count)，
+                // 以前等返回再赋值，锚定分支可能先跑（顺序未定义）。
                 prependAnchor = anchor
-                try? await Task.sleep(for: .milliseconds(400))
+                prependAnchorAtTop = sentinelNearTop
+                prependBaseline = before
+                let anchorSequence = anchorCompletions
+                await model.loadOlder()
+                guard model.timeline.items.count > count else {
+                    prependAnchor = nil
+                    return
+                }
+                // 等锚定收敛后再量 `kept`：固定睡 400ms 会在"一页 150 行"的降级通道上
+                // 量到还在折行的中间态，把已经收敛的补页误记成 kept=0（用例 50 实测）。
+                // `onChange(items.count)` 是**异步投递**的：插入刚返回时锚定任务可能还没建起来，
+                // 此刻直接 await 会立刻返回，等于在没锚之前就量 kept（2026-10-08 实测：读回路径
+                // 因此被误记成 kept=0，而它其实锚住了）。先等任务出现，再等它跑完。
+                var waitedForAnchor = 0
+                while anchorCompletions == anchorSequence, waitedForAnchor < 1500 {
+                    try? await Task.sleep(for: .milliseconds(25))
+                    waitedForAnchor += 25
+                }
                 if Task.isCancelled { return }
                 let after = ViewportProbe.scrollFacts
                 var kept = "-"
@@ -649,18 +821,44 @@ struct ChatView: View {
     /// 视口就留在了新内容上）。所以真正的锚定放在**视图看到条数变化之后**
     /// （`onChange(of: items.count)`），并按 0 / 60 / 160 / 320ms 重试几次：
     /// 第一次通常和插入同一帧落地，后面几次兜住"行高还在折"的情况。
-    /// 视口一旦离开顶部（`sentinelNearTop == false`）就停手，绝不和读者抢滚动。
+    /// 判断依据是"这次插入**发起时**读者在不在顶部"（`prependAnchorAtTop`），不是插入后的
+    /// 哨兵状态：插入必然把哨兵挤出视口，用后者会把锚定全部挡掉（就是 `kept=0` 的成因）。
+    /// 读者若在这次补页之后自己滚走了，`sentinelNearTop` 会被 `evaluateTopDistance` 置回 false，
+    /// 那一次的后续重试就会停手——不去和读者抢滚动。
     private func anchorAfterPrepend(_ proxy: ScrollViewProxy) {
-        guard let anchor = prependAnchor else { return }
+        guard let anchor = prependAnchor, prependAnchorAtTop else { return }
         prependAnchorTask?.cancel()
         prependAnchorTask = Task { @MainActor in
-            for delay in [0, 60, 160, 320] {
-                if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }
+            // 由**测量**决定锚几次，而不是由固定时刻表决定（原来的 0/60/160/320ms 四枪）。
+            //
+            // 为什么：一页 30 行时第一枪就到位，一页 150 行（降级通道）时行高要过一秒才折完，
+            // 固定时刻表要么锚不够、要么白锚。这里的判据是"内容高度连着两轮没变"——布局稳了
+            // 就停手，没稳就再锚一次，最多 `anchorAttemptCap` 次。
+            var attempts = 0
+            var stableRounds = 0
+            var lastContent = ViewportProbe.scrollFacts?.content
+            while attempts < Self.anchorAttemptCap {
                 if Task.isCancelled || !ownsTranscript { return }
                 guard model.timeline.items.contains(where: { $0.id == anchor }) else { return }
-                if !sentinelNearTop { return }
+                // 第一枪无条件锚（插入刚落地）；之后读者若已离开顶部就停手，不跟他抢滚动。
+                if attempts > 0, !sentinelNearTop { return }
                 proxy.scrollTo(anchor, anchor: .top)
+                attempts += 1
+                try? await Task.sleep(for: .milliseconds(80))
+                let content = ViewportProbe.scrollFacts?.content
+                if let lastContent, let content, abs(content - lastContent) < 1 {
+                    stableRounds += 1
+                } else {
+                    stableRounds = 0
+                }
+                lastContent = content
+                if stableRounds >= 2 { break }
             }
+            anchorCompletions += 1
+            ViewportProbe.note("older.anchor", [
+                "attempts": String(attempts),
+                "stable": stableRounds >= 2 ? "1" : "0",
+            ], force: true)
         }
     }
 
@@ -669,6 +867,61 @@ struct ChatView: View {
     /// 三次重试的理由和 `pinOnOpen` 一样：目标行的位置要等 `List` 把这一批行折完才准，
     /// 只滚一次会落在"当时的"位置上。同时把跟随关掉、并记成"读者自己滚过"——
     /// 否则滚过去之后只要内容一变，`repinAfterContentChange` 就把人拽回底部。
+    /// 跳到一条**命中**上。
+    ///
+    /// 和 `jumpToItem(id:)` 的区别是它认的是**seq**：合并搜索缓冲会重新折时间线，
+    /// 行 id 可能就变了（2026-10-08 T068：按 id 跳时，合并之后 `contains(id)` 不再成立，
+    /// 梯子里的重试全部直接 return，视口就停在合并把它挤到的位置上）。
+    /// 这里每一枪都重新按 seq 解析一次行，解析不到才退回去用面板给的那个 id。
+    private func jumpToHit(_ hit: TranscriptSearchHit, proxy: ScrollViewProxy) async {
+        guard ownsTranscript else { return }
+        isFollowing = false
+        userScrolled = true
+        // 命中可能在窗口**之外**（搜索是全会话的，时间线只装一窗）：先换窗口再滚，
+        // 否则"按 seq 解析行"只会解析到窗口的第一行，怎么滚都落不到目标上（T068）。
+        let windowOldest = model.timeline.firstSeq ?? Int.max
+        if hit.seq < windowOldest {
+            rebalancing = true
+            _ = await model.rebaseWindow(around: hit.seq)
+            rebalancing = false
+        } else if TranscriptHitLocator.row(forSeq: hit.seq, in: model.timeline.items) == nil,
+                  !model.timeline.items.contains(where: { $0.id == hit.id }) {
+            _ = model.commitSearchHistory()
+        }
+        ViewportProbe.note("search.jump", ["item": hit.id, "seq": String(hit.seq)], force: true)
+        Task { @MainActor in
+            for delay in [0, 120, 300, 600, 1000, 1800, 2600] {
+                if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }
+                if Task.isCancelled || !ownsTranscript { return }
+                guard let row = TranscriptHitLocator.row(forSeq: hit.seq, in: model.timeline.items) else {
+                    continue
+                }
+                proxy.scrollTo(row.id, anchor: .center)
+            }
+            let visible = ViewportProbe.visibleRowIds()
+            let target = TranscriptHitLocator.row(forSeq: hit.seq, in: model.timeline.items)?.id ?? hit.id
+            if ProbeVariants.listHost == "uikit" {
+                // 新宿主：把目标交给它滚过去（同一次更新里定位，不经过 ScrollViewProxy）。
+                listJumpId = target
+                return
+            }
+            ViewportProbe.note("search.jump.settle", [
+                "item": target, "seq": String(hit.seq),
+                "top": ViewportProbe.topVisibleRow() ?? "-",
+                "items": String(model.timeline.items.count),
+                "visible": String(visible.count),
+                "near": visible.prefix(3).joined(separator: "|"),
+            ], force: true)
+            highlightedItemId = target
+            highlightTask?.cancel()
+            highlightTask = Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(1600))
+                if Task.isCancelled { return }
+                highlightedItemId = nil
+            }
+        }
+    }
+
     private func jumpToItem(_ id: String, proxy: ScrollViewProxy) {
         guard ownsTranscript else { return }
         isFollowing = false
@@ -681,12 +934,27 @@ struct ChatView: View {
         }
         ViewportProbe.note("search.jump", ["item": id], force: true)
         Task { @MainActor in
-            for delay in [0, 120, 300] {
+            // 梯子要够长：`commitSearchHistory()` 把搜索缓冲并进时间线时是**往上方插内容**，
+            // 插入落地会把目标行挤走；只滚三次（0/120/300ms）时，最后一次常常落在插入之前的布局上
+            // （2026-10-08 用例 49 实测：`search.jump` 之后 offset 变成 -116，目标行不在屏幕上）。
+            // 最后两枪要打在"内容稳定之后"：并缓冲/插内容会让 `List` 在 1–2 秒里继续
+            // 调整偏移（探针里 19.2s 到 20.7s 之间 top_row_y 还在变），早于这个时刻的 scrollTo
+            // 都会落在旧布局上（2026-10-08 用例 49 实测：2.2s 时目标行已经在视口上方 360pt）。
+            for delay in [0, 120, 300, 600, 1000, 1800, 2600] {
                 if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }
                 if Task.isCancelled || !ownsTranscript { return }
                 guard model.timeline.items.contains(where: { $0.id == id }) else { return }
                 proxy.scrollTo(id, anchor: .center)
             }
+            // 落点诊断：跳完之后视口最上面是哪一行。目标行不在附近就说明又没钉住。
+            let visible = ViewportProbe.visibleRowIds()
+            ViewportProbe.note("search.jump.settle", [
+                "item": id, "top": ViewportProbe.topVisibleRow() ?? "-",
+                "items": String(model.timeline.items.count),
+                // 目标行到底在不在视口里、周围是哪些行——一次就能分清"视口外"与"没渲染"。
+                "visible": String(visible.count),
+                "near": visible.prefix(3).joined(separator: "|"),
+            ], force: true)
             highlightedItemId = id
             highlightTask?.cancel()
             highlightTask = Task { @MainActor in
@@ -856,6 +1124,20 @@ struct ChatView: View {
     /// `sentinelApproach` 以内的一点点。阈值放大到一屏，这个挪动就成了"倒退几行"的跳。
     /// 实测 13pt（不到一行字）：锚定误差 ≤ 哨兵行高 + 阈值。
     private static let sentinelApproach: CGFloat = 16
+    /// 取消在飞的补页并留一条诊断（反向滚动、切会话都走这里）。
+    private func cancelOlderPump(reason: String) {
+        guard olderPump != nil else { return }
+        olderPump?.cancel()
+        olderPump = nil
+        ViewportProbe.note("prefetch.cancel", ["reason": reason], force: true)
+    }
+
+    /// 预加载余量：离顶部还有这么高就开始"惦记"下一页（见 `evaluateTopDistance`）。
+    /// 比触发线（`sentinelApproach`）大得多，所以它是**预取意图**而不是触发点；
+    /// 掉头往下超过这条线就取消在飞的补页。
+    private static let prefetchMargin: CGFloat = 700
+    /// 一次补页最多锚几次（测量驱动：布局稳定就提前停）。
+    private static let anchorAttemptCap = 10
     /// 判"位置没跳"的容差：内容长了多少、偏移就该跟着走多少，差在这一点之内算原地不动。
     private static let keepTolerance: CGFloat = 20
     /// 位置数据的新鲜度上限：超过它就不许拿它触发补页（见 `evaluateTopDistance`）。

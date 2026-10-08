@@ -153,6 +153,17 @@ enum ViewportProbe {
 
     // MARK: - 两条证据
 
+    /// 跳转诊断：当前**落在视口里**的行 id（按 y 从下到上）。
+    ///
+    /// 只靠 `topVisibleRow()` 判不出"目标行是渲染了但在视口外，还是根本没渲染"
+    /// （2026-10-08 T068 三次加长梯子都没修好，就是因为判不出来）。
+    static func visibleRowIds() -> [String] {
+        guard viewport.height > 1 else { return [] }
+        return rows.filter { $0.value.intersects(viewport) }
+            .sorted { $0.value.minY < $1.value.minY }
+            .map(\.key)
+    }
+
     private static func evaluate(force: Bool) {
         guard viewport.height > 1, isReady else { return }
         let band = viewport
@@ -501,6 +512,101 @@ enum ProbeVariants {
         return Int(arguments[index + 1]) ?? 0
     }
 
+    /// 复现用：假装连接器没有精确窗口能力，逼 App 走旧的 `session/page` 通道
+    /// （配合 `pageShortfall` 复现"少给一段要重问"，也就是用例 43）。
+    static var noHistoryWindow: Bool {
+        ProcessInfo.processInfo.arguments.contains("-DSHProbeNoHistoryWindow")
+    }
+
+    /// 故障注入：让前 N 次取页失败，验证"失败不等于到底、重试能恢复"（用例 48）。
+    static var failPageAttempts: Int {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-DSHProbeFailPage"),
+              index + 1 < arguments.count
+        else { return 0 }
+        return Int(arguments[index + 1]) ?? 0
+    }
+
+    /// 复现用：失败后那次自动补试的等待时长（毫秒）。默认 3 秒——对人是"自己就好了"，
+    /// 但要让用例稳定看到重试条，就得把这段窗口拉长（`-DSHProbeAutoRetryMs 20000`）。
+    static var autoRetryMs: Int {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-DSHProbeAutoRetryMs"),
+              index + 1 < arguments.count,
+              let value = Int(arguments[index + 1]), value > 0
+        else { return 3000 }
+        return value
+    }
+
+    /// 转写列表宿主走哪条实现（spec 008）。
+    /// **缺省已是 `uikit`（新宿主）**：008 的全部验收都在它上面取得（见 VERIFY-008）；
+    /// `-DSHProbeListHost swiftui` 是**回退开关**（旧 `List` 宿主保留一个版本周期，见 plan 的退场计划）。
+    static var listHost: String {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-DSHProbeListHost"),
+              index + 1 < arguments.count
+        else { return "uikit" }
+        return arguments[index + 1]
+    }
+
+    /// 复现用：把"离视口几屏才回收 / 回到几屏内水合"改掉（spec 008 的 FR-009）。
+    /// 默认 5 屏回收、2 屏水合，写进 `specs/008-transcript-list-host/contracts/list-host.md` §4。
+    static func screensArg(_ name: String) -> Int? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: name), index + 1 < arguments.count,
+              let value = Int(arguments[index + 1]), value > 0 else { return nil }
+        return value
+    }
+
+    static var reclaimScreens: Int { screensArg("-DSHProbeReclaimScreens") ?? 5 }
+    static var rehydrateScreens: Int { screensArg("-DSHProbeRehydrateScreens") ?? 2 }
+
+    /// 复现用：强制走一次"回收 → 再水合"的真实代码路径（spec 008 的 US3 / SC-004）。
+    /// 仿真器里**造不出**"滑回被回收的那一段"（未渲染的行 `scrollTo` 落不下去），
+    /// 所以用这个开关直接调用同一条链：`onNeedRehydrate → ChatModel.items(forSeqs:) → host.rehydrate`。
+    static var forceRehydrate: Bool {
+        ProcessInfo.processInfo.arguments.contains("-DSHProbeForceRehydrate")
+    }
+
+    /// 复现用：把行载荷预算压小（KB），这样"按预算丢弃"在用例里能真的发生
+    /// （spec 008 的 US1/T013；默认 32MB，真实会话远达不到）。
+    static var payloadBudgetKB: Int? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-DSHProbePayloadBudgetKB"),
+              index + 1 < arguments.count, let value = Int(arguments[index + 1]), value > 0
+        else { return nil }
+        return value
+    }
+
+    /// spike 用：转写页换成"列表宿主 spike 屏"（spec 008 的 Phase 0 A/B）。
+    /// 它不读会话，自己造 200 行、每 1.5 秒往上插 50 行并**故意并发**一次定位，
+    /// 用来量"插入时的锚点位移"与"插入与滚动并发会不会崩"。
+    static var listSpike: Bool {
+        ProcessInfo.processInfo.arguments.contains("-DSHProbeListSpike")
+    }
+
+    /// 复现用：把 `session-search` 从能力表里摘掉——等价于"连接器版本低于基线、
+    /// 不会搜整个会话"，用来验硬门槛提示与本地降级（用例 51）。
+    static var noSessionSearch: Bool {
+        ProcessInfo.processInfo.arguments.contains("-DSHProbeNoSessionSearch")
+    }
+
+    /// 复现用：启动时清空本地转写库。故障注入类用例必须在**干净库**上跑，
+    /// 否则"本地读回"会抢在注入的失败/少给一段之前把页补上，用例前提就不成立。
+    static var clearTranscriptStore: Bool {
+        ProcessInfo.processInfo.arguments.contains("-DSHProbeClearTranscriptStore")
+    }
+
+    /// 复现用：把内存窗口行数上限压小（如 `-DSHProbeWindowRows 200`），
+    /// 这样"窗口滑出去 → 往回滑读回本地、不联网"在仿真器里可观测（用例 47）。
+    static var windowRows: Int? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-DSHProbeWindowRows"),
+              index + 1 < arguments.count
+        else { return nil }
+        return Int(arguments[index + 1])
+    }
+
     /// 复现用：把转写换回 `ScrollView + LazyVStack`（产品默认已经是 `List`）。
     static var lazyStack: Bool { all.contains("lazy-stack") }
     static var noRowProbe: Bool { all.contains("no-rows") }
@@ -593,6 +699,7 @@ enum ViewportProbe {
     static func runNotifyTapProbe(delegate: SessionAlerts) async {}
     static var scrollFacts: (offset: CGFloat, content: CGFloat)? { nil }
     static func topVisibleRow() -> String? { nil }
+    static func visibleRowIds() -> [String] { [] }
     static func pause() {}
     static func resume() {}
     static func runAskProbe(provider: @MainActor () -> DSHClient?) async {}
@@ -606,6 +713,18 @@ enum ViewportProbe {
 
 enum ProbeVariants {
     static var pageShortfall: Int { 0 }
+    static var noHistoryWindow: Bool { false }
+    static var windowRows: Int? { nil }
+    static var autoRetryMs: Int { 3000 }
+    static var clearTranscriptStore: Bool { false }
+    static var noSessionSearch: Bool { false }
+    static var listHost: String { "uikit" }
+    static var listSpike: Bool { false }
+    static var payloadBudgetKB: Int? { nil }
+    static var forceRehydrate: Bool { false }
+    static var reclaimScreens: Int { 5 }
+    static var rehydrateScreens: Int { 2 }
+    static var failPageAttempts: Int { 0 }
     static var lazyStack: Bool { false }
     static var noRowProbe: Bool { false }
     static var noPixelProbe: Bool { false }

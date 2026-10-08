@@ -171,7 +171,7 @@ struct RootView: View {
                 listModel.loadCachedList()
                 // 磁盘缓存的自净：过期与超预算的转写在启动时清一次（不在热路径上做）。
                 await Task.detached {
-                    SessionTranscriptCache().prune()
+                    await Self.housekeepTranscriptStore()
                     AttachmentDiskCache().prune()
                 }.value
                 // 认下上次那台电脑并直接进列表：连不上也在列表上显示缓存 + 未连接，
@@ -197,7 +197,10 @@ struct RootView: View {
             }
             .onChange(of: scenePhase) { _, phase in
                 // 退到后台/被挂起：把转写尾部立刻写盘——此刻之后进程可能就没了。
-                if phase != .active { chatModel.persistTranscriptNow() }
+                if phase != .active {
+                    chatModel.persistTranscriptNow()
+                    Task { await chatModel.flushTranscript() }
+                }
                 // Re-checked on every return to the foreground: that is when a
                 // user who just installed an update comes back to look.
                 if phase == .active { Task { await updates.refresh() } }
@@ -508,7 +511,7 @@ struct RootView: View {
             // computer's.
             hub.stop()
             listModel.forgetConnection()
-            chatModel.forgetConnection()
+            Task { await chatModel.forgetConnection() }
             attachmentImages.reset()
             viewLog.useScope(nil)
         }
@@ -975,5 +978,25 @@ extension HostEventHub {
     func startIfNeeded(client: DSHClient?) {
         guard let client, !isLive else { return }
         start(client: client)
+    }
+}
+
+
+extension RootView {
+    /// 本地历史的日常清理：7 天没打开就归档、超预算就按最久未打开淘汰。
+    ///
+    /// 以前这两件事由 JSON 缓存的 `prune()` 在启动时做；换成 SQLite 之后语义不变、
+    /// 只是走新存储（spec 007 FR-034）。
+    static func housekeepTranscriptStore() async {
+        let store = TranscriptStore()
+        #if DEBUG
+        if ProbeVariants.clearTranscriptStore {
+            try? await store.clearAll()
+            return
+        }
+        #endif
+        _ = try? await store.evictExpired()
+        _ = try? await store.enforceBudget()
+        await store.close()
     }
 }

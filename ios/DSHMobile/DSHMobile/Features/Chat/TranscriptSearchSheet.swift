@@ -14,12 +14,16 @@ import SwiftUI
 struct TranscriptSearchSheet: View {
     @Bindable var model: ChatModel
     /// 选中一条结果：把行 id 交回转写页，由它滚动并高亮。
-    var onPick: (String) -> Void
+    var onPick: (TranscriptSearchHit) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
     @State private var onlyMine = false
     @State private var hits: [TranscriptSearchHit] = []
+    /// 连接器给的续页游标；`source` 说明这一屏命中覆盖到哪儿（spec 007 P2）。
+    @State private var searchCursor: String?
+    @State private var pageHasMore = false
+    @State private var searchSource = "local"
     @State private var isLoadingMore = false
     /// 现在**真的在屏幕上**的结果行（行自己上报，用于算"底下还剩几条"）。
     @State private var visibleHitIds: Set<String> = []
@@ -55,11 +59,31 @@ struct TranscriptSearchSheet: View {
     private static let maxScrollDrivenLoads = 4
     @FocusState private var isFocused: Bool
 
+    /// 连接器不支持"搜整个会话"时的硬门槛提示（FR-036）：只说明天花板，不禁用搜索。
+    @ViewBuilder
+    private var upgradeNotice: some View {
+        if let notice = model.searchUpgradeNotice {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.circle")
+                    .font(.caption)
+                Text(notice)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .foregroundStyle(DSHTheme.labelSecondary)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityIdentifier("search.upgrade")
+        }
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 field
                 filter
+                upgradeNotice
                 Hairline()
                 results
             }
@@ -404,10 +428,28 @@ struct TranscriptSearchSheet: View {
         let mine = onlyMine
         let browsing = isBrowsing
         let started = Date()
-        let found = await Task.detached(priority: .userInitiated) {
-            browsing ? TranscriptSearch.myQuestions(in: items)
-                     : TranscriptSearch.hits(in: items, query: query, onlyMine: mine)
-        }.value
+        let found: [TranscriptSearchHit]
+        // 只有"带关键词"的搜索才交给连接器：`_link/sessionFind` 要求至少 2 个字符，
+        // 而"只看我的提问"是**无关键词的浏览**（列出我问过的所有话），那条路仍是本地缓冲
+        // + 按需往前读（FR-010 要说的是"很久以前聊过的某件事也能搜到"，那一定有词）。
+        let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if model.connectorSearchesWholeSession, !browsing, keyword.count >= 2 {
+            // 整个会话都搜（FR-010）：命中来自连接器，可能落在手机从没读过的位置。
+            let page = await model.searchPage(query: query, onlyMine: mine)
+            found = page?.hits ?? []
+            searchCursor = page?.cursor
+            pageHasMore = page?.hasMore ?? false
+            searchSource = "connector"
+        } else {
+            // 没有这个能力：还是老办法（本地、只搜已加载的那一段），并且**离开主线程**匹配。
+            found = await Task.detached(priority: .userInitiated) {
+                browsing ? TranscriptSearch.myQuestions(in: items)
+                         : TranscriptSearch.hits(in: items, query: query, onlyMine: mine)
+            }.value
+            searchCursor = nil
+            pageHasMore = false
+            searchSource = "local"
+        }
         if Task.isCancelled { return }
         ViewportProbe.note("search.run", [
             "key": key,
@@ -424,7 +466,7 @@ struct TranscriptSearchSheet: View {
     }
 
     private func pick(_ hit: TranscriptSearchHit) {
-        onPick(hit.id)
+        onPick(hit)
         dismiss()
     }
 
@@ -482,8 +524,18 @@ struct TranscriptSearchSheet: View {
         // 必须始终不变——这是"加载无感、列表不跳"的机器判据（`firstBefore == firstAfter`）。
         let firstBefore = hits.first?.id
         let countBefore = hits.count
-        await model.extendSearchHistory()
-        await performSearch(key: searchKey)
+        if searchSource == "connector" {
+            // 连接器分页：直接要下一页命中（它自己扫整个会话），不走本地缓冲。
+            if let page = await model.searchPage(query: self.query, onlyMine: onlyMine, cursor: searchCursor) {
+                let existing = Set(hits.map(\.id))
+                hits.append(contentsOf: page.hits.filter { !existing.contains($0.id) })
+                searchCursor = page.cursor
+                pageHasMore = page.hasMore
+            }
+        } else {
+            await model.extendSearchHistory()
+            await performSearch(key: searchKey)
+        }
         lastRowCount = hits.count
         isLoadingMore = false
         ViewportProbe.note("search.page", [
