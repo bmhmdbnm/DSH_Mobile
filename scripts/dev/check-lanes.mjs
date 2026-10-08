@@ -35,11 +35,17 @@ export function collectChangedFiles({ changed = [], from = undefined, repo = REP
 
 /**
  * 校验必跑集合的证据。
- * @returns {{required: string[], satisfied: string[], missing: string[], blocked: object[], reasons: object, evidence: object, stale: object}}
+ *
+ * 两种"不算缺"的来源必须与"真的验过"分开记：
+ *   - `ciCovered`：CI 模式下 L1/L2 由 workflow 自己的作业覆盖（它们挂了 PR 就红）；
+ *   - `exempt`：L3 这类 CI 跑不了的格子，改动记录里给了 `L3: <verdict 路径>` 或
+ *     `L3: 未跑 — <理由>` 的声明。声明是"允许未跑但要留痕"，不是"验过"。
  */
-export function evaluateEvidence({ required, reasons, entries, evidenceRoot = DEFAULT_EVIDENCE_ROOT, changedFiles = [] } = {}) {
+export function evaluateEvidence({ required, reasons, entries, evidenceRoot = DEFAULT_EVIDENCE_ROOT, changedFiles = [], ciCovered = [], l3Declaration = '' } = {}) {
   const newestChange = newestMtime(changedFiles)
   const satisfied = []
+  const covered = []
+  const exempt = []
   const missing = []
   const blocked = []
   const evidence = {}
@@ -55,12 +61,36 @@ export function evaluateEvidence({ required, reasons, entries, evidenceRoot = DE
       continue
     }
     if (passes.length > 0) stale[lane] = `证据比改动旧（${relative(passes[passes.length - 1].path)}）`
+    if (ciCovered.includes(lane)) {
+      covered.push(lane)
+      continue
+    }
+    const declared = lane === 'l3' ? parseL3Declaration(l3Declaration) : undefined
+    if (declared !== undefined) {
+      exempt.push({ lane, reason: declared })
+      continue
+    }
     if (blocks.length > 0) {
       blocked.push({ lane, reason: blocks[blocks.length - 1].verdict.blockedReason, nextStep: blocks[blocks.length - 1].verdict.nextStep })
     }
     missing.push(lane)
   }
-  return { required, satisfied, missing, blocked, reasons, evidence, stale }
+  return { required, satisfied, covered, exempt, missing, blocked, reasons, evidence, stale }
+}
+
+/**
+ * 改动记录里的 L3 声明。两种写法都认：
+ *   `L3: .lanes/runs/l3/<run-id>/verdict.json`（本机跑过，附证据路径）
+ *   `L3: 未跑 — <理由>`（明确没跑，但说清为什么）
+ * 认不出的写法一律不算声明——"没写"与"写了看不懂"都要挡下来。
+ */
+export function parseL3Declaration(text) {
+  const source = String(text ?? '')
+  const withEvidence = /L3[:：]\s*(\S*\.lanes\/runs\/l3\/\S*verdict\.json)/.exec(source)
+  if (withEvidence !== null) return `本机已跑 L3：${withEvidence[1]}`
+  const notRun = /L3[:：]\s*(未跑|不跑)\s*[—\-:：]?\s*([^\n]{4,})/.exec(source)
+  if (notRun !== null) return `L3 ${notRun[1]}：${notRun[2].trim()}`
+  return undefined
 }
 
 function newestMtime(files) {
@@ -100,6 +130,8 @@ function parseArgs(argv) {
     else if (token === '--require') require.push(argv[++index])
     else if (token === '--changed-from') flags.from = argv[++index]
     else if (token === '--evidence-root') flags.evidenceRoot = argv[++index]
+    else if (token === '--l3-declaration') flags.l3Declaration = argv[++index]
+    else if (token === '--ci') flags.ci = true
     else if (token === '--json') flags.json = true
     else if (token === '--help' || token === '-h') flags.help = true
     else throw new Error(`未知参数：${token}`)
@@ -107,7 +139,7 @@ function parseArgs(argv) {
   return { changed, require, flags }
 }
 
-export function gate({ changed = [], from, require: forced = [], evidenceRoot = DEFAULT_EVIDENCE_ROOT, matrixPath } = {}) {
+export function gate({ changed = [], from, require: forced = [], evidenceRoot = DEFAULT_EVIDENCE_ROOT, matrixPath, ci = false, l3Declaration = '' } = {}) {
   const matrix = loadMatrix(matrixPath)
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'))
   const issues = [...validateMatrix(matrix), ...validateLaneEntries(matrix, pkg.scripts ?? {})]
@@ -117,31 +149,39 @@ export function gate({ changed = [], from, require: forced = [], evidenceRoot = 
   const decision = requiredLanes(matrix, files)
   const required = [...new Set([...decision.required, ...forced])].sort()
   const entries = readEvidence(evidenceRoot)
-  const verdict = evaluateEvidence({ required, reasons: decision.reasons, entries, evidenceRoot, changedFiles: files })
-  const missing = verdict.missing
-  const ok = missing.length === 0
+  // CI 里 L1/L2 由 workflow 自己的作业覆盖（它们红了 PR 就红）；L3 跑不了，只能要声明。
+  const ciCovered = ci ? required.filter((lane) => lane === 'l1' || lane === 'l2') : []
+  const verdict = evaluateEvidence({ required, reasons: decision.reasons, entries, evidenceRoot, changedFiles: files, ciCovered, l3Declaration })
+  const ok = verdict.missing.length === 0
   return {
     exitCode: ok ? 0 : 1,
     ok,
     changedFiles: files,
     subjects: decision.subjects,
     required,
+    ci,
     ...verdict,
-    missing,
   }
 }
 
 function format(result) {
   if (result.toolError) return `矩阵/入口自身有问题（退出码 2）：\n  ${result.toolError.join('\n  ')}`
   const lines = [`改动命中：${result.subjects.join('、') || '（没有命中任何被测对象）'}`]
-  lines.push(`必跑渠道：${result.required.join('、') || '（无）'}`)
+  lines.push(`必跑渠道：${result.required.join('、') || '（无）'}${result.ci ? '（CI 模式：L1/L2 由本 workflow 的作业覆盖）' : ''}`)
   for (const lane of result.required) {
     const why = result.reasons[lane] ?? '被 --require 强制要求'
-    if (result.satisfied.includes(lane)) lines.push(`  ok   ${lane} — ${result.evidence[lane]}（${why}）`)
-    else lines.push(`  MISS ${lane} — ${why}${result.stale[lane] ? `；${result.stale[lane]}` : ''}`)
+    if (result.satisfied.includes(lane)) lines.push(`  ok      ${lane} — ${result.evidence[lane]}（${why}）`)
+    else if (result.covered.includes(lane)) lines.push(`  CI      ${lane} — 由 workflow 作业覆盖（${why}）`)
+    else if (result.exempt.some((item) => item.lane === lane)) {
+      const item = result.exempt.find((entry) => entry.lane === lane)
+      lines.push(`  声明    ${lane} — ${item.reason}（${why}）`)
+    } else lines.push(`  MISS    ${lane} — ${why}${result.stale[lane] ? `；${result.stale[lane]}` : ''}`)
   }
   for (const block of result.blocked) lines.push(`  BLOCKED ${block.lane} — ${block.reason}；下一步：${block.nextStep}`)
-  if (!result.ok) lines.push('缺证据：跑 `npm run lane:<id> -- run --scenario <name>` 补齐，或说明为什么这一级不需要跑（改矩阵）。')
+  if (!result.ok) {
+    lines.push('缺证据：跑 `npm run lane:<id> -- run --scenario <name>` 补齐；L3 跑不了时，在改动记录里写')
+    lines.push('`L3: 未跑 — <理由>` 或 `L3: .lanes/runs/l3/<run-id>/verdict.json`（声明会被原样打印，不许静默跳过）。')
+  }
   return lines.join('\n')
 }
 
@@ -154,12 +194,20 @@ async function main(argv = process.argv.slice(2)) {
     return 2
   }
   if (args.flags.help) {
-    process.stdout.write('用法：check-lanes.mjs [--changed <file>]… [--changed-from <file>] [--require <lane>]… [--json]\n')
+    process.stdout.write('用法：check-lanes.mjs [--changed <file>]… [--changed-from <file>] [--require <lane>]…\n'
+      + '                    [--ci] [--l3-declaration <text>] [--json]\n')
     return 0
   }
   let result
   try {
-    result = gate({ changed: args.changed, from: args.flags.from, require: args.require, evidenceRoot: args.flags.evidenceRoot ?? DEFAULT_EVIDENCE_ROOT })
+    result = gate({
+      changed: args.changed,
+      from: args.flags.from,
+      require: args.require,
+      evidenceRoot: args.flags.evidenceRoot ?? DEFAULT_EVIDENCE_ROOT,
+      ci: args.flags.ci === true,
+      l3Declaration: args.flags.l3Declaration ?? process.env.DSH_L3_DECLARATION ?? '',
+    })
   } catch (error) {
     process.stderr.write(`工具错误：${error.message}\n`)
     return 2

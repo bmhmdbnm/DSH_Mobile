@@ -200,3 +200,34 @@ jobs:
             fi
           done
           exit $status
+
+  # 006：选择性拦截。CI 跑得了 L1/L2 的等价部分——就是上面那些作业（它们红了 PR 就红）；
+  # 跑不了 L3（干净 guest、真实手机、TestFlight 都不在 runner 上）。所以这里只做两件事：
+  #   ① 矩阵与渠道入口的守卫（缺格、重复、理由缺失、npm 脚本漂移 → exit 2）；
+  #   ② 改动要求 L3 时，必须在改动记录（PR 正文或提交说明）里留痕：
+  #      `L3: .lanes/runs/l3/<run-id>/verdict.json` 或 `L3: 未跑 — <理由>`。
+  # 声明会被原样打印出来，不是"验过"，只是"不许静默跳过"。
+  lanes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 这次改动必须跑哪几级（L3 缺留痕即失败）
+        env:
+          DSH_L3_DECLARATION: ${{ github.event.pull_request.body }} ${{ github.event.head_commit.message }}
+        run: |
+          set -e
+          base='${{ github.event.pull_request.base.sha }}'
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base='${{ github.event.before }}'
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base='HEAD~1'
+          fi
+          git diff --name-only "$base" HEAD > changed.txt
+          echo "改动文件："; sed 's/^/  /' changed.txt
+          node scripts/dev/check-lanes.mjs --changed-from changed.txt --ci

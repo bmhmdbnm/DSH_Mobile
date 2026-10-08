@@ -241,6 +241,42 @@ test('渠道入口：正常场景写出四态证据且能读回', async () => {
   }
 })
 
+test('CI 模式：L1/L2 由作业覆盖，L3 仍要声明（声明原样留痕，不是"验过"）', () => {
+  const root = tempDir()
+  try {
+    const bare = gate({ changed: [INSTALL_FILE], evidenceRoot: root, ci: true })
+    assert.deepEqual(bare.required, ['l1', 'l3'])
+    assert.ok(bare.covered.includes('l1'))
+    assert.deepEqual(bare.missing, ['l3'])
+    assert.equal(bare.exitCode, 1)
+
+    const declared = gate({
+      changed: [INSTALL_FILE],
+      evidenceRoot: root,
+      ci: true,
+      l3Declaration: '本次改动\nL3: 未跑 — guest 镜像还没建好',
+    })
+    assert.equal(declared.exitCode, 0)
+    assert.equal(declared.exempt[0].lane, 'l3')
+    assert.ok(declared.exempt[0].reason.includes('guest 镜像'))
+
+    const withPath = gate({
+      changed: [INSTALL_FILE],
+      evidenceRoot: root,
+      ci: true,
+      l3Declaration: 'L3: .lanes/runs/l3/20261008T101500Z-onboarding/verdict.json',
+    })
+    assert.equal(withPath.exitCode, 0)
+    assert.ok(withPath.exempt[0].reason.includes('verdict.json'))
+
+    const gibberish = gate({ changed: [INSTALL_FILE], evidenceRoot: root, ci: true, l3Declaration: '跑过了，放心' })
+    assert.equal(gibberish.exitCode, 1)
+    assert.deepEqual(gibberish.missing, ['l3'])
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('矩阵自己能被加载且合法（真实仓库这一份）', () => {
   const matrix = loadMatrix()
   assert.deepEqual(validateMatrix(matrix), [])
