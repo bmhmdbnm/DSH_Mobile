@@ -79,13 +79,29 @@ public enum TranscriptHitLocator {
     /// Fills the phone-side row id on each hit, dropping the ones that have no row
     /// to point at (the reader has not loaded that stretch yet).
     public static func attach(hits: [HistorySearchHit], to items: [TimelineItem]) -> [TranscriptSearchHit] {
-        hits.compactMap { hit in
-            guard let row = row(forSeq: hit.seq, in: items) else { return nil }
+        // 同一条记录可能落进同一行（命中映射是按 seq → 行），去重后每行只留一条：
+        // 列表用行 id 当身份，重复 id 会让 SwiftUI 的 `ForEach` 出现未定义渲染（少行/错行）。
+        var seen = Set<String>()
+        let windowOldest = items.first?.seq ?? Int.max
+        return hits.compactMap { hit in
             let role: TranscriptSearchHit.Role = switch hit.role {
             case "me": .me
             case "tool": .tool
             default: .agent
             }
+            // 命中在**已加载窗口之外**（浏览"我的提问"时几乎全是这样）：`row(forSeq:)` 会退化成
+            // "窗口第一行"，全都会被去重成一条——那正是"列表里只剩几条"的原因。
+            // 这类命中用合成身份（`seq-<n>`）：列表直接显示连接器给的 snippet，
+            // 点它时由 `ChatView.jumpToHit` 按 seq 换窗口再跳（那条路已经验过）。
+            if hit.seq < windowOldest {
+                let synthetic = "seq-\(hit.seq)"
+                guard seen.insert(synthetic).inserted else { return nil }
+                return TranscriptSearchHit(id: synthetic, role: role, snippet: hit.snippet,
+                                           highlightStart: hit.highlightStart,
+                                           highlightLength: hit.highlightLength, seq: hit.seq)
+            }
+            guard let row = row(forSeq: hit.seq, in: items) else { return nil }
+            guard seen.insert(row.id).inserted else { return nil }
             return TranscriptSearchHit(id: row.id, role: role, snippet: hit.snippet,
                                        highlightStart: hit.highlightStart,
                                        highlightLength: hit.highlightLength, seq: hit.seq)

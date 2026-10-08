@@ -219,12 +219,15 @@ export function createHistoryService({ logger = console } = {}) {
     const sessionId = idOfAddress(args.address)
     if (sessionId === undefined) return failure('gateway/bad-request', 'address must name a session')
     const query = typeof args.query === 'string' ? args.query.trim() : ''
-    if (query.length < MIN_QUERY_LENGTH) {
+    const roles = Array.isArray(args.roles) && args.roles.length > 0 ? new Set(args.roles) : undefined
+    // 浏览模式：**没有关键词但带了 roles**（读者要看"我问过的全部提问"）。
+    // 这时不按文本过滤，只按 seq 段扫，按角色筛。
+    const browsing = query.length === 0 && roles !== undefined
+    if (!browsing && query.length < MIN_QUERY_LENGTH) {
       return failure('link/query-too-short', `query must be at least ${MIN_QUERY_LENGTH} characters`)
     }
     const limit = Number.isSafeInteger(Number(args.limit)) && Number(args.limit) > 0
       ? Math.min(Number(args.limit), 200) : DEFAULT_SEARCH_LIMIT
-    const roles = Array.isArray(args.roles) && args.roles.length > 0 ? new Set(args.roles) : undefined
     // Advanced knob (also used by the measurement route and the tests): a smaller
     // chunk makes the cursor path reachable on short sessions. Clamped, never 0.
     const chunk = Number.isSafeInteger(Number(args.chunk)) && Number(args.chunk) > 0
@@ -271,11 +274,10 @@ export function createHistoryService({ logger = console } = {}) {
       let scanned = 0
       while (to >= 0 && hits.length < limit && scanned < MAX_SEARCH_CHUNKS_PER_CALL) {
         const chunkFrom = Math.max(0, to - chunk + 1)
+        const filters = [{ kind: 'seq', from: chunkFrom, to }]
+        if (!browsing) filters.push({ kind: 'text', text: query })
         const docs = await withTimeout(
-          sessionQuery.filterEvents(sessionId, [
-            { kind: 'seq', from: chunkFrom, to },
-            { kind: 'text', text: query },
-          ]),
+          sessionQuery.filterEvents(sessionId, filters),
           HOST_CALL_TIMEOUT_MS,
           'filterEvents(search)',
         )
@@ -287,7 +289,10 @@ export function createHistoryService({ logger = console } = {}) {
           const role = roleOf(doc.type)
           if (role === undefined) continue
           if (roles !== undefined && !roles.has(role)) continue
-          hits.push({ seq: doc.seq, role, ...makeSnippet(doc.text, query) })
+          hits.push({ seq: doc.seq, role, ...(query.length > 0
+            ? makeSnippet(doc.text, query)
+            : { snippet: String(doc.text ?? '').slice(0, 72).replace(/\s+/g, ' ').trim(),
+                highlightStart: 0, highlightLength: 0 }) })
           if (hits.length >= limit) break
         }
         to = chunkFrom - 1

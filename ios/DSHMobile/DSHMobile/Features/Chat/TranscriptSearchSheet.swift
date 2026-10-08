@@ -433,9 +433,13 @@ struct TranscriptSearchSheet: View {
         // 而"只看我的提问"是**无关键词的浏览**（列出我问过的所有话），那条路仍是本地缓冲
         // + 按需往前读（FR-010 要说的是"很久以前聊过的某件事也能搜到"，那一定有词）。
         let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if model.connectorSearchesWholeSession, !browsing, keyword.count >= 2 {
-            // 整个会话都搜（FR-010）：命中来自连接器，可能落在手机从没读过的位置。
-            let page = await model.searchPage(query: query, onlyMine: mine)
+        // 连接器能搜整个会话时：
+        //  * 带关键词 ⇒ 搜整个会话；
+        //  * "只看我的提问"（无关键词的浏览）⇒ 也问连接器，**首页一次要 200 条**，
+        //    这样进面板就能看到"我问过的全部提问"而不是本地那几条（2026-10-08 真机反馈）。
+        if model.connectorSearchesWholeSession, browsing || keyword.count >= 2 {
+            let page = await model.searchPage(query: browsing ? "" : query, onlyMine: mine,
+                                              limit: browsing ? 200 : 50)
             found = page?.hits ?? []
             searchCursor = page?.cursor
             pageHasMore = page?.hasMore ?? false
@@ -526,7 +530,9 @@ struct TranscriptSearchSheet: View {
         let countBefore = hits.count
         if searchSource == "connector" {
             // 连接器分页：直接要下一页命中（它自己扫整个会话），不走本地缓冲。
-            if let page = await model.searchPage(query: self.query, onlyMine: onlyMine, cursor: searchCursor) {
+            let browsingNow = isBrowsing
+            if let page = await model.searchPage(query: browsingNow ? "" : self.query, onlyMine: onlyMine,
+                                                 cursor: searchCursor, limit: browsingNow ? 200 : 50) {
                 let existing = Set(hits.map(\.id))
                 hits.append(contentsOf: page.hits.filter { !existing.contains($0.id) })
                 searchCursor = page.cursor

@@ -308,3 +308,20 @@ test('sessionFind caps how much it scans per call', async () => {
   assert.ok(result.value.scannedChunks <= 4, `扫了 ${result.value.scannedChunks} 块，上限是 4`)
   assert.equal(result.value.hasMore, true)
 })
+
+// 浏览模式（spec 008 的真机反馈修复）：没有关键词、只带 roles ⇒ 列出"我问过的全部提问"。
+test('sessionFind 在无关键词 + roles 时列出提问（浏览模式）', async () => {
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeSearchQuery(searchLog(40)))
+  const result = await service.handle(FIND_METHOD, { address: ADDRESS, query: '', roles: ['me'], limit: 20, chunk: 40 })
+  assert.equal(result.ok, true)
+  assert.ok(result.value.hits.length > 0, '应该列出提问')
+  assert.ok(result.value.hits.every((hit) => hit.role === 'me'), '只留我的提问')
+  assert.equal(result.value.source, 'scan')
+})
+
+test('sessionFind 无关键词又无 roles 仍然拒绝（没有范围的扫描没有意义）', async () => {
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeSearchQuery(searchLog(20)))
+  const result = await service.handle(FIND_METHOD, { address: ADDRESS, query: '' })
+  assert.equal(result.ok, false)
+  assert.equal(result.error.code, 'link/query-too-short')
+})

@@ -506,14 +506,18 @@ final class ChatModel {
     ///
     /// 命中可能落在**还没加载**的位置：先把那一段上下文从本地库读回来（不联网），
     /// 再做 `seq → 行` 的映射，否则命中会因为"没有行可指"被丢掉（FR-011）。
-    func searchPage(query: String, onlyMine: Bool, cursor: String? = nil) async -> SearchPage? {
+    func searchPage(query: String, onlyMine: Bool, cursor: String? = nil,
+                    limit: Int = 50) async -> SearchPage? {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty, let client = store?.client, let address else { return nil }
+        // 空关键词只允许"浏览我的提问"这一种用法（连接器侧同样要求带 roles，
+        // 否则一次无范围的全表扫描没有意义）。spec 008 的真机反馈修复。
+        guard !needle.isEmpty || onlyMine, let client = store?.client, let address else { return nil }
         let service = TranscriptSearchService(client: client, address: address,
                                               capabilities: effectiveCapabilities)
         switch service.source {
         case .connector:
-            guard let value = try? await service.page(query: needle, onlyMine: onlyMine, cursor: cursor) else {
+            guard let value = try? await service.page(query: needle, onlyMine: onlyMine,
+                                                     cursor: cursor, limit: limit) else {
                 return nil
             }
             await loadContextForHits(value.hits)
