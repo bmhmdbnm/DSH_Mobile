@@ -7,7 +7,8 @@ import time
 
 import pytest
 
-from store import Conflict, InviteRejected, NotFound, Store, normalize_pair_code
+from store import (Conflict, InviteRejected, NotFound, PairCodeClaimRejected, Store,
+                   normalize_pair_code)
 
 
 def test_pair_codes_are_stored_hashed(store: Store):
@@ -37,16 +38,53 @@ def test_pair_code_is_single_use_and_normalized(store: Store):
     assert claimed["ok"] is True
     assert claimed["agentId"] == agent["agentId"]
     assert claimed["deviceToken"].startswith("dt_")
-    with pytest.raises(NotFound):
+    with pytest.raises(PairCodeClaimRejected) as rejection:
         store.claim_pair_code(minted["code"], device_name="iPhone")
+    # "已用" 与 "过期" 是两件事：用户拿着屏幕上那张码再扫一次时，
+    # 只有前一种能解释发生了什么。
+    assert rejection.value.reason == "used"
+    assert rejection.value.details["deviceId"] == claimed["deviceId"]
+    assert rejection.value.details["agentId"] == agent["agentId"]
 
 
 def test_pair_code_expiry(store: Store):
     account = store.create_account("a")
     agent = store.register_agent(account["accountId"], "mac")
     minted = store.mint_pair_code(agent["agentId"], ttl_ms=-1)
-    with pytest.raises(NotFound):
+    with pytest.raises(PairCodeClaimRejected) as rejection:
         store.claim_pair_code(minted["code"], device_name="iPhone")
+    assert rejection.value.reason == "expired"
+    assert rejection.value.details["expiresAt"] > 0
+
+
+def test_a_code_nobody_minted_is_unknown(store: Store):
+    account = store.create_account("a")
+    agent = store.register_agent(account["accountId"], "mac")
+    store.mint_pair_code(agent["agentId"], ttl_ms=60_000)
+    with pytest.raises(PairCodeClaimRejected) as rejection:
+        store.claim_pair_code("ZZZZ-ZZZZ", device_name="iPhone")
+    assert rejection.value.reason == "unknown"
+    # 没有命中任何一行，就没有行上的时间戳可说。
+    assert rejection.value.details == {}
+
+
+def test_classification_only_looks_back_a_bounded_window(store: Store):
+    """窗口之外的码一律报 unknown——判定本身不能变成 CPU 放大器。
+
+    逐行 scrypt 是有意昂贵的，所以"已用/过期"的判定按创建时间与条数双重设限：
+    更早的码与其花 CPU 去认，不如老老实实说"无效"。
+    """
+    account = store.create_account("a")
+    agent = store.register_agent(account["accountId"], "mac")
+    minted = store.mint_pair_code(agent["agentId"], ttl_ms=60_000)
+    row = store._conn.execute("SELECT createdAt, codeHash FROM pairCodes").fetchone()
+    aged = int(row["createdAt"]) - 3 * 60 * 60 * 1000
+    store._conn.execute("UPDATE pairCodes SET createdAt=?, expiresAt=? WHERE codeHash=?",
+                        (aged, aged, row["codeHash"]))
+    store._conn.commit()
+    with pytest.raises(PairCodeClaimRejected) as rejection:
+        store.claim_pair_code(minted["code"], device_name="iPhone")
+    assert rejection.value.reason == "unknown"
 
 
 def test_disabled_agent_cannot_be_paired(store: Store):

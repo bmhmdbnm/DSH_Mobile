@@ -114,6 +114,17 @@ CREATE TABLE IF NOT EXISTS invites (
 
 DEFAULT_PAIR_TTL_MS = 10 * 60 * 1000
 DEFAULT_DEVICE_TTL_MS = 365 * 24 * 60 * 60 * 1000
+
+#: How far back a *rejected* pairing claim looks for the row it actually hit,
+#: and how many rows it is willing to scrypt-verify to find it.
+#:
+#: The live-code scan is bounded by the TTL on its own; this second scan exists
+#: only to answer "already used" or "expired" instead of "not valid", and scrypt
+#: per row is deliberately expensive — a rejection path that walked the whole
+#: table would be a CPU amplifier. Two hours is far past any TTL a person can
+#: still be looking at, and 50 rows is far more than a machine mints in one.
+_PAIR_REJECT_LOOKBACK_MS = 2 * 60 * 60 * 1000
+_PAIR_REJECT_LIMIT = 50
 #: Invites are handed out by a person and redeemed days later, unlike pairing
 #: codes which live for minutes.
 DEFAULT_INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000
@@ -212,6 +223,28 @@ class InviteRejected(StoreError):
     def __init__(self, reason: str, message: str):
         super().__init__(message)
         self.reason = reason
+
+
+class PairCodeClaimRejected(NotFound):
+    """A pairing code could not be claimed, and *why*.
+
+    The same argument as :class:`InviteRejected`, for the other code a person
+    reads off a screen: one sentence covering a typo, a second scan of a code
+    that is already spent, and a code that simply ran out of time cannot be acted
+    on — not by the person, and not by whoever ends up reading the log line.
+
+    ``reason`` is ``unknown`` | ``used`` | ``expired``; ``details`` carries the
+    timestamps and identity of the row the submitted code matched when one did,
+    which is what turns "扫码没反应" into an answerable report.
+
+    Subclasses :class:`NotFound` on purpose: every existing caller that treats a
+    lost code as "not found" keeps working unchanged.
+    """
+
+    def __init__(self, reason: str, message: str, **details: Any):
+        super().__init__(message)
+        self.reason = reason
+        self.details = details
 
 def local_day(stamp: float | None = None) -> int:
     """服务器本地日的序号，形如 20260921。
@@ -461,6 +494,10 @@ class Store:
 
         The lookup has to scan live unused codes because each row carries its
         own scrypt salt; the candidate set is tiny (codes expire in minutes).
+
+        A miss is not simply "not found": see :meth:`_pair_code_rejection`, which
+        re-checks the bounded recent history so the caller can say whether the
+        code was already spent or had run out.
         """
         normalized = normalize_pair_code(code)
         if not normalized:
@@ -473,7 +510,7 @@ class Store:
             ).fetchall()
             match = next((row for row in rows if _verify_pair_code(normalized, row["codeHash"])), None)
             if match is None:
-                raise NotFound("pairing code is invalid, used, or expired")
+                raise self._pair_code_rejection(normalized, stamp)
             agent = self._conn.execute(
                 "SELECT * FROM agents WHERE agentId=?", (match["agentId"],)
             ).fetchone()
@@ -500,6 +537,34 @@ class Store:
             "deviceToken": token,
             "expiresAt": expires,
         }
+
+    def _pair_code_rejection(self, normalized: str, stamp: int) -> PairCodeClaimRejected:
+        """Why a claim missed every live code: spent, expired, or never issued.
+
+        Called only from the failure path of :meth:`claim_pair_code`, with the
+        lock held. The candidate query deliberately excludes rows that are still
+        live — those were already scanned and did not match, so a hit here can
+        only mean used or expired, and the answer can never contradict the
+        decision that produced it. Bounded by both time and row count; see
+        ``_PAIR_REJECT_LOOKBACK_MS``.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM pairCodes WHERE createdAt > ? AND (usedAt IS NOT NULL OR expiresAt <= ?)"
+            " ORDER BY createdAt DESC LIMIT ?",
+            (stamp - _PAIR_REJECT_LOOKBACK_MS, stamp, _PAIR_REJECT_LIMIT),
+        ).fetchall()
+        hit = next((row for row in rows if _verify_pair_code(normalized, row["codeHash"])), None)
+        if hit is None:
+            return PairCodeClaimRejected("unknown", "that pairing code is not valid")
+        if hit["usedAt"] is not None:
+            return PairCodeClaimRejected(
+                "used", "that pairing code has already been used",
+                agentId=hit["agentId"], createdAt=int(hit["createdAt"]),
+                usedAt=int(hit["usedAt"]), deviceId=hit["deviceId"])
+        return PairCodeClaimRejected(
+            "expired", "that pairing code has expired",
+            agentId=hit["agentId"], createdAt=int(hit["createdAt"]),
+            expiresAt=int(hit["expiresAt"]))
 
     def purge_expired(self, at: int | None = None) -> int:
         stamp = at or now_ms()

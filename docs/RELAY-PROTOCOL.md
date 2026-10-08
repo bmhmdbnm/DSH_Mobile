@@ -71,6 +71,17 @@ Relay 只做两件事：**鉴权**与**按 `agentId` 转发**。它不解析 DLP
 
 失败：`{"ok":false,"error":{"code":"pair/invalid-code","message":"..."}}`
 
+`error.code` 区分三种失败（HTTP 状态都是 `404`），因为三者的下一步动作不同：
+
+| `error.code` | 含义 | 该做什么 |
+|---|---|---|
+| `pair/invalid-code` | 没有这张码（打错，或早于判定窗口） | 重新生成一张 |
+| `pair/used-code` | 这张码已经被兑换过 | 重新生成一张；一张码只能配一台设备 |
+| `pair/expired-code` | 这张码过了有效期 | 重新生成一张 |
+
+判定「已用 / 过期」要逐行核对最近两小时内的码，因此超出这个窗口的码一律按
+`pair/invalid-code` 回答；判定失败同样计入限流桶。
+
 - 配对码一次性、有时效（默认 10 分钟），由电脑侧连接器生成并展示（二维码 / 终端）。
 - `deviceToken` 长期有效（默认 365 天），并随 `/pair/refresh` 轮换。
 

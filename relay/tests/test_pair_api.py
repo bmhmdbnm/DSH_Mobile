@@ -42,7 +42,26 @@ async def test_pair_claim_is_one_time(client, provisioned):
     assert (await client.post("/pair/claim", json=payload)).status == 200
     second = await client.post("/pair/claim", json=payload)
     assert second.status == 404
-    assert (await second.json())["error"]["code"] == "pair/invalid-code"
+    body = await second.json()
+    # 同一张码再扫一次，与"打错字"必须能分开：前者是拿屏幕上那张旧码
+    # 给第二台手机扫，后者才是真的输错。
+    assert body["error"]["code"] == "pair/used-code"
+    assert "already been used" in body["error"]["message"]
+
+
+async def test_pair_claim_says_an_expired_code_expired(client, provisioned, store):
+    stale = store.mint_pair_code(provisioned["agent"]["agentId"], ttl_ms=-1)
+    response = await client.post("/pair/claim",
+                                 json={"pairCode": stale["code"], "deviceName": "iPhone"})
+    assert response.status == 404
+    assert (await response.json())["error"]["code"] == "pair/expired-code"
+
+
+async def test_pair_claim_calls_a_stranger_code_unknown(client, provisioned):
+    response = await client.post("/pair/claim",
+                                 json={"pairCode": "ZZZZ-ZZZZ", "deviceName": "iPhone"})
+    assert response.status == 404
+    assert (await response.json())["error"]["code"] == "pair/invalid-code"
 
 
 @pytest.mark.parametrize("payload", [

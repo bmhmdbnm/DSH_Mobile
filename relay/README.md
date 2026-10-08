@@ -285,7 +285,10 @@ These numbers are the relay's, so they can.
 |---|---|
 | device never gets `hostStatus online:true` | is the agent connected? `journalctl -u dsh-relay -f` logs `agent <id> connected` |
 | `401` on the device WebSocket | the device token is unknown, revoked, or expired (`admin.py device-list --all`) |
-| `pair/invalid-code` | the code is one-time only and lives 10 minutes; mint a new one |
+| `pair/invalid-code` | no such code: mistyped, or older than the classification window |
+| `pair/used-code` | the code was already claimed — one code pairs one device; a second phone needs a fresh one |
+| `pair/expired-code` | the code outlived its TTL (10 minutes by default); mint a new one |
+| a rejected claim, and which code it was | the log line names the reason and, when the code matched a row, when it was minted / used / expired — `journalctl -u dsh-relay \| grep 'pair claim rejected'` |
 | device is dropped every few seconds | it is not draining frames; the relay closes on 512 queued frames (code `4008`) |
 | device stops receiving mid-session, close code `4011` | it spent its daily allowance (`--device-daily-mb`); the frame before the close is an `error` with code `quota/device-daily` |
 | a device feels slow but nothing is dropped | it is being paced (`--device-rate-kbps`); `GET /stats` shows the seconds each device spent waiting |

@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import ipaddress
 import json
 import logging
+import secrets
 import time
 import uuid
 from typing import Any
@@ -19,7 +22,8 @@ from typing import Any
 from aiohttp import web
 
 import dlp
-from store import InviteRejected, PairCodeRejected, Store, StoreError, hash_invite_code
+from store import (InviteRejected, PairCodeClaimRejected, PairCodeRejected, Store,
+                   StoreError, hash_invite_code, normalize_pair_code)
 
 LOGGER = logging.getLogger("relay.api")
 
@@ -32,6 +36,24 @@ _SCRYPT_SLOTS = asyncio.Semaphore(2)
 #: end is the front end itself and would put every caller in one bucket.
 _CLAIM_FAILURES = 10
 _CLAIM_WINDOW_S = 300
+
+#: How a store-level rejection is reported on the wire. ``unknown`` keeps the
+#: code this endpoint has always returned, so a client that knows only that one
+#: is unaffected; the other two let a client (and a log reader) tell a second
+#: scan of a spent code from a code that ran out of time.
+_PAIR_REJECTION_CODES = {
+    "unknown": "pair/invalid-code",
+    "used": "pair/used-code",
+    "expired": "pair/expired-code",
+}
+
+#: Salt for :func:`code_fingerprint`. Random per process, so a fingerprint
+#: correlates repeats of the *same* submission inside one run — what the log line
+#: is for — and is useless for anything else. A stable key, or a bare hash of the
+#: code, would put an offline-crackable copy of a secret in the log; the store
+#: keeps these codes as per-row scrypt precisely so that reading the database
+#: does not reveal them.
+_FINGERPRINT_KEY = secrets.token_bytes(16)
 
 CORS_HEADERS = {
     "access-control-allow-origin": "*",
@@ -64,6 +86,38 @@ async def read_json(request: web.Request) -> dict[str, Any] | None:
     except (ValueError, UnicodeDecodeError):
         return None
     return body if isinstance(body, dict) else None
+
+
+def code_fingerprint(normalized_code: str) -> str:
+    """A short process-local handle for a submitted code — never the code itself."""
+    return hmac.new(_FINGERPRINT_KEY, normalized_code.encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:12]
+
+
+def local_stamp(ms: int) -> str:
+    """A store timestamp as the operator's wall clock, for log reading."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ms / 1000))
+
+
+def describe_pair_rejection(error: PairCodeClaimRejected) -> str:
+    """The row the rejected code matched, when it matched one.
+
+    This is the line that answers "他扫了为什么不行": the reason alone says what
+    went wrong, and these timestamps say which code and when.
+    """
+    details = error.details
+    if not details:
+        return ""
+    parts = []
+    if "agentId" in details:
+        parts.append(f"agent {details['agentId']}")
+    if "createdAt" in details:
+        parts.append(f"minted {local_stamp(details['createdAt'])}")
+    if "usedAt" in details:
+        parts.append(f"used {local_stamp(details['usedAt'])} for {details.get('deviceId') or 'a device'}")
+    if "expiresAt" in details:
+        parts.append(f"expired {local_stamp(details['expiresAt'])}")
+    return " (" + ", ".join(parts) + ")"
 
 
 #: The header the front end is required to set. Caddy's ``header_up X-Real-IP
@@ -337,6 +391,13 @@ async def pair_claim(request: web.Request) -> web.Response:
                 app_version=app_version if isinstance(app_version, str) else None,
                 ttl_ms=int(request.app["device_ttl_ms"]),
             )
+    except PairCodeClaimRejected as error:
+        limiter.record_failure(peer)
+        normalized = normalize_pair_code(code)
+        LOGGER.info("relay: pair claim rejected from %s: %s (%d chars, fingerprint %s)%s",
+                    peer, error.reason, len(normalized), code_fingerprint(normalized),
+                    describe_pair_rejection(error))
+        return json_error(404, _PAIR_REJECTION_CODES[error.reason], str(error))
     except StoreError as error:
         limiter.record_failure(peer)
         LOGGER.info("relay: pair claim rejected from %s: %s", peer, error)
