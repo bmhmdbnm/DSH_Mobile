@@ -245,6 +245,12 @@
       "file": "ios/DSHMobile/DSHMobile/Support/ViewportProbe.swift",
       "reason": "视口探针的调试文案（带 -DSHViewportProbe 才跑），不是产品文案",
       "backlog": "i18n-backlog-app-viewportprobe"
+    },
+    {
+      "rule": "hardcoded-string",
+      "file": "ios/DSHMobile/DSHMobile/Features/Chat/TranscriptListSpikeView.swift",
+      "snippet": "内容",
+      "reason": "spec 008 的 Phase 0 spike 屏专用：只有 -DSHProbeListSpike 打开时才显示，行内容是合成的假数据，不进产品界面；spike 收尾后连同这个文件一起删。"
     }
   ]
 }
