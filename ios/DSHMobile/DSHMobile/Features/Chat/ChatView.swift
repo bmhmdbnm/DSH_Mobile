@@ -88,6 +88,8 @@ struct ChatView: View {
     @State private var listJumpId: String?
     /// 新宿主的引用（回收/水合要从外面把行交回去）。
     @State private var listHostRef: TranscriptListHost?
+    /// 宿主正在执行"我们发起的滚动"（回到底部/打开钉底）时为真：这期间不要把它当成"读者滚走了"。
+    @State private var listHostRefIsScrollingProgrammatically = false
     /// 刚刚跳过去、正在高亮的那一行。
     @State private var highlightedItemId: String?
     /// 高亮的清除任务（连续跳转时上一次要取消）。
@@ -271,6 +273,8 @@ struct ChatView: View {
             if !isFollowing, !model.timeline.items.isEmpty {
                 Button {
                     isFollowing = true
+                    userScrolled = false
+                    listHostRef?.scrollToBottom()
                     // 新宿主下 `ScrollViewProxy` 不在它的视图树里，走 proxy 等于没反应
                     // （2026-10-08 真机反馈：点了不生效）。
                     if ProbeVariants.listHost == "uikit" {
@@ -410,7 +414,7 @@ struct ChatView: View {
             TranscriptListRepresentable(
                 items: model.timeline.items,
                 makeRow: { AnyView(row($0)) },
-                pinToBottom: isFollowing && !userScrolled,
+                pinToBottom: isFollowing,
                 onDiagnostic: { name, fields in ViewportProbe.note(name, fields, force: true) },
                 onNearTop: { Task { await model.loadOlder() } },
                 onScroll: { distance in
@@ -450,6 +454,20 @@ struct ChatView: View {
                         let items = await model.items(forSeqs: seqs)
                         guard !items.isEmpty else { return }
                         listHostRef?.rehydrate(items: items)
+                    }
+                },
+                onBottomChanged: { atBottom in  // 几何驱动
+                    // 唯一可靠的"跟随"依据：滚动几何。原来靠拖动位移（>24pt）判定，
+                    // 于是"轻轻往上滑/刷新"这类情况仍被判成跟随，内容一变就被拽到底部
+                    // （2026-10-08 真机反馈："偶尔自动跳到底部"）。
+                    if atBottom {
+                        isFollowing = true
+                        userScrolled = false
+                        listHostRef?.cancelBottomIntent()
+                    } else {
+                        isFollowing = false
+                        userScrolled = true
+                        listHostRef?.noteUserMovedAwayFromBottom()
                     }
                 },
                 jumpToId: listJumpId,
@@ -593,6 +611,8 @@ struct ChatView: View {
     private var olderLoadingPill: some View {
         // 已经失败过就不再显示"正在加载"：那会让人以为还在忙，而实际上要等的是他自己点一下
         // （或 3 秒后那一次自动补试）。两者互斥，屏幕上也才看得出"现在是失败态"。
+        // 预取现在提前一屏半发生，所以这行小字会在读者快到顶之前就出现——
+        // 真机反馈过"加载中要有小字，否则以为获取历史有问题"。
         if model.isLoadingOlder, model.olderFailure == nil {
             HStack(spacing: DSHTheme.Spacing.hairline) {
                 ProgressView().controlSize(.mini)

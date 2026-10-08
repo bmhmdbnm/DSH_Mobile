@@ -42,6 +42,8 @@ struct TranscriptListRepresentable: UIViewRepresentable {
     let onReclaim: ([String]) -> Void
     /// 这些 seq 需要内容（调用方从本地库读回来后调用 `coordinator.rehydrate(items:)`）。
     let onNeedRehydrate: ([Int]) -> Void
+    /// 读者是否贴在最新那一头（唯一可靠的"跟随"依据）。
+    let onBottomChanged: (Bool) -> Void
     /// 跳转目标行（spec 008 的 US2）：换窗口之后由宿主滚过去，**不经过 SwiftUI 的 ScrollViewProxy**。
     let jumpToId: String?
     /// 把宿主实例交回给 `ChatView`（回收/水合要用它把行交回来）。
@@ -53,6 +55,7 @@ struct TranscriptListRepresentable: UIViewRepresentable {
         host.makeRow = makeRow
         host.onDiagnostic = onDiagnostic
         host.onScroll = onScroll
+        host.onBottomChanged = onBottomChanged
         host.onNearTop = { [weak coordinator = context.coordinator] in
             coordinator?.requestOlder()
         }
@@ -89,6 +92,7 @@ struct TranscriptListRepresentable: UIViewRepresentable {
         }
         if pinToBottom, let last = items.last?.id { host.scrollTo(id: last) }
         context.coordinator.known = Set(items.map(\.id))
+        if pinToBottom { host.pinAfterUpdate() }
         context.coordinator.finishOlderIfNeeded(host: host, items: items)
         // 强制水合要等**真有行被回收**之后才有东西可水合：`makeUIView` 那一刻还没回收，
         // 所以在每次更新时也问一次（2026-10-08 实测：只在 makeUIView 里问 ⇒ request=0）。
@@ -255,6 +259,39 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
     var onScroll: ((CGFloat) -> Void)?
     /// 读者滑到顶部附近——**只在"靠近"这一次里触发一次**，离开足够远才重新武装。
     var onNearTop: (() -> Void)?
+    /// 读者是否贴在最新那一头（由滚动几何算，不信拖动位移）。
+    var onBottomChanged: ((Bool) -> Void)?
+    /// 读者滚走（离开底部）时撤销"回到底部"的意图。
+    func noteUserMovedAwayFromBottom() { wantsBottom = false }
+    /// 内容变了之后要不要继续钉底：**只有本来就在底部**（或按钮刚点过）才钉。
+    /// 这条替代了原来"用时间窗口猜程序化滚动"的做法——那套会把读者 600ms 内的真实上滑
+    /// 误判成我们自己的滚动，于是内容一变就把会话拽回底部（真机反馈第 2 条）。
+    func pinAfterUpdate() {
+        guard wantsBottom || lastReportedAtBottom else { return }
+        setOffsetToBottom()
+    }
+
+    /// 把偏移直接设到底（**不用 `scrollToItem`**：`apply(snapshot)` 是异步的，
+    /// 同一轮里 `scrollToItem` 打的是旧数据源的下标，UIKit 会忽略——真机反馈"点了仍无效"，
+    /// 探针里也是 `before == after`）。
+    func setOffsetToBottom() {
+        collectionView.layoutIfNeeded()
+        let bottom = max(-collectionView.adjustedContentInset.top,
+                         collectionView.contentSize.height + collectionView.adjustedContentInset.bottom
+                            - collectionView.bounds.height)
+        collectionView.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)
+    }
+    /// "回到底部"的意图：一次点击之后**持续满足**，直到真的到了底部。
+    /// 一次性的 `scrollToItem` 会被在飞的批量更新吞掉——真机反馈过"点了仍无效"。
+    private var wantsBottom = false
+    /// 贴底容差（点）：在这个范围内就算"在最新那一头"。
+    static let bottomSlack: CGFloat = 40
+
+    /// 预取余量：一屏半。
+    private func prefetchMargin() -> CGFloat {
+        max(240, collectionView.bounds.height * 1.5)
+    }
+
     /// 该回收这些行（由调用方决定最终是否回收）。
     var onReclaim: (([String]) -> Void)?
     /// 这些 seq 需要把内容要回来（调用方从本地库读，0 网络）。
@@ -369,7 +406,8 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         // `scrollViewDidScroll` 也就不会再报"靠近顶端"，只在第一页之后停住
         // （2026-10-08 真机反馈："仍不能无限拉，中断了"）。这里由宿主自己续上，
         // 次数交给调用方的"还有没有更早"兜底（到日志开头就不再要）。
-        if distanceToTop() < Self.tolerance * 2 {
+        satisfyBottomIntent()
+        if distanceToTop() < prefetchMargin() {
             nearTopArmed = true
             onNearTop?()
         }
@@ -440,6 +478,39 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         ])
     }
 
+    /// 上一次滚动上报时读者是不是贴着底。
+    private var lastReportedAtBottom = true
+
+    /// 满足"回到底部"的意图。
+    ///
+    /// 一次 `scrollToItem` 会被在飞的批量更新吞掉（真机反馈"点了仍无效"），所以：
+    /// 记意图 + **按 0/120/300/600ms 重试**，每次重试前再确认一次"还没到底"。
+    func satisfyBottomIntent() {
+        guard wantsBottom, let last = rows.last?.id else { return }
+        setOffsetToBottom()
+        Task { @MainActor [weak self] in
+            for delay in [0, 120, 300, 600, 1000] {
+                if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }
+                guard let self, self.wantsBottom else { return }
+                if self.bottomDistance() <= Self.bottomSlack { return }
+                // 直接改 `contentOffset`，**不用** `scrollToItem`：`apply(snapshot)` 是异步的，
+                // 同一轮里 `scrollToItem` 打的是旧数据源的下标，UIKit 会直接忽略
+                // （真机反馈"点了仍无效"，探针里也看到 `before == after`）。
+                // 自撑高度的列表里内容高度是估算值，所以要按 0/120/300/600/1000ms 多修几次。
+                self.setOffsetToBottom()
+            }
+            _ = last
+        }
+    }
+
+    /// 视口距底部的距离（点）。
+    func bottomDistance() -> CGFloat {
+        let content = collectionView.contentSize.height + collectionView.adjustedContentInset.bottom
+        return content - collectionView.bounds.height - collectionView.contentOffset.y
+    }
+
+    func cancelBottomIntent() { wantsBottom = false }
+
     /// 视口距内容顶端的距离（点）。
     func distanceToTop() -> CGFloat {
         collectionView.contentOffset.y + collectionView.adjustedContentInset.top
@@ -452,9 +523,13 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
     }
 
     /// 钉到底部（打开会话、跟随中、以及"回到底部"按钮）。
+    ///
+    /// 记成**意图**：`scrollToItem` 一次可能被在飞的批量更新吞掉，所以之后每次布局/更新
+    /// 都会再满足一次，直到真的贴到底（或者读者自己滚走）。
     func scrollToBottom() {
+        wantsBottom = true
+        satisfyBottomIntent()
         guard let last = rows.last?.id else { return }
-        scrollTo(id: last)
         // 诊断：按钮点了到底有没有把视口带走（真机反馈过"点了不生效"）。
         // 前后各报一次——只报"调用时"的距离说明不了问题，要看**滚完之后**还剩多远。
         let before = distanceToTop()
@@ -612,13 +687,19 @@ extension TranscriptListHost {
         let distance = scrollView.contentOffset.y + scrollView.adjustedContentInset.top
         onScroll?(distance)
         scheduleReclaimCheck()
-        // 靠近顶端 ⇒ 请求补页（一次性）；离开 120pt 以上再武装。
-        if distance < Self.tolerance * 2 {
+        // 视口距底部的距离：这是"读者还在不在最新那一头"的唯一依据
+        // （真机反馈过"刷新时偶尔自己跳到底部"——用拖动位移判定跟随是不可靠的）。
+        let atBottom = bottomDistance() <= Self.bottomSlack
+        lastReportedAtBottom = atBottom
+        onBottomChanged?(atBottom)
+        // **可见余量预取**：离顶端还有一屏半就开始要，而不是等贴到顶（真机反馈"预取太慢"）。
+        // 贴着顶时也允许继续要 —— 读者一直往上拉就一页页接着给。
+        if distance < prefetchMargin() {
             if nearTopArmed {
                 nearTopArmed = false
                 onNearTop?()
             }
-        } else if distance > 120 {
+        } else if distance > prefetchMargin() * 2 {
             nearTopArmed = true
         }
     }
