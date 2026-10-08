@@ -78,16 +78,28 @@ export function bundleProvidedIds(repoRoot = defaultRepoRoot()) {
  */
 export const ON_DEMAND = new Set(['permission', 'agent-default-model'])
 
-/** 规范化的内容行：去注释、去空行、去缩进、压缩空白、去标量两端引号。 */
+/**
+ * 规范化的内容行。不参与比较的：注释、空行、缩进、行内多余空白、标量两端的引号、
+ * 流式序列/映射的括号内空白，以及**顶层 `name:`**（那是条目身份：同一个 id 在不同档案里
+ * 可以带 `name` 也可以不带，模块名由 id 决定；insert 子项里的 `name` 是内容，保留）。
+ */
 export function canonical(lines) {
   const out = []
   for (const raw of lines) {
+    // 行级 `name:`（缩进 ≤2）是条目身份，不是内容；insert 子项里的 `name:`（缩进 6）是内容。
+    const indent = raw.length - raw.trimStart().length
+    if (indent <= 2 && /^name:\s/.test(raw.trimStart())) continue
     const line = raw.trim()
     if (line === '' || line.startsWith('#')) continue
     out.push(line
       .replace(/\s+/g, ' ')
       .replace(/:\s*'([^']*)'$/, ': $1')
-      .replace(/:\s*"([^"]*)"$/, ': $1'))
+      .replace(/:\s*"([^"]*)"$/, ': $1')
+      .replace(/\[\s+/g, '[')
+      .replace(/\s+\]/g, ']')
+      .replace(/{\s+/g, '{')
+      .replace(/\s+}/g, '}')
+      .replace(/,\s+/g, ','))
   }
   return out.join('\n')
 }

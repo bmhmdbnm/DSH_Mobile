@@ -148,14 +148,18 @@ test('内容漂移：同一个块里超时值不同 → exit 1，报"内容漂�
   })
 })
 
-test('规范化比较：只差注释、引号与行内空白不算差异', () => {
+test('规范化比较：注释/引号/行内空白/行级 name/流式括号空格都不算差异', () => {
   withFixture({}, (home) => {
-    const drifted = readPatch(home, 'desktop')
-      .replace("name: '@deepseek-ai/dsh-host-directory-picker-auto'", 'name: "@deepseek-ai/dsh-host-directory-picker-auto"')
-      .replace('    timeoutMs: 120000', '    # 排版差异\n    timeoutMs:    120000')
-    writeFileSync(patchPath(home, 'desktop'), drifted)
+    // 真机上出现过的四种"看起来不同、其实一样"：
+    //   ① 注释与行内多余空白；② 标量引号风格；③ 行级 name（ConfigEditor 会补）；
+    //   ④ 流式序列括号内空格（plugin-hmr 与手写两种写法）。
+    writeFileSync(patchPath(home, 'web'), `${PICKER}\n${BASH}\n${WELCOME}\n- id: hmr\n  config:\n    root: ["/tmp/x"]\n`)
+    writeFileSync(patchPath(home, 'desktop'), `${DESKTOP_OWNED}\n${PICKER}\n`
+      + '# 排版差异\n- id: bash-sandbox\n  name: "@deepseek-ai/dsh-bash-sandbox"\n  config:\n    timeoutMs:    120000\n    maxTimeoutMs: 120000\n'
+      + '- id: hmr\n  config:\n    root: [ "/tmp/x" ]\n')
     const r = run(home)
     assert.equal(r.status, 0, r.stdout + r.stderr)
+    assert.match(r.stdout, /功能对等/)
   })
 })
 
