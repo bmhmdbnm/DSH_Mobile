@@ -8,9 +8,15 @@
  * 而且仓库的检查脚本保持零新增依赖。
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/** 本文件在 `<repo>/scripts/dev/` 下，仓库根是上两级。 */
+function defaultRepoRoot() {
+  return join(dirname(fileURLToPath(import.meta.url)), '..', '..')
+}
 
 /** 默认数据根（`DSH_HOME` 优先，便于隔离测试）。 */
 export function dshHome() {
@@ -33,6 +39,44 @@ export const HOST_OWNED = {
   desktop: new Set(['ui-chat', 'ui-settings', 'ui-settings-account']),
   web: new Set(['ui-settings-general']),
 }
+
+/**
+ * 由**仓库里我们自己的插件**在 bundle 层提供的顶层条目 id：
+ * bundle 层在两个档案里都装着同一个包，所以这些条目天然对等，档案里没有不算缺。
+ *
+ * 从 `plugins/<pkg>/cordis.patch.yml` 现读现算，不写死清单——否则清单会和插件漂移
+ * （004：`directory-picker` / browse 那一对就是由 `dsh-plugin-mobile-link` 的 bundle patch 声明的）。
+ *
+ * @param repoRoot 仓库根目录（默认从本文件位置推两级）。
+ * @returns 条目 id 集合（含 `insert(...)` 这种合成 id）。
+ */
+export function bundleProvidedIds(repoRoot = defaultRepoRoot()) {
+  const ids = new Set()
+  const pluginsDir = join(repoRoot, 'plugins')
+  let names = []
+  try { names = readdirSync(pluginsDir) } catch { return ids }
+  for (const name of names) {
+    const dir = join(pluginsDir, name)
+    let manifest
+    try { manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) } catch { continue }
+    const declared = manifest?.dsh?.bundle?.patch
+    const files = typeof declared === 'string' ? [declared] : Array.isArray(declared) ? declared : []
+    for (const file of files) {
+      // 相对路径的锚点在这个文件旁边（与 DSH 的 loadOverlayPatches 一致）。
+      for (const block of parseBlocks(readPatch(join(dir, file)))) ids.add(block.id)
+    }
+  }
+  return ids
+}
+
+/**
+ * 由使用者**按需**写入的条目：两边不必都预置，缺了不算差异。
+ *
+ * owner 2026-10-08 决定：`permission.defaultPreset` 与 `agent-default-model` 不写死在档案里，
+ * 以后在手机设置页点选即可（写进去的就是同一个 profile patch，ConfigEditor 就地编辑）。
+ * 这里登记的是"缺了不是故障"，不是"永远不管"——它们的内容一旦两边都有，仍然会比内容。
+ */
+export const ON_DEMAND = new Set(['permission', 'agent-default-model'])
 
 /** 规范化的内容行：去注释、去空行、去缩进、压缩空白、去标量两端引号。 */
 export function canonical(lines) {

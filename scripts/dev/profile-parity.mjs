@@ -30,12 +30,14 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { HOST_OWNED, PROFILE_NAMES, blocksOf, dshHome, profileDir } from './profile-patch.mjs'
+import { HOST_OWNED, ON_DEMAND, PROFILE_NAMES, blocksOf, bundleProvidedIds, dshHome, profileDir } from './profile-patch.mjs'
 
 const HOME = dshHome()
 const asJson = process.argv.includes('--json')
 const strict = !process.argv.includes('--report')
 const allowMissing = process.argv.includes('--allow-missing')
+/** 由我们自己的插件在 bundle 层提供的条目：两边都有，档案里缺了不算差异。 */
+const BUNDLE_PROVIDED = bundleProvidedIds()
 
 function readJson(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return undefined }
@@ -58,6 +60,8 @@ const missingProfiles = PROFILE_NAMES.filter((name) => states[name].dir === unde
 
 const findings = []
 const hostOwnedSeen = { web: [], desktop: [] }
+const bundleSeen = []
+const onDemandSeen = []
 
 function setGaps(field, other, mine, side) {
   for (const item of other) {
@@ -65,6 +69,10 @@ function setGaps(field, other, mine, side) {
     if (field === 'patches') {
       const owner = PROFILE_NAMES.find((name) => name !== side && HOST_OWNED[name].has(item))
       if (owner) { hostOwnedSeen[owner].push(item); continue }
+      // 由插件 bundle 层提供：两个档案装的是同一个包，所以它天然对等。
+      if (BUNDLE_PROVIDED.has(item)) { bundleSeen.push(item); continue }
+      // 按需写入（owner 2026-10-08）：以后在手机设置页点选即可，缺了不是故障。
+      if (ON_DEMAND.has(item)) { onDemandSeen.push(item); continue }
     }
     findings.push({ field, item, missingIn: side, kind: 'missing' })
   }
@@ -138,6 +146,12 @@ if (asJson) {
   }
   if (hostOwnedSeen.web.length) {
     process.stdout.write(`宿主专属配置块（不算差异）：${[...new Set(hostOwnedSeen.web)].join(', ')}\n—— 只属于 web 档案，桌面版不需要（owner 2026-10-08 决定）。\n\n`)
+  }
+  if (bundleSeen.length) {
+    process.stdout.write(`由插件 bundle 层提供（不算差异）：${[...new Set(bundleSeen)].join(', ')}\n—— 两个档案装的是同一个插件包，bundle patch 在两边都生效。\n\n`)
+  }
+  if (onDemandSeen.length) {
+    process.stdout.write(`按需写入（不算差异）：${[...new Set(onDemandSeen)].join(', ')}\n—— owner 2026-10-08 决定：以后在手机设置页点选即可，档案里不预置。\n\n`)
   }
   if (ok) {
     process.stdout.write('两个档案功能对等：插件、bundle、配置块三类一致（含关键内容）。\n')
