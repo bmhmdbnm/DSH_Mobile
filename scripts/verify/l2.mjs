@@ -57,7 +57,7 @@ export function doctorL2({ env = process.env } = {}) {
     name: '容器运行时已启动',
     ok: Boolean(info && info.status === 0),
     detail: info?.stdout?.trim() || info?.stderr?.trim().split('\n')[0] || '未启动',
-    fix: 'colima start --vm-type vz --mount-type virtiofs --cpu 4 --memory 6 --disk 60 --registry-mirror <mirror>',
+    fix: 'colima start（默认就是 vz + virtiofs）；起不来先看 colima 自己的输出',
   })
   // 镜像源以 dockerd 自报为准（`docker info`），不去猜配置文件在哪——
   // colima 启动时会重写自己的 colima.yaml，按文件判断会得到假结论。
@@ -66,7 +66,7 @@ export function doctorL2({ env = process.env } = {}) {
     name: '镜像源已配置（本机直连 Docker Hub 超时）',
     ok: mirrors.length > 0,
     detail: mirrors[0] ?? 'dockerd 没配 registry-mirrors',
-    fix: '在 VM 里给 dockerd 配镜像源（colima ssh -- sudo 改 /etc/docker/daemon.json 后重启 docker）',
+    fix: 'sh scripts/verify/l2-vm-setup.sh（补镜像源与 resolv.conf 后重启 docker；colima 启动会重写 daemon.json，所以每次启动后都要跑）',
   })
   const failed = checks.filter((check) => !check.ok)
   return {
