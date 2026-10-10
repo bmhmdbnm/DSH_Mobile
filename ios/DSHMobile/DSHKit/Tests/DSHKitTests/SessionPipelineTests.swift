@@ -326,8 +326,9 @@ final class SessionPipelineTests: XCTestCase {
         XCTAssertEqual(records.map(\.event.seq), Array(1...40))
         let diff = await iterator.next()
         XCTAssertEqual(diff?.inserted.map(\.event.seq), Array(1...40))
-        // 锚点（20）靠近老端：淘汰丢最远的新端 61...100，不是正在读的段。
-        XCTAssertEqual(diff?.removed, Array(61...100))
+        // T028 裁定：锚点淘汰仍丢最远的新端 61...100，但**不进** diff.removed
+        // ——热窗口是缓存，缩窗不等于数据消失，UI 裁剪由 008 宿主两层负责。
+        XCTAssertEqual(diff?.removed ?? [], [])
         snapshot = await pipeline.snapshot()
         XCTAssertEqual(snapshot.records.map(\.event.seq), Array(1...60))
         // 区间集不受内存淘汰影响（磁盘兜底语义不变）。
@@ -336,6 +337,28 @@ final class SessionPipelineTests: XCTestCase {
         // 全程零网络。
         let requests = await stub.allRequests()
         XCTAssertTrue(requests.isEmpty)
+
+        // 淘汰后回看被裁段（61...100）：磁盘水合仍能取回（T028 语义闭环）。
+        let rehydrated = try await pipeline.records(in: 61...100)
+        XCTAssertEqual(rehydrated.map(\.event.seq), Array(61...100))
+        // 水合段本身不走网络（尾沿预取 101...150 是 fire-and-forget，不在此断言）。
+        let hydrationRequests = await stub.requestCount(51...100)
+        XCTAssertEqual(hydrationRequests, 0)
+    }
+
+    /// T028：下行事件把热窗口推超上限时，淘汰的 seq 不出现在 diff.removed。
+    func testEvictionFromDownstreamApplyDoesNotEmitRemovals() async throws {
+        let pipeline = makePipeline(hotLimit: 60)
+        let diffs = await pipeline.diffs()
+        var iterator = diffs.makeAsyncIterator()
+        // 一批 100 条直接超上限：淘汰 1...40（默认丢最老）。
+        await pipeline.apply(events: (1...100).map { record($0).event })
+        let diff = await iterator.next()
+        XCTAssertEqual(diff?.inserted.count, 100)
+        XCTAssertEqual(diff?.removed ?? [], [])
+        // 热窗口确实缩到上限（淘汰本身仍发生，只是不广播）。
+        let snapshot = await pipeline.snapshot()
+        XCTAssertEqual(snapshot.records.map(\.event.seq), Array(41...100))
     }
 
     // MARK: - T026：降级跳转的僵尸缺口

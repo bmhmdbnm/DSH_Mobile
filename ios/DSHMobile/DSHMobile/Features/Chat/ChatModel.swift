@@ -1924,25 +1924,3 @@ extension JSONValue {
         self = try JSONDecoder().decode(JSONValue.self, from: data)
     }
 }
-
-
-/// DEBUG 故障注入：让前 N 次取页失败（`-DSHProbeFailPage <n>`，用例 48 用）。
-///
-/// 产品构建里 `remaining` 恒为 0。放在这里而不是测试里，是因为它要拦在**真实**取页
-/// 路径上：只有这样才能验证"失败之后还能继续翻"这条产品行为。
-private final class PageFailureInjector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var remaining: Int
-
-    init(remaining: Int) { self.remaining = remaining }
-
-    func shouldFail() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard remaining > 0 else { return false }
-        remaining -= 1
-        return true
-    }
-}
-
-private struct PageFailureInjected: Error {}

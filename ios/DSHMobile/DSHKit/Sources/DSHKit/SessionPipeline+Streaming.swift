@@ -86,7 +86,7 @@ extension SessionPipeline {
             // 崩在半路时重连后快照也会带来正式记录（spec §3 兜底）。
         }
         guard !diff.isEmpty else { return }
-        diff.removed = evictIfNeeded()
+        _ = evictIfNeeded()
         diff.gaps = currentGaps()
         emit(diff)
     }

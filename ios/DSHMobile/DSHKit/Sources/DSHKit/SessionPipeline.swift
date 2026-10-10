@@ -19,6 +19,10 @@ import Foundation
 /// 失败语义（spec 可见性兜底）：拉取失败重试上限 3 次，超限的缺口标
 /// `failed(retryable: true)`；只有 `hasMore=false` 或 `clamped` 才允许「到头」，
 /// 网络失败永远不得静默当作到底。
+///
+/// 淘汰语义（T028 裁定）：热窗口只是缓存，超上限缩窗**不进** `diff.removed`——被淘汰的行
+/// 仍由磁盘覆盖（ranges 语义不变），回看时「取不到就拉」会水合回来；UI 侧的行裁剪由 008
+/// 宿主的 reclaim/dropOldestRows 两层负责，重订阅首帧（`snapshot()`）以热窗口为准是合法的。
 public actor SessionPipeline {
 
     // MARK: - 对外类型
@@ -218,7 +222,7 @@ public actor SessionPipeline {
         let hydrated = await hydrateCoveredSpans(of: range, missing: &missing)
         if !hydrated.isEmpty {
             var diff = Diff(inserted: hydrated)
-            diff.removed = evictIfNeeded(anchor: Self.anchor(of: range))
+            _ = evictIfNeeded(anchor: Self.anchor(of: range))
             diff.gaps = currentGaps()
             emit(diff)
         }
@@ -362,7 +366,7 @@ public actor SessionPipeline {
                          key: pageRecords.last!.event.seq)
             knownEmptyPages.removeAll()
             if isBottomPage, page.hasMore == false || page.clamped { topExhausted = true }
-            diff.removed = evictIfNeeded(anchor: Self.anchor(of: requested))
+            _ = evictIfNeeded(anchor: Self.anchor(of: requested))
         }
         diff.gaps = currentGaps()
         emit(diff)
@@ -407,7 +411,7 @@ public actor SessionPipeline {
             scope: scope, sessionId: sessionId,
             records: events.map(SessionRecord.init)), key: latestKey)
         knownEmptyPages.removeAll()
-        diff.removed = evictIfNeeded()
+        _ = evictIfNeeded()
         diff.gaps = currentGaps()
         emit(diff)
     }
@@ -472,7 +476,9 @@ public actor SessionPipeline {
     /// 默认丢最老（尾部到达，spec「超出丢最老已读」）；给锚点（回看水合）
     /// 时丢离锚点更远的一端——回看时把正在读的段抽走会立刻触发再水合，
     /// 形成「水合→淘汰→空白」死循环（T026）。
-    /// 返回被淘汰的 seq（diff 的 removed）。
+    /// 返回被淘汰的 seq：仅内部记账/测试断言用——T028 裁定淘汰**不进**
+    /// `diff.removed`（热窗口是缓存不是事实，见头注「淘汰语义」）。
+    @discardableResult
     func evictIfNeeded(anchor: Int? = nil) -> [Int] {
         guard hotOrder.count > hotLimit else { return [] }
         hotOrder.sort()

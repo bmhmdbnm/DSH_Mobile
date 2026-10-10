@@ -45,6 +45,8 @@ final class MessageLayer {
     private(set) var pipeline: MessagePipeline?
     /// attach 时注入的 client 现取闭包，T024 灌库也要用（重连后自动换 carrier）。
     private var clientProvider: (@Sendable () -> DSHClient?)?
+    /// DEBUG 故障注入：前 N 次取页失败（`-DSHProbeFailPage <n>`）。release 恒 0。
+    private let pageFailures = PageFailureInjector(remaining: ProbeVariants.failPageAttempts)
 
     /// 注册一批会话的拉取地址（列表刷新后、进会话前各喂一次）。
     func registerAddresses(_ summaries: [SessionSummary]) {
@@ -62,6 +64,9 @@ final class MessageLayer {
         }
         guard let store, pipeline == nil else { return }
         let addresses = self.addresses
+        // T028：`-DSHProbeFailPage` 重接到 009 链路——包在 PageFetch 外层，
+        // 前 N 次取页直接抛错，驱动慢闸场景③（断网缺口失败重试）。
+        let pageFailures = self.pageFailures
         // T026：热窗口按 spec 裁决的 500 条裁剪（US2 期间为避免淘汰后回看
         // 静默丢行临时放宽到 5000；空白带根因——磁盘水合不发 diff——已在
         // SessionPipeline 修复，这里调回预算值）。
@@ -69,6 +74,7 @@ final class MessageLayer {
             store: store,
             fetchFactory: { ref in
                 { range in
+                    if pageFailures.shouldFail() { throw PageFailureInjected() }
                     guard let client = client() else { throw FetchFailure.notConnected }
                     guard let address = addresses.address(for: ref.sessionId) else {
                         throw FetchFailure.noAddress
