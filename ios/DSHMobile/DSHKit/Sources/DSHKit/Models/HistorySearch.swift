@@ -76,6 +76,22 @@ public enum TranscriptHitLocator {
         return candidate ?? items.first
     }
 
+    /// Membership variant of `row(forSeq:in:)`: returns a row **only** when `seq`
+    /// is inside the loaded window (owned by some row); `nil` when the hit lies
+    /// outside. `row(forSeq:in:)` deliberately clamps out-of-window hits to the
+    /// nearest edge row (its original callers wanted a landing spot, not a
+    /// verdict) — using it as a membership test makes every off-window seq a
+    /// false hit (009 场景⑥：搜索跳转到窗口外命中被判成"本地命中"，
+    /// 换窗口拉取整段被跳过，跳转成为空操作）。
+    public static func row(exactlyForSeq seq: Int, in items: [TimelineItem]) -> TimelineItem? {
+        // 边界只认数据行：缺口行（含顶部合成行 `gap:0-0`，seq=0）不是内容，
+        // 拿它当窗口边界会让"比窗口还旧"的判定永远成立（假命中复发）。
+        let dataRows = items.filter { $0.kind.isContentRow }
+        guard let first = dataRows.first, let last = dataRows.last,
+              seq >= first.seq, seq <= last.seq else { return nil }
+        return row(forSeq: seq, in: items)
+    }
+
     /// Fills the phone-side row id on each hit, dropping the ones that have no row
     /// to point at (the reader has not loaded that stretch yet).
     public static func attach(hits: [HistorySearchHit], to items: [TimelineItem]) -> [TranscriptSearchHit] {

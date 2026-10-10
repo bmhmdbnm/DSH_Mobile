@@ -456,6 +456,10 @@ struct ChatView: View {
                 onNearTop: { Task { await model.loadOlder() } },
                 onScroll: { distance in
                     topDistance = distance
+                    // 几何的新鲜度戳必须与值同写：只写值时哨兵路径的
+                    // `older.stale` 会拿 distantPast 算出垃圾 age，把补页恒挡掉
+                    // （uikit 宿主下 SwiftUI 哨兵仍参与补页判定，用例 57 实测）。
+                    topDistanceAt = Date()
                     let near = distance < Self.sentinelApproach
                     if near != sentinelNearTop {
                         sentinelNearTop = near
@@ -997,13 +1001,15 @@ struct ChatView: View {
             for delay in [0, 120, 300, 600, 1000, 1800, 2600] {
                 if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }
                 if Task.isCancelled || !ownsTranscript { return }
-                guard let row = TranscriptHitLocator.row(forSeq: hit.seq, in: model.timeline.items) else {
+                // 精确归属：换窗口失败时钳制版会把目标解析成窗口第一行，
+                // 梯子会把视口滚到错误位置还以为成功（009 场景⑥回归）。
+                guard let row = TranscriptHitLocator.row(exactlyForSeq: hit.seq, in: model.timeline.items) else {
                     continue
                 }
                 proxy.scrollTo(row.id, anchor: .center)
             }
             let visible = ViewportProbe.visibleRowIds()
-            let target = TranscriptHitLocator.row(forSeq: hit.seq, in: model.timeline.items)?.id ?? hit.id
+            let target = TranscriptHitLocator.row(exactlyForSeq: hit.seq, in: model.timeline.items)?.id ?? hit.id
             if ProbeVariants.listHost == "uikit" {
                 // 新宿主：把目标交给它滚过去（同一次更新里定位，不经过 ScrollViewProxy）。
                 listJumpId = target

@@ -358,11 +358,23 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
 
         let registration = UICollectionView.CellRegistration<UICollectionViewListCell, String> {
             [weak self] cell, _, id in
-            guard let self, let item = self.item(for: id) else { return }
-            cell.contentConfiguration = UIHostingConfiguration {
-                self.makeRow?(item) ?? AnyView(Color.clear)
+            guard let self, let payload = self.rows.first(where: { $0.id == id }) else { return }
+            if let item = payload.item {
+                cell.contentConfiguration = UIHostingConfiguration {
+                    self.makeRow?(item) ?? AnyView(Color.clear)
+                }
+                .margins(.all, 0)
+            } else if case .reclaimed(_, _, let height) = payload.state {
+                // 回收行的占位：按回收时记下的真实高度撑住几何（FR-005 高度不变）。
+                // 老实现直接不配置 cell（return）——自撑高列表里这等于一行 0 高的
+                // 空白，整屏被回收行占满时就是"只剩输入框"的白屏（用例 57 根因）。
+                cell.contentConfiguration = UIHostingConfiguration {
+                    // 没量到真实高度的（从没排版就被回收）退到典型行高 44，
+                    // 不能让占位是 0 高——0 高会把整段内容高度抽没。
+                    AnyView(Color.clear.frame(height: max(height, 44)))
+                }
+                .margins(.all, 0)
             }
-            .margins(.all, 0)
         }
         dataSource = UICollectionViewDiffableDataSource<String, String>(
             collectionView: collectionView
@@ -385,7 +397,10 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         case .dropOldest(let count):
             dropOldest(count)
         case .reclaim(let ids):
-            for index in rows.indices where ids.contains(rows[index].id) { rows[index].reclaim() }
+            for index in rows.indices where ids.contains(rows[index].id) {
+                noteLaidOutHeight(at: index)
+                rows[index].reclaim()
+            }
             diagnostic("list.reclaim", ["rows": String(ids.count),
                                         "bytes": String(payloadBytes()),
                                         "totalBytes": String(payloadBytes())])
@@ -429,7 +444,11 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
             uniquingKeysWith: { old, _ in old })
         rows = ordered.map { item in
             var payload = TranscriptRowPayload(item: item)
-            if let reclaimed = reclaimedById[item.id] { payload.state = reclaimed }
+            // 只有数据行保留回收态：缺口行没有磁盘记录，水合要不回内容，
+            // 保留回收态就是一条永久空白占位（数据行由磁盘水合路径要回）。
+            if item.kind.isContentRow, let reclaimed = reclaimedById[item.id] {
+                payload.state = reclaimed
+            }
             return payload
         }
         applySnapshot(reloading: changedIds)
@@ -566,6 +585,14 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
             .layoutAttributesForItem(at: IndexPath(item: index, section: 0))?.frame.height
     }
 
+    /// 回收前把真实行高记进载荷：占位行要靠它撑住几何（FR-005 回收/水合高度一致）。
+    /// 从没排版过的行（快速滚动里一眼没看就被回收）量不到，保持 nil——占位用兜底高。
+    private func noteLaidOutHeight(at index: Int) {
+        guard rows[index].height == nil, !rows[index].isReclaimed else { return }
+        rows[index].height = collectionView.collectionViewLayout
+            .layoutAttributesForItem(at: IndexPath(item: index, section: 0))?.frame.height
+    }
+
     /// 当前是否还有已回收的行（驱动与诊断用）。
     var hasReclaimedRows: Bool { rows.contains { $0.isReclaimed } }
 
@@ -576,7 +603,10 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
     func reclaim(ids: [String]) {
         let freed = rows.filter { ids.contains($0.id) && !$0.isReclaimed }
             .reduce(0) { $0 + $1.payloadBytes }
-        for index in rows.indices where ids.contains(rows[index].id) { rows[index].reclaim() }
+        for index in rows.indices where ids.contains(rows[index].id) {
+            noteLaidOutHeight(at: index)
+            rows[index].reclaim()
+        }
         applySnapshot()
         diagnostic("list.reclaim", ["rows": String(ids.count),
                                     "bytes": String(freed),
@@ -652,7 +682,7 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
     func scrollToBottom() {
         wantsBottom = true
         satisfyBottomIntent()
-        guard let last = rows.last?.id else { return }
+        guard rows.last != nil else { return }
         // 诊断：按钮点了到底有没有把视口带走（真机反馈过"点了不生效"）。
         // 前后各报一次——只报"调用时"的距离说明不了问题，要看**滚完之后**还剩多远。
         let before = distanceToTop()
@@ -706,6 +736,9 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         let band = bandWithMargin(screens: screens)
         var picked: [String] = []
         for index in rows.indices where !rows[index].isReclaimed {
+            // 缺口行不回收：载荷几乎为零，且它没有磁盘记录可取——水合要不回
+            // spinner/重试态，只会留下一条永久空白占位。
+            if let item = rows[index].item, !item.kind.isContentRow { continue }
             guard let attributes = collectionView.collectionViewLayout
                 .layoutAttributesForItem(at: IndexPath(item: index, section: 0)) else { continue }
             if !attributes.frame.intersects(band) { picked.append(rows[index].id) }

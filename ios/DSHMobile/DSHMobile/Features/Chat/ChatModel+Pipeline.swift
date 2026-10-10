@@ -137,7 +137,11 @@ final class ChatPipelineBridge {
         var onlyStreamingUpdates = true
         // 尾部到达计数（T018 未读数）：只数"比现有最大 seq 还新"的插入——
         // 向上翻页的 prepend 与首帧快照都不算（后者由 maxSeqBefore == nil 排除）。
-        let maxSeqBefore = records.keys.max()
+        // 最大值只在**正式 seq**里取：pending/failed 回声用 Int.max 起递减的合成
+        // seq，混进来会把 maxSeqBefore 顶到天花板——之后胶囊永不出现（T018）。
+        let maxSeqBefore = records.keys
+            .filter { sendStatuses[$0] != .pending && sendStatuses[$0] != .failed }
+            .max()
         var tailArrivals = 0
         for change in diff.changes {
             switch change {
@@ -253,9 +257,7 @@ final class ChatPipelineBridge {
     }
 
     /// 缺口行集合：管道派生的中间缺口 + 顶部合成行（向上拉的 spinner 与中间
-    /// 缺口是同一机制——前者是「窗口最顶端之上的缺口」，spec「缺口行的生命周期」）。
-    /// 尾部追平（点胶囊/可见性兜底，T018/T019）期间再补一行合成**底部**缺口
-    /// （spinner），区间集不表达"窗口之外的尾巴"，由这里显式占位。
+    /// 缺口同机制）。尾部追平（T018/T019）期间再补一行合成**底部**缺口行。
     private func gapItems(
         _ pipelineGaps: [SessionPipeline.GapRow], topExhausted: Bool
     ) -> [TimelineItem] {
@@ -297,8 +299,7 @@ final class ChatPipelineBridge {
 
     // MARK: - 用户动作（转发管道）
 
-    /// 向上翻页（.userVisible）：向管道请求窗口之上的对齐范围。
-    /// 命中区间零网络零 spinner；缺口由管道拉取并走 diff 回填。
+    /// 向上翻页（.userVisible）：向管道请求窗口之上的对齐范围；缺口由管道拉取回填。
     func loadOlder() async {
         guard let model, let session, !isLoadingOlder else { return }
         guard let oldest = records.keys.min(), oldest > 1 else { return }
@@ -316,10 +317,20 @@ final class ChatPipelineBridge {
         do {
             _ = try await session.records(in: lower...(oldest - 1), priority: .userVisible)
             didAutoRetry = false
+            // 009 取页链路原来没有任何探针事件（pager.page 只在旧 pager 路径上），
+            // 失败语义不可观测。按同一名字补回（用例按「逐页落地、首尾相接」验收）。
+            ViewportProbe.note("pager.page", [
+                "start": String(lower), "end": String(oldest - 1),
+                "oldest": String(records.keys.min() ?? -1),
+            ], force: true)
         } catch {
             // 失败绝不写成「没有更多」（T016）：顶部行转「点击重试」，并补试一次。
             olderFailure = String(localized: "读取更早的记录失败，点按重试")
             model.notePipelineOlderFailure(olderFailure)
+            ViewportProbe.note("pager.failed", [
+                "start": String(lower), "end": String(oldest - 1),
+                "reason": String(describing: error),
+            ], force: true)
             scheduleAutoRetry()
         }
     }
@@ -334,7 +345,9 @@ final class ChatPipelineBridge {
     func rebase(around seq: Int, leading: Int, limit: Int) async -> String? {
         guard let model, let session else { return nil }
         // 本地命中（行已在时间线里）直接渲染，不等水合（spec「搜索策略」2）。
-        if let row = TranscriptHitLocator.row(forSeq: seq, in: model.timeline.items) {
+        // 必须精确归属：`row(forSeq:)` 把窗口外命中钳到窗口第一行，误当本地
+        // 命中会跳过换窗口拉取——搜索跳转因此成为空操作（009 场景⑥）。
+        if let row = TranscriptHitLocator.row(exactlyForSeq: seq, in: model.timeline.items) {
             return row.id
         }
         let upper = seq + leading
@@ -375,7 +388,9 @@ final class ChatPipelineBridge {
     private func resolveRebaseWaiters() {
         guard !rebaseWaiters.isEmpty, let model else { return }
         for (id, waiter) in rebaseWaiters {
-            guard let row = TranscriptHitLocator.row(forSeq: waiter.seq, in: model.timeline.items)
+            // 同上（精确归属）：钳制版会在目标页未落地时把 waiter 解析到窗口
+            // 第一行——跳转落到错行，重试梯子还以为已成功。
+            guard let row = TranscriptHitLocator.row(exactlyForSeq: waiter.seq, in: model.timeline.items)
             else { continue }
             rebaseWaiters.removeValue(forKey: id)
             rebaseTimeouts.removeValue(forKey: id)?.cancel()
@@ -410,10 +425,10 @@ final class ChatPipelineBridge {
 
     // MARK: - 尾部追平（T018 点胶囊 / T019 可见性兜底）
 
-    /// 桥已收到的最大 seq（"本地对到哪儿了"的口径）。
+    /// 桥已收到的最大 seq。
     func localNewestSeq() -> Int { records.keys.max() ?? 0 }
 
-    /// 尾部追平展示态变了（模型侧的 isCatchingUpTail）：底部合成缺口行生灭。
+    /// 尾部追平展示态变了：底部合成缺口行生灭。
     func noteCatchUpPresentationChanged() {
         refold(messagesChanged: false, gapsChanged: true)
     }

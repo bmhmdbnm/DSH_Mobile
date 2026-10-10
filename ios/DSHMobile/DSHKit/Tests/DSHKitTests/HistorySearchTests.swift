@@ -46,6 +46,34 @@ final class HistorySearchTests: XCTestCase {
         XCTAssertNil(TranscriptHitLocator.row(forSeq: 1, in: []))
     }
 
+    /// 009 场景⑥回归：换窗口拉取的"本地命中"判定必须是精确归属。
+    /// `row(forSeq:)` 会把窗口外命中钳到窗口第一行——拿它当归属判定时，
+    /// 任何比窗口旧的 seq 都是假命中，跳转拉取整段被跳过（空操作）。
+    func testExactMembershipRejectsHitsOutsideTheWindow() {
+        var timeline = ChatTimeline()
+        timeline.reset(with: [userMessage(seq: 100), userMessage(seq: 200), userMessage(seq: 300)])
+        let rows = timeline.items
+        XCTAssertEqual(TranscriptHitLocator.row(exactlyForSeq: 250, in: rows)?.seq, 200, "窗口内：归 200 那行")
+        XCTAssertEqual(TranscriptHitLocator.row(exactlyForSeq: 100, in: rows)?.seq, 100, "正好第一行")
+        XCTAssertEqual(TranscriptHitLocator.row(exactlyForSeq: 300, in: rows)?.seq, 300, "正好最后一行")
+        XCTAssertNil(TranscriptHitLocator.row(exactlyForSeq: 99, in: rows), "比窗口旧：不算命中（钳制版会给 100）")
+        XCTAssertNil(TranscriptHitLocator.row(exactlyForSeq: 301, in: rows), "比窗口新：不算命中（钳制版会给 300）")
+        XCTAssertNil(TranscriptHitLocator.row(exactlyForSeq: 200, in: []))
+    }
+
+    /// 边界只认数据行：009 的缺口行（含顶部合成行 `gap:0-0`，seq=0）不是内容。
+    /// 拿缺口行当窗口下界，"比窗口旧"的判定会永远成立（假命中复发）。
+    func testExactMembershipIgnoresGapRowsAtTheEdges() {
+        var timeline = ChatTimeline()
+        timeline.reset(with: [userMessage(seq: 100), userMessage(seq: 200)])
+        var rows = timeline.items
+        rows.insert(ChatTimeline.gapItem(start: 0, end: 0, status: .loading), at: 0)
+        rows.append(ChatTimeline.gapItem(start: 201, end: 250, status: .loading))
+        XCTAssertNil(TranscriptHitLocator.row(exactlyForSeq: 50, in: rows),
+                     "第一行是 gap:0-0 也不能把 seq=50 判成窗口内")
+        XCTAssertEqual(TranscriptHitLocator.row(exactlyForSeq: 150, in: rows)?.seq, 100)
+    }
+
     func testAttachFillsRowIDsAndDropsHitsWithNoRow() {
         var timeline = ChatTimeline()
         timeline.reset(with: [userMessage(seq: 100), userMessage(seq: 200)])
