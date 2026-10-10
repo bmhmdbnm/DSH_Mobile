@@ -13,6 +13,8 @@ struct RootView: View {
     @State private var viewLog = SessionViewLog()
     @State private var listModel = SessionListModel()
     @State private var chatModel = ChatModel()
+    /// 009 消息层（磁盘层 + 内存层枢纽）：列表/会话的冷启动叠加都从它取数。
+    @State private var messageLayer = MessageLayer()
     /// Holds the app awake in the background while there is work to report on.
     @State private var keepAlive = RunKeepAlive()
 
@@ -47,9 +49,11 @@ struct RootView: View {
                 if isConnected { attachmentImages.clearFailures() }
             }
             .task {
-                listModel.attach(to: store, hub: hub, viewLog: viewLog)
+                messageLayer.attach { [store] in store.client }
+                listModel.attach(to: store, hub: hub, viewLog: viewLog, messageLayer: messageLayer)
                 attachmentImages.attach(store: store)
                 chatModel.attach(store: store, hub: hub)
+                chatModel.attach(messageLayer: messageLayer)
                 // The feed asks for the client each time it reopens, so a repair
                 // that swapped the carrier underneath is picked up by itself.
                 hub.attach { [store] in store.client }

@@ -1,0 +1,68 @@
+import DSHKit
+import Foundation
+
+/// 列表冷启动的 009 叠加（tasks T010/T011，spec 009「冷启动流程」第 1/2/4 步）。
+///
+/// 叠加而非替换：现有 `SessionListSnapshotStore` 快照机制照旧负责首帧，这里只在
+/// MessageStore（009 磁盘层）有数据时把它的聚合信息叠上去；磁盘层为空（老用户
+/// 首次启动）时一切表现与现状一致。host 数据回来后仍以 host 为准，刷新逻辑不动。
+extension SessionListModel {
+
+    /// T010：从 MessageStore 读会话聚合，把 snippet 叠到列表行上。
+    /// 快照首帧与 host 刷新成功后各调一次——后者能叠上预取瀑布刚喂出来的数据。
+    func overlayMessageStoreSnippets() async {
+        guard let scope = store?.scopeId, let store = messageLayer?.store,
+              let states = try? await store.sessionStates(scope: scope), !states.isEmpty
+        else { return }
+        var snippets: [String: String] = [:]
+        for entry in states {
+            guard let snippet = entry.lastSnippet, !snippet.isEmpty else { continue }
+            snippets[entry.sessionId] = snippet
+        }
+        guard snippets != coldStartSnippets else { return }
+        coldStartSnippets = snippets
+    }
+
+    /// 某行的冷启动摘要；nil 时该行布局与现状完全一致（无摘要行）。
+    func coldStartSnippet(for sessionId: String) -> String? {
+        coldStartSnippets[sessionId]
+    }
+
+    /// T011：按列表顺序为前 ~10 个会话排预取瀑布（最新页 [newestSeq-49, newestSeq]，
+    /// 并发 3，低优先级后台任务）。链接未建立、磁盘层不可用都整体跳过——
+    /// 预取不许报错刷日志；同一台电脑一次启动只排一次。
+    func scheduleColdStartPrefetch() {
+        guard let scope = store?.scopeId, store?.client != nil,
+              lastPrefetchScope != scope,
+              let layer = messageLayer, let pipeline = layer.pipeline, let store = layer.store
+        else { return }
+        // 列表顺序 = 分组顺序 + 折叠桶，与屏幕上一致；去重（child 不进组）。
+        var seen = Set<String>()
+        let ordered = (groups.flatMap(\.sessions) + loose)
+            .filter { seen.insert($0.sessionId).inserted }
+        guard !ordered.isEmpty else { return }
+        lastPrefetchScope = scope
+        layer.registerAddresses(ordered)
+        Task(priority: .utility) {
+            let states = (try? await store.sessionStates(scope: scope)) ?? []
+            var persistedRanges: [MessagePipeline.SessionRef: RangeIndex] = [:]
+            var newestBySession: [String: Int] = [:]
+            for entry in states {
+                let ref = MessagePipeline.SessionRef(scope: scope, sessionId: entry.sessionId)
+                if !entry.ranges.isEmpty { persistedRanges[ref] = entry.ranges }
+                if let newest = entry.newestSeq { newestBySession[entry.sessionId] = newest }
+            }
+            // 最新游标优先取磁盘层的（与持久化区间同源），没有再用 host 的 asOfSeq。
+            let targets = ordered.prefix(10).compactMap { summary -> MessagePipeline.PrefetchTarget? in
+                let newest = newestBySession[summary.sessionId] ?? summary.asOfSeq
+                guard newest > 0 else { return nil }
+                return MessagePipeline.PrefetchTarget(
+                    session: .init(scope: scope, sessionId: summary.sessionId), newestSeq: newest)
+            }
+            guard !targets.isEmpty else { return }
+            ViewportProbe.note("prefetch.coldstart", ["sessions": String(targets.count)], force: true)
+            await pipeline.prefetchLatestPages(
+                targets, persistedRanges: persistedRanges, limit: 10, concurrency: 3)
+        }
+    }
+}

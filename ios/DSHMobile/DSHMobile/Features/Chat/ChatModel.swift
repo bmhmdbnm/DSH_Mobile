@@ -149,6 +149,9 @@ final class ChatModel {
 
     private var store: ConnectionStore?
     private var hub: HostEventHub?
+    /// 009 消息层（T012：MessageStore 有数据时优先用它画进会话首帧）。
+    /// internal：冷启动半边在 ChatModel+ColdStart.swift（文件按职责拆分）。
+    weak var messageLayer: MessageLayer?
     /// Warm transcripts, most recently used last.
     private var cache: [String: CachedSession] = [:]
 
@@ -191,7 +194,7 @@ final class ChatModel {
     /// 不能在落盘那一刻现取 `store.scopeId`：切换/断开时 profile 已经被清掉或换成
     /// 新电脑了，旧电脑的尾部会落到 `unknown/` 或**新电脑**的目录里——两台电脑的
     /// 会话 id 本来就可能撞（fork/clone），那就是把 A 的记录当成 B 的显示。
-    private var sessionScope: String?
+    private(set) var sessionScope: String?
 
     /// 这次打开用的同步计划（快照到达时还要用它判断合并还是重来）。
     private var syncPlanRef = TranscriptSyncPlan.plan(localThrough: nil, hostCursor: 0)
@@ -248,6 +251,11 @@ final class ChatModel {
     func attach(store: ConnectionStore, hub: HostEventHub) {
         self.store = store
         self.hub = hub
+    }
+
+    /// 注入 009 消息层（冷启动首帧与预取插队用，T011/T012）。
+    func attach(messageLayer: MessageLayer) {
+        self.messageLayer = messageLayer
     }
 
     /// Opens a session: cached transcript first, then the live stream.
@@ -314,7 +322,7 @@ final class ChatModel {
             phase = .ready
             scrollSignal += 1
         } else if let scope = sessionScope,
-                  let stored = await loadStoredTail(scope: scope, sessionId: key) {
+                  let stored = await loadColdStartTail(scope: scope, sessionId: key) {
             // 窗口按"本地落后 host 多少"来定：落后很多时要更大的窗口，否则
             // 快照接不上本地尾部，时间线中间会留一个永远补不上的洞。
             syncPlan = TranscriptSyncPlan.plan(
@@ -361,6 +369,8 @@ final class ChatModel {
         }
 
         syncPlanRef = syncPlan
+        // T011：点开的会话以 .jump 插队水合最新页进 009 磁盘层（抢占在途预取）。
+        warmMessageLayer(for: summary)
         startFollowing(client: client, summary: summary, maxMessages: syncPlan.maxMessages)
         await restoreSearchHistory()
         pendingOpen = nil
@@ -714,7 +724,8 @@ final class ChatModel {
     /// 600 条 ≈ 300 行：足够填满一屏并留出上下滑动的余量，又不至于把上万条的会话一次性装进内存。
     private static let restoreRecordLimit = 600
 
-    private func loadStoredTail(scope: String, sessionId: String) async -> StoredTail? {
+    /// internal：009 优先的包装（loadColdStartTail）在 ChatModel+ColdStart.swift。
+    func loadStoredTail(scope: String, sessionId: String) async -> StoredTail? {
         guard let state = try? await transcriptStore.state(scope: scope, sessionId: sessionId) else { return nil }
         let records = (try? await transcriptStore.loadWindow(
             scope: scope, sessionId: sessionId, before: Int.max,
@@ -729,7 +740,8 @@ final class ChatModel {
     }
 
     /// The tail the store can hand back on a cold start.
-    private struct StoredTail {
+    /// internal：ChatModel+ColdStart.swift 的 009 首帧路径复用同一形状。
+    struct StoredTail {
         let records: [SessionRecord]
         let oldest: Int?
         let newest: Int?

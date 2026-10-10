@@ -360,4 +360,67 @@ public actor MessagePipeline {
             continuation.yield(diff)
         }
     }
+
+    // MARK: - 冷启动预取瀑布（spec「冷启动流程」/ tasks T011）
+
+    /// 一个预取目标：会话 + 列表已知的最新游标（host 的 asOfSeq 或磁盘层 newestSeq）。
+    public struct PrefetchTarget: Sendable, Hashable {
+        public let session: SessionRef
+        public let newestSeq: Int
+
+        public init(session: SessionRef, newestSeq: Int) {
+            self.session = session
+            self.newestSeq = newestSeq
+        }
+    }
+
+    /// 按列表顺序预取前 `limit` 个会话的最新页（[newestSeq-P+1, newestSeq]，页对齐
+    /// 由 SessionPipeline 负责）：区间命中读磁盘、缺口网络按页拉；并发上限
+    /// `concurrency`（spec：3–4 个会话）。`persistedRanges` 是磁盘层持久化的区间集，
+    /// 采纳后命中段零网络。单个会话失败静默——磁盘只是缓存，取用失败即拉取兜底，
+    /// 预取不许成为错误来源。用户点开的会话由调用方传 `.jump`，抢占在途预取。
+    public func prefetchLatestPages(
+        _ targets: [PrefetchTarget],
+        persistedRanges: [SessionRef: RangeIndex] = [:],
+        limit: Int = 10,
+        concurrency: Int = 3,
+        priority: SessionPipeline.FetchPriority = .prefetch
+    ) async {
+        let selected = targets.filter { $0.newestSeq > 0 }.prefix(limit)
+        var iterator = selected.makeIterator()
+        await withTaskGroup(of: Void.self) { group in
+            var running = 0
+            while let target = iterator.next() {
+                if running >= concurrency {
+                    await group.next()
+                    running -= 1
+                }
+                running += 1
+                group.addTask {
+                    await self.prefetchLatestPage(target, persistedRanges: persistedRanges, priority: priority)
+                }
+            }
+            await group.waitForAll()
+        }
+    }
+
+    /// 单会话最新页水合：采纳持久化区间 → 「取不到就拉」→ 区间集回写磁盘层
+    /// （下次冷启动预取判定直接命中，data-model 的 ranges_json）。
+    private func prefetchLatestPage(
+        _ target: PrefetchTarget,
+        persistedRanges: [SessionRef: RangeIndex],
+        priority: SessionPipeline.FetchPriority
+    ) async {
+        let pipeline = pipeline(for: target.session)
+        if let persisted = persistedRanges[target.session] {
+            await pipeline.adoptPersistedRanges(persisted)
+        }
+        let lower = max(1, target.newestSeq - pageSize + 1)
+        _ = try? await pipeline.records(in: lower...target.newestSeq, priority: priority)
+        if let store {
+            let ranges = await pipeline.ranges
+            try? await store.saveRanges(
+                scope: target.session.scope, sessionId: target.session.sessionId, ranges: ranges)
+        }
+    }
 }

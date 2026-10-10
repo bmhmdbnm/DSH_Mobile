@@ -173,8 +173,17 @@ final class SessionListModel {
 
     private var eventTask: Task<Void, Never>?
     private var refreshDebounce: Task<Void, Never>?
-    private weak var store: ConnectionStore?
+    private(set) weak var store: ConnectionStore?
     private weak var hub: HostEventHub?
+
+    // MARK: 冷启动 009 叠加（T010/T011；逻辑在 SessionListModel+ColdStart.swift）
+
+    /// 009 消息层（磁盘层聚合数据 + 预取瀑布）；nil 时整套叠加缺位，回退现有行为。
+    weak var messageLayer: MessageLayer?
+    /// 冷启动首帧各行叠加的摘要（sessionId → snippet，来自 MessageStore）。
+    var coldStartSnippets: [String: String] = [:]
+    /// 这台电脑本轮启动有没有排过预取瀑布（只排一次）。
+    var lastPrefetchScope: String?
 
     /// Whether a session is still worth continuing.
     ///
@@ -278,9 +287,11 @@ final class SessionListModel {
 
     // MARK: - Lifecycle
 
-    func attach(to store: ConnectionStore, hub: HostEventHub, viewLog: SessionViewLog? = nil) {
+    func attach(to store: ConnectionStore, hub: HostEventHub, viewLog: SessionViewLog? = nil,
+                messageLayer: MessageLayer? = nil) {
         self.store = store
         self.hub = hub
+        self.messageLayer = messageLayer
         if let viewLog { self.viewLog = viewLog }
     }
 
@@ -436,6 +447,8 @@ final class SessionListModel {
         // 说"显示上次数据"。
         lastSavedFingerprint = nil
         isShowingSnapshot = false
+        coldStartSnippets = [:]
+        lastPrefetchScope = nil
     }
 
     func refresh() async {
@@ -466,6 +479,10 @@ final class SessionListModel {
             isShowingSnapshot = false
             phase = .loaded
             saveSnapshot()
+            // T011：host 数据回来之后排一次冷启动预取瀑布（只排一次；
+            // 磁盘层可能已被它喂出新的摘要，顺手再叠一次）。
+            Task { await overlayMessageStoreSnippets() }
+            scheduleColdStartPrefetch()
         } catch {
             // Keep any previously loaded rows visible: a transient failure
             // should not blank out a list the user is reading.
@@ -502,6 +519,8 @@ final class SessionListModel {
         isShowingSnapshot = true
         lastSavedFingerprint = snapshot.contentFingerprint
         phase = .loaded
+        // T010：快照首帧之上叠加 009 磁盘层的摘要（异步，磁盘读，不阻塞首帧）。
+        Task { await overlayMessageStoreSnippets() }
         // 诊断：冷启动到底有没有用上缓存（排查"打开是空的"时第一眼要看的就是这行）。
         ViewportProbe.note("snapshot.loaded", ["items": String(snapshot.items.count)], force: true)
     }
@@ -544,6 +563,7 @@ final class SessionListModel {
         if let scope = store?.scopeId { snapshotStore.clear(scope: scope) }
         lastSavedFingerprint = nil
         isShowingSnapshot = false
+        coldStartSnippets = [:]
     }
 
     /// Subscribes to the host feed so sessions started elsewhere appear here.

@@ -340,7 +340,8 @@ struct SessionListView: View {
             NavigationLink(value: session.sessionId) {
                 SessionRow(session: session, rowState: model.state(of: session),
                            home: store.hostHome,
-                           isJustCreated: session.sessionId == model.lastCreatedSessionId)
+                           isJustCreated: session.sessionId == model.lastCreatedSessionId,
+                           snippet: model.coldStartSnippet(for: session.sessionId))
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier(session.sessionId == model.lastCreatedSessionId
@@ -367,7 +368,8 @@ struct SessionListView: View {
     private func archivedRow(_ session: SessionSummary) -> some View {
         NavigationLink(value: session.sessionId) {
             SessionRow(session: session, rowState: model.state(of: session),
-                       home: store.hostHome, isChild: true)
+                       home: store.hostHome, isChild: true,
+                       snippet: model.coldStartSnippet(for: session.sessionId))
         }
         .buttonStyle(.plain)
         .listRowInsets(EdgeInsets(top: 1, leading: 10, bottom: 1, trailing: 10))
@@ -385,7 +387,8 @@ struct SessionListView: View {
         NavigationLink(value: session.sessionId) {
             SessionRow(session: session, rowState: model.state(of: session),
                        home: store.hostHome, isChild: true,
-                       isJustCreated: session.sessionId == model.lastCreatedSessionId)
+                       isJustCreated: session.sessionId == model.lastCreatedSessionId,
+                       snippet: model.coldStartSnippet(for: session.sessionId))
         }
         .buttonStyle(.plain)
         .listRowInsets(EdgeInsets(top: 1, leading: 10, bottom: 1, trailing: 10))
@@ -558,6 +561,8 @@ struct SessionRow: View {
     var isChild: Bool = false
     /// Whether this is the session the app just created in this run.
     var isJustCreated: Bool = false
+    /// 009 磁盘层给的冷启动摘要；nil 时行布局与现状一致（T010）。
+    var snippet: String? = nil
 
     private var projections: SessionProjectionValues? { session.projections?.values }
 
@@ -597,6 +602,15 @@ struct SessionRow: View {
                     if isJustCreated {
                         CreatedBadge()
                     }
+                }
+
+                if let snippet {
+                    // 冷启动时磁盘层给的一行摘要；host 数据里本来没有这个槽位，
+                    // 所以只作为叠加信息出现，不参与任何状态判定。
+                    Text(snippet)
+                        .font(DSHTheme.Typography.micro)
+                        .foregroundStyle(DSHTheme.labelTertiary)
+                        .lineLimit(1)
                 }
 
                 HStack(spacing: DSHTheme.Spacing.hairline) {
