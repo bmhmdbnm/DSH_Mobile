@@ -8,7 +8,7 @@ import Foundation
 /// bytes instead: same `Caches` rules as the transcript cache (plaintext, not
 /// backed up, reclaimable), keyed by computer and attachment id so two hosts
 /// cannot hand each other the wrong picture.
-public struct AttachmentDiskCache {
+public struct AttachmentDiskCache: @unchecked Sendable {
 
     /// How long a downloaded picture may be reused.
     public static let maxAge: TimeInterval = 30 * 24 * 60 * 60

@@ -14,12 +14,32 @@ struct AttachmentThumbnail: View {
 
     @Environment(AttachmentImages.self) private var images
     @State private var isShowingPreview = false
+    /// 行内容宽，量到之前先按经验值估；T029 后它只影响占位精度，
+    /// 高度由「宽度 ÷ 宽高比」一次算定，解码完成不再改。
+    @State private var columnWidth: CGFloat = 320
 
-    private var aspectRatio: CGFloat? {
-        guard let width = attachment.width, let height = attachment.height,
-              width > 0, height > 0
-        else { return nil }
-        return CGFloat(width) / CGFloat(height)
+    /// 协议事件没带宽高时的占位比例（4:3）。真实尺寸解码后由
+    /// `AttachmentImages` 写进尺寸缓存，之后同一附件直接按真实比例定高。
+    private static let fallbackAspect: CGFloat = 4.0 / 3.0
+
+    /// 宽高比来源优先级：事件元数据 → 尺寸缓存（上次解码记录）→ 4:3 占位。
+    private var aspectRatio: CGFloat {
+        if let width = attachment.width, let height = attachment.height,
+           width > 0, height > 0 {
+            return CGFloat(width) / CGFloat(height)
+        }
+        if let size = images.knownSize(attachment.attachmentId),
+           let ratio = size.aspectRatio {
+            return CGFloat(ratio)
+        }
+        return Self.fallbackAspect
+    }
+
+    /// T029：占位即最终尺寸——行高按宽高比 + 可用宽度**定死**，
+    /// 解码完成只换内容、不改高度。
+    private var reservedSize: CGSize {
+        let height = min(maxHeight, max(120, columnWidth / aspectRatio))
+        return CGSize(width: min(columnWidth, height * aspectRatio), height: height)
     }
 
     private var resolved: UIImage? {
@@ -35,7 +55,7 @@ struct AttachmentThumbnail: View {
                     Image(uiImage: resolved)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .frame(maxHeight: maxHeight)
+                        .frame(width: reservedSize.width, height: reservedSize.height)
                         .clipShape(RoundedRectangle(cornerRadius: DSHTheme.Radius.medium, style: .continuous))
                         .overlay {
                             RoundedRectangle(cornerRadius: DSHTheme.Radius.medium, style: .continuous)
@@ -50,6 +70,9 @@ struct AttachmentThumbnail: View {
                 placeholder
             }
         }
+        .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { width in
+            if width > 0 { columnWidth = width }
+        }
         .task(id: attachment.attachmentId) {
             await images.load(attachment.attachmentId, variant: attachment.cacheVariant)
         }
@@ -63,14 +86,6 @@ struct AttachmentThumbnail: View {
     private var attachmentLabel: String {
         // Never surfaces the agent marker: it is a routing signal, not a name.
         ChatTimeline.displayName(attachment) ?? "图片"
-    }
-
-    /// A sane box to occupy while the bytes arrive.
-    private var placeholderHeight: CGFloat {
-        guard let aspectRatio, aspectRatio > 0 else { return 160 }
-        // Assume roughly a phone-width column, then clamp so a tall screenshot
-        // does not reserve the whole screen.
-        return min(maxHeight, max(120, 320 / aspectRatio))
     }
 
     /// The box the picture will occupy: a failure with a way out, or a spinner.
@@ -94,8 +109,7 @@ struct AttachmentThumbnail: View {
                         .foregroundStyle(DSHTheme.brand)
                 }
                 .foregroundStyle(DSHTheme.labelTertiary)
-                .frame(maxWidth: .infinity)
-                .frame(height: placeholderHeight)
+                .frame(width: reservedSize.width, height: reservedSize.height)
                 .background(
                     RoundedRectangle(cornerRadius: DSHTheme.Radius.medium, style: .continuous)
                         .fill(DSHTheme.codeBackground)
@@ -115,8 +129,7 @@ struct AttachmentThumbnail: View {
             // `aspectRatio`: that pair asks the layout for an infinite width and
             // then derives the height from it, which is a feedback loop — it locked
             // the main thread and left the transcript blank.
-            .frame(maxWidth: .infinity)
-            .frame(height: placeholderHeight)
+            .frame(width: reservedSize.width, height: reservedSize.height)
             .accessibilityIdentifier("attachment.image.loading")
         }
     }

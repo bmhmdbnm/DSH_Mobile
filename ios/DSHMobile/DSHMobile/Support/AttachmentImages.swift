@@ -27,8 +27,14 @@ final class AttachmentImages {
         }
     }
 
-    /// session → attachment id → decoded image.
-    private var images: [String: [String: UIImage]] = [:]
+    /// 解码结果内存 LRU（T029）：key 是 "session|attachmentId"，cost 是位图字节数，
+    /// 总量按字节封顶——解码后的位图才是内存大头，按张数限会漏掉「全是 4K 截图」
+    /// 的情形。逐出策略交给 NSCache（线程安全，且内存紧张时系统可代为回收）。
+    private let cache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.totalCostLimit = 64 * 1024 * 1024
+        return cache
+    }()
     /// session → attachment id → when it last failed.
     ///
     /// A timestamp rather than a set, because "failed" must not mean "forever":
@@ -37,26 +43,15 @@ final class AttachmentImages {
     private var failures: [String: [String: Date]] = [:]
     /// "session|attachment" → the load in progress, so the same picture asked
     /// for twice in one session coalesces while two sessions never share one.
-    private var inFlight: [String: Task<UIImage?, Never>] = [:]
-    /// Every cached picture, least recently used first.
-    private var recent: [String] = []
+    private var inFlight: [String: Task<(image: UIImage?, attemptedNetwork: Bool), Never>] = [:]
+    /// 解码过的附件的真实像素宽高（T029）：协议事件没带宽高时，首帧按 4:3 占位，
+    /// 解码完成把真实尺寸记进这里，下次同一附件直接定高。持久化在 DSHKit 侧。
+    private let dimensions = AttachmentDimensions()
 
-    /// Enough for a session's worth of screenshots without hoarding memory.
-    ///
-    /// Three bounds, because decoded images are large: per session, in total, and
-    /// in how many sessions keep a bucket at all. A bucket is dropped whole, so a
-    /// conversation never shows a picture it did not load.
-    private static let perSessionLimit = 24
-    private static let totalLimit = 48
+    /// 失败时间戳的会话桶上限（图片本身由 NSCache 按字节管，不再需要按会话清）。
     private static let sessionLimit = 6
 
     private var key: String { sessionId ?? "" }
-
-    /// 写完这份字节。调用点在**取图的那个异步任务**里，不在渲染路径上；
-    /// 单张图的写入是几毫秒级，换来的是下次冷启动不必再走一趟中转。
-    private func persist(_ data: Data, attachmentId: String, variant: String?) {
-        diskCache.save(data, scope: scopeId, attachmentId: attachmentId, variant: variant)
-    }
 
     private func bucketKey(_ session: String, _ attachmentId: String) -> String {
         "\(session)|\(attachmentId)"
@@ -70,7 +65,13 @@ final class AttachmentImages {
 
     /// The decoded image, when it has already been loaded.
     func cached(_ attachmentId: String) -> UIImage? {
-        images[key]?[attachmentId]
+        cache.object(forKey: bucketKey(key, attachmentId) as NSString)
+    }
+
+    /// The size a previous decode established, when the wire metadata didn't
+    /// say — the second source `AttachmentThumbnail` sizes its box from.
+    func knownSize(_ attachmentId: String) -> AttachmentDimensions.Size? {
+        dimensions.size(scope: scopeId, attachmentId: attachmentId)
     }
 
     /// How long a failure keeps a re-rendering view from asking again.
@@ -90,9 +91,9 @@ final class AttachmentImages {
 
     /// 丢掉所有内存里的图片（「清除本地缓存」时用；磁盘那份由设置页删）。
     func clearAllCached() {
-        images.removeAll()
+        cache.removeAllObjects()
+        dimensions.clearAll()
         inFlight.removeAll()
-        recent.removeAll()
         failures.removeAll()
     }
 
@@ -119,30 +120,31 @@ final class AttachmentImages {
     /// media type). Attachment ids are the host's; if it ever reuses one for a
     /// different picture, a different variant means a different cache entry
     /// rather than the old picture forever.
+    ///
+    /// T029：磁盘读取、网络下载与**解码**全部在后台任务里完成
+    /// （`preparingForDisplay` 强制位图落出来），主线程只拿现成的 UIImage——
+    /// 行高早已按元数据定死，这里只负责把内容填进去。
     @discardableResult
     func load(_ attachmentId: String, variant: String? = nil) async -> UIImage? {
         let session = key
         let flightKey = bucketKey(session, attachmentId)
-        if let cached = images[session]?[attachmentId] {
-            touch(flightKey)
-            return cached
-        }
-        // 内存没有就问磁盘：同一个会话翻回去看时，图不该再走一遍网络。
-        if let data = diskCache.load(scope: scopeId, attachmentId: attachmentId, variant: variant),
-           let image = UIImage(data: data) {
-            store(image, for: attachmentId, in: session)
-            // 诊断：这张图是**从磁盘**拿到的（没走网络）。
-            ViewportProbe.note("attachment.disk", ["id": attachmentId], force: true)
-            return image
-        }
-        if hasFailed(attachmentId) { return nil }
-        // Past the quiet window the stale entry must not block the retry.
-        failures[session]?.removeValue(forKey: attachmentId)
-        if let running = inFlight[flightKey] { return await running.value }
+        if let cached = cache.object(forKey: flightKey as NSString) { return cached }
+        if let running = inFlight[flightKey] { return await running.value.image }
         guard !attachmentId.isEmpty, let sessionId, let client = store?.client else { return nil }
 
-        let task = Task<UIImage?, Never> { [weak self] in
-            if self?.shouldInjectFailure(for: attachmentId) == true { return nil }
+        let scope = scopeId
+        let disk = diskCache
+        let task = Task<(image: UIImage?, attemptedNetwork: Bool), Never>.detached {
+            [weak self] in
+            // 内存没有先问磁盘：同一个会话翻回去看时，图不该再走一遍网络。
+            // 磁盘命中不触网，也就不受失败静默窗约束。
+            if let data = disk.load(scope: scope, attachmentId: attachmentId, variant: variant),
+               let image = Self.decode(data) {
+                await ViewportProbe.note("attachment.disk", ["id": attachmentId], force: true)
+                return (image, false)
+            }
+            if await self?.shouldInjectFailure(for: attachmentId) == true { return (nil, true) }
+            if await self?.hasFailed(attachmentId) == true { return (nil, false) }
             do {
                 let value = try await client.attachment(
                     sessionId: sessionId,
@@ -150,26 +152,33 @@ final class AttachmentImages {
                 )
                 guard let encoded = value["data"]?.stringValue,
                       let data = Data(base64Encoded: encoded),
-                      let image = UIImage(data: data)
-                else { return nil }
+                      let image = Self.decode(data)
+                else { return (nil, true) }
                 // 下到了就留一份：下次冷启动不必再为这张图跑一趟中转。
-                self?.persist(data, attachmentId: attachmentId, variant: variant)
-                return image
+                disk.save(data, scope: scope, attachmentId: attachmentId, variant: variant)
+                return (image, true)
             } catch {
-                return nil
+                return (nil, true)
             }
         }
         inFlight[flightKey] = task
 
-        let image = await task.value
+        let result = await task.value
         inFlight[flightKey] = nil
-        if let image {
+        if let image = result.image {
             store(image, for: attachmentId, in: session)
             failures[session]?.removeValue(forKey: attachmentId)
-        } else {
+        } else if result.attemptedNetwork {
             failures[session, default: [:]][attachmentId] = Date()
         }
-        return image
+        return result.image
+    }
+
+    /// 后台解码：`UIImage(data:)` 本身是惰性的，不强制的话真正的解码会推迟到
+    /// 渲染那一帧、发生在主线程上。`preparingForDisplay` 在后台把位图落出来。
+    private nonisolated static func decode(_ data: Data) -> UIImage? {
+        guard let image = UIImage(data: data) else { return nil }
+        return image.preparingForDisplay() ?? image
     }
 
     /// The person asked for this picture again.
@@ -188,9 +197,8 @@ final class AttachmentImages {
     /// across hosts. Switching *sessions* does not come here — that just changes
     /// which bucket is read.
     func reset() {
-        images.removeAll()
+        cache.removeAllObjects()
         failures.removeAll()
-        recent.removeAll()
         for task in inFlight.values { task.cancel() }
         inFlight.removeAll()
     }
@@ -228,58 +236,23 @@ final class AttachmentImages {
     }
 
     private func store(_ image: UIImage, for attachmentId: String, in session: String) {
-        images[session, default: [:]][attachmentId] = image
-        touch(bucketKey(session, attachmentId))
-        evict()
-    }
-
-    /// Marks a picture as just used.
-    private func touch(_ flightKey: String) {
-        recent.removeAll { $0 == flightKey }
-        recent.append(flightKey)
-    }
-
-    /// Enforces the three bounds by dropping whole pictures, oldest first.
-    private func evict() {
-        // 总量：全局 LRU 里最旧的那些
-        while recent.count > Self.totalLimit {
-            drop(recent.first)
+        // cost = 解码后位图的字节数，配合 totalCostLimit 按内存压力逐出。
+        let cost = image.cgImage.map { $0.bytesPerRow * $0.height } ?? 1
+        cache.setObject(
+            image, forKey: bucketKey(session, attachmentId) as NSString, cost: max(cost, 1))
+        // T029：真实像素宽高落进尺寸缓存——协议事件没带宽高的附件，
+        // 下次渲染直接用这里的值定行高，不再经过 4:3 占位。
+        if let pixels = image.cgImage {
+            dimensions.record(
+                scope: scopeId, attachmentId: attachmentId,
+                size: .init(width: pixels.width, height: pixels.height))
         }
-        // 单个会话：`recent` 是按使用顺序排的，前缀里最旧的先丢
-        for (session, bucket) in images where bucket.count > Self.perSessionLimit {
-            let sessionKeys = recent.filter { $0.hasPrefix("\(session)|") }
-            for flightKey in sessionKeys.prefix(bucket.count - Self.perSessionLimit) {
-                drop(flightKey)
-            }
-        }
-        pruneSessions()
     }
 
-    /// Removes one cached picture (and its bucket, when it becomes empty).
-    private func drop(_ flightKey: String?) {
-        guard let flightKey else { return }
-        recent.removeAll { $0 == flightKey }
-        let parts = flightKey.split(separator: "|", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return }
-        images[parts[0]]?.removeValue(forKey: parts[1])
-        if images[parts[0]]?.isEmpty == true { images.removeValue(forKey: parts[0]) }
-    }
-
-    /// Keeps at most `sessionLimit` sessions, oldest first.
+    /// Keeps at most `sessionLimit` sessions' failure buckets, oldest first.
     private func pruneSessions() {
-        var seen: [String] = []
-        for flightKey in recent.reversed() {
-            guard let session = flightKey.split(separator: "|", maxSplits: 1).first.map(String.init) else { continue }
-            if !seen.contains(session) { seen.append(session) }
-        }
-        for session in images.keys where !seen.contains(session) {
-            images.removeValue(forKey: session)
-            failures.removeValue(forKey: session)
-        }
-        for session in seen.dropFirst(Self.sessionLimit) {
-            images.removeValue(forKey: session)
-            failures.removeValue(forKey: session)
-            recent.removeAll { $0.hasPrefix("\(session)|") }
-        }
+        guard failures.count > Self.sessionLimit else { return }
+        let oldest = failures.keys.prefix(failures.count - Self.sessionLimit)
+        for session in oldest { failures.removeValue(forKey: session) }
     }
 }
