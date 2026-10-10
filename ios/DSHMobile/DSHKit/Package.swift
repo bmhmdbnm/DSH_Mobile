@@ -14,9 +14,17 @@ let package = Package(
         // 依赖方向只有一条：RelayKit → DSHKit，反过来会成环。
         .library(name: "RelayKit", targets: ["RelayKit"]),
     ],
+    dependencies: [
+        // 009 磁盘层（specs/009-message-pipeline research D1，owner 已批准引入）：
+        // GRDB 提供 WAL、类型安全查询与 FTS5 封装，取代 007 的手写 SQLite 层。
+        .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.5.0"),
+    ],
     targets: [
         .target(
             name: "DSHKit",
+            dependencies: [
+                .product(name: "GRDB", package: "GRDB.swift"),
+            ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
