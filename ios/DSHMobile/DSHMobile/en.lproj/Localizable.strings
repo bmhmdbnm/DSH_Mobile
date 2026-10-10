@@ -199,6 +199,7 @@
 "已到最早" = "Beginning of the conversation";
 "继续下拉会接着往前读" = "Keep scrolling down to read further back";
 "已经读到这段会话的最开头。" = "You have reached the start of this conversation.";
+"提问已同步到本机，列表与搜索不联网。" = "Your questions are synced to this device; this list and its search work offline.";
 "我的提问 %lld 条" = "%lld questions from me";
 "已搜 %lld 行 · 我的提问 %lld 条" = "%lld rows searched · %lld of my questions";
 "已搜 %lld 行 · 命中 %lld 条" = "%lld rows searched · %lld matches";

@@ -43,6 +43,8 @@ final class MessageLayer {
     let addresses = AddressBook()
     private(set) var store: MessageStore?
     private(set) var pipeline: MessagePipeline?
+    /// attach 时注入的 client 现取闭包，T024 灌库也要用（重连后自动换 carrier）。
+    private var clientProvider: (@Sendable () -> DSHClient?)?
 
     /// 注册一批会话的拉取地址（列表刷新后、进会话前各喂一次）。
     func registerAddresses(_ summaries: [SessionSummary]) {
@@ -52,6 +54,7 @@ final class MessageLayer {
     /// 懒建磁盘层与内存层（各一次，进程级复用）。`client` 每次调用现取：
     /// 未连接时 fetch 抛 `notConnected`，预取方按"跳过"处理。
     func attach(client: @escaping @Sendable () -> DSHClient?) {
+        clientProvider = client
         if store == nil {
             // 磁盘层建不起来（如存储被拒）时整套 009 叠加自动缺位，
             // 列表/会话都回退到现有行为——不劣于现状。
@@ -106,5 +109,40 @@ final class MessageLayer {
             },
             hotLimit: 5000
         )
+    }
+
+    // MARK: - T024 用户输入灌库（spec 009「用户输入全量入库」）
+
+    /// 冷启动预取瀑布之后的低优先级任务：逐会话走 `_link/sessionFind` 浏览模式
+    /// （roles=['me']、无关键词）把全量用户输入灌进 `user_inputs` 表。
+    ///
+    /// 刻意**串行**：灌库是缓存行为，不许和读者正在用的拉取抢隧道（连接器对同会话
+    /// 并发 find 也直接回 `link/busy`）。未连接、磁盘层缺位、地址未注册都静默跳过；
+    /// 去重与增量判定全在 `UserInputBackfiller`（24h 新鲜窗口 + lastSeq 锚点）。
+    func backfillUserInputs(scope: String, summaries: [SessionSummary]) async {
+        guard let store, let client = clientProvider?() else { return }
+        let backfiller = UserInputBackfiller(store: store)
+        for summary in summaries {
+            guard let address = addresses.address(for: summary.sessionId) else { continue }
+            let lastSeq = summary.asOfSeq
+            guard lastSeq > 0 else { continue }
+            do {
+                let outcome = try await backfiller.backfill(
+                    scope: scope, sessionId: summary.sessionId, lastSeq: lastSeq) { cursor in
+                        try await client.sessionFind(HistorySearchRequest(
+                            address: address, query: "", roles: ["me"],
+                            limit: 200, cursor: cursor))
+                    }
+                if case .pulled(let pages, let rows) = outcome {
+                    ViewportProbe.note("userinputs.backfill", [
+                        "session": summary.sessionId,
+                        "pages": String(pages), "rows": String(rows),
+                    ], force: true)
+                }
+            } catch {
+                // 失败不记账（backfiller 语义），下次冷启动重试；静默，不刷错误。
+                continue
+            }
+        }
     }
 }

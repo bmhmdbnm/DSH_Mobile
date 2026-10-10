@@ -59,10 +59,15 @@ extension SessionListModel {
                 return MessagePipeline.PrefetchTarget(
                     session: .init(scope: scope, sessionId: summary.sessionId), newestSeq: newest)
             }
-            guard !targets.isEmpty else { return }
-            ViewportProbe.note("prefetch.coldstart", ["sessions": String(targets.count)], force: true)
-            await pipeline.prefetchLatestPages(
-                targets, persistedRanges: persistedRanges, limit: 10, concurrency: 3)
+            if !targets.isEmpty {
+                ViewportProbe.note("prefetch.coldstart", ["sessions": String(targets.count)], force: true)
+                await pipeline.prefetchLatestPages(
+                    targets, persistedRanges: persistedRanges, limit: 10, concurrency: 3)
+            }
+            // T024：预取瀑布之后灌「我问过的」全量库（优先级天然低于最新页预取——
+            // 串行排在它后面；任务本身是 .utility）。逐会话串行，内部有 24h
+            // 去重与 lastSeq 增量判定，重复触发是廉价的。
+            await layer.backfillUserInputs(scope: scope, summaries: ordered)
         }
     }
 }

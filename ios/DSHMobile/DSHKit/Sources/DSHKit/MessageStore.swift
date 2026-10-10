@@ -136,6 +136,17 @@ public actor MessageStore {
               PRIMARY KEY (scope, session_id, seq)
             );
             """)
+        // T024 灌库去重账本：每会话记 pulled_at 与当时见到的 last_seq，
+        // 24h 内且 lastSeq 没变就跳过（UserInputBackfiller 的判定依据）。
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS user_input_state (
+              scope      TEXT    NOT NULL,
+              session_id TEXT    NOT NULL,
+              pulled_at  REAL    NOT NULL,
+              last_seq   INTEGER NOT NULL,
+              PRIMARY KEY (scope, session_id)
+            );
+            """)
         // trigram：unicode61 不会切中文（整段当一个词），子串搜索会全空。
         // trigram 需要查询 ≥3 字符，短查询在读取侧降级 LIKE（见 searchUserInputs）。
         try db.execute(sql: """
