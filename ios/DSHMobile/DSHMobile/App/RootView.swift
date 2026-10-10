@@ -224,6 +224,9 @@ struct RootView: View {
                     // has to make the rows fresh again.
                     hub.startIfNeeded(client: store.client)
                     Task { await listModel.refresh() }
+                    // 可见性兜底（009 tasks T019）：回前台对一次 lastSeq，
+                    // 推送在后台漏掉的尾部增量向管道补齐（幂等，在飞不重复）。
+                    Task { await chatModel.syncTailWithHost(reason: "foreground") }
                 } else if phase == .active {
                     // Sockets do not survive suspension; put the link back.
                     Task { await store.reconnectIfNeeded() }

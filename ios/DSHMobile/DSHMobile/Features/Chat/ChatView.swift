@@ -270,10 +270,47 @@ struct ChatView: View {
         .overlay(alignment: .top) { olderLoadingPill }
         .overlay(alignment: .top) { olderRetryBar }
         .overlay(alignment: .bottomTrailing) {
-            if !isFollowing, !model.timeline.items.isEmpty {
+            // 009「↓ 新消息」胶囊（T018）：reading 态且有新消息到达时出现，
+            // 点击一律滚到最新（差值补齐与降级在模型侧，见 ChatModel+Follow）。
+            // 与 008「回到底部」按钮共用同一视觉家族（胶囊、layer3、描边、投影）。
+            if model.pipelineActive, model.followState == .reading, model.unreadWhileReading > 0 {
+                Button {
+                    Task { @MainActor in
+                        await model.jumpToLatest()
+                        isFollowing = true
+                        userScrolled = false
+                        listHostRef?.scrollToBottom()
+                    }
+                } label: {
+                    HStack(spacing: DSHTheme.Spacing.hairline) {
+                        if model.isCatchingUpTail {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        Text(String(format: String(localized: "↓ %lld 条新消息"),
+                                    model.unreadWhileReading))
+                            .font(DSHTheme.Typography.micro)
+                    }
+                    .foregroundStyle(DSHTheme.labelPrimary)
+                    .padding(.horizontal, DSHTheme.Spacing.tight)
+                    .padding(.vertical, 6)
+                    .background(DSHTheme.layer3, in: Capsule())
+                    .overlay(Capsule().stroke(DSHTheme.border2, lineWidth: 1))
+                    .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("chat.newMessages")
+                .padding(.trailing, DSHTheme.Spacing.loose)
+                .padding(.bottom, DSHTheme.Spacing.tight)
+                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+            } else if !isFollowing, !model.timeline.items.isEmpty {
                 Button {
                     isFollowing = true
                     userScrolled = false
+                    // 手动回底 = 回到跟底态（T017：胶囊之外的手动回底也清两态）。
+                    model.noteWantsBottom()
                     listHostRef?.scrollToBottom()
                     // 新宿主下 `ScrollViewProxy` 不在它的视图树里，走 proxy 等于没反应
                     // （2026-10-08 真机反馈：点了不生效）。
@@ -457,6 +494,9 @@ struct ChatView: View {
                     }
                 },
                 onBottomChanged: { atBottom in  // 几何驱动
+                    // 009 管道 + uikit 宿主：跟随判定由跟底两态接管（48pt + 向上拖动
+                    // 抑制，见 onFollowGeometry），这条旧回调只在其它路径生效。
+                    guard !(model.pipelineActive && ProbeVariants.listHost == "uikit") else { return }
                     // 唯一可靠的"跟随"依据：滚动几何。原来靠拖动位移（>24pt）判定，
                     // 于是"轻轻往上滑/刷新"这类情况仍被判成跟随，内容一变就被拽到底部
                     // （2026-10-08 真机反馈："偶尔自动跳到底部"）。
@@ -465,6 +505,23 @@ struct ChatView: View {
                         userScrolled = false
                         listHostRef?.cancelBottomIntent()
                     } else {
+                        isFollowing = false
+                        userScrolled = true
+                        listHostRef?.noteUserMovedAwayFromBottom()
+                    }
+                },
+                onFollowGeometry: { distance, draggingUp in
+                    // 跟底两态（T017）：状态判定收敛在模型，这里只把结论同步给
+                    // 本视图的两个滚动开关（isFollowing 是所有自动滚动的总闸）。
+                    model.noteFollowGeometry(distance: distance, draggingUp: draggingUp)
+                    guard model.pipelineActive else { return }
+                    if model.followState == .atBottom {
+                        if !isFollowing {
+                            isFollowing = true
+                            userScrolled = false
+                            listHostRef?.cancelBottomIntent()
+                        }
+                    } else if isFollowing {
                         isFollowing = false
                         userScrolled = true
                         listHostRef?.noteUserMovedAwayFromBottom()

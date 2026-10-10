@@ -147,7 +147,8 @@ final class ChatModel {
     /// away: they are waiting to see their own message land.
     private(set) var sendSignal: Int = 0
 
-    private var store: ConnectionStore?
+    /// internal(set)：ChatModel+Follow 的可见性兜底要读 client（T019）。
+    private(set) var store: ConnectionStore?
     private var hub: HostEventHub?
     /// 009 消息层（T012：MessageStore 有数据时优先用它画进会话首帧）。
     /// internal：冷启动半边在 ChatModel+ColdStart.swift（文件按职责拆分）。
@@ -235,6 +236,18 @@ final class ChatModel {
     /// 快照驱动（订阅/折叠/重试全在 ChatModel+Pipeline.swift 的桥里）；
     /// nil = 回退到自有 pager/fetcher/store 路径（管道不可用时不劣于现状）。
     var pipelineBridge: ChatPipelineBridge?
+    /// 009 跟底两态（tasks T017）：判定逻辑在 ChatModel+Follow.swift，
+    /// 存储只能留在主文件（扩展不能有存储属性）。
+    enum FollowState: String { case atBottom, reading }
+    /// 只允许 ChatModel+Follow 的迁移入口改写（Swift 没有"跨文件只读"，
+    /// 写权限按模块内纪律约束）。
+    var followState: FollowState = .atBottom
+    /// reading 期间到达的新消息数（「↓ 新消息」胶囊的未读数，T018）。
+    var unreadWhileReading = 0
+    /// 尾部追平（点胶囊/可见性兜底）进行中：胶囊转 spinner，兜底去重（T018/T019）。
+    var isCatchingUpTail = false
+    /// 可见性兜底的幂等闩（T019）：一次只跑一轮「对 lastSeq」。
+    var tailSyncInFlight = false
     /// 本地窗口的最老 seq（投影自 pager，供搜索缓冲与落盘使用）。
     private var oldestSeq: Int? { pager?.oldestLoadedSeq }
     /// DEBUG 故障注入：让前 N 次取页失败（`-DSHProbeFailPage <n>`）。
@@ -284,6 +297,8 @@ final class ChatModel {
         let key = summary.sessionId
         sessionScope = scopeId == "unknown" ? nil : scopeId
         persistSuspended = false
+        // 冷进入回到跟底默认态（T017：首帧贴底纪律在 ChatModel+ColdStart/T012）。
+        noteFollowResetForOpen()
         // 这次跟 host 要多少条快照：本地尾部很新（差 ≤20 条）时只要 20 条就够对齐，
         // 少拉一遍重复数据；本地落后很多或没有本地缓存时按 60 条来，避免中间留洞。
         var syncPlan = TranscriptSyncPlan.plan(localThrough: nil, hostCursor: summary.asOfSeq)
@@ -554,6 +569,8 @@ final class ChatModel {
     ///
     /// 只从**本地库**读（0 网络）；库里没有这一段就返回 nil，界面保持原地并留一条诊断。
     func rebaseWindow(around seq: Int, leading: Int = 20, limit: Int = 80) async -> String? {
+        // 跳转/换窗口强制置为「阅读中」（spec 009 场景 9：不重置会被下一条增量拽回底部）。
+        noteJumpToReading()
         // T013：跳转 = 管道的 .jump（抢占在途低优预取，只拉目标对齐页）。
         if let bridge = pipelineBridge {
             return await bridge.rebase(around: seq, leading: leading, limit: limit)
@@ -710,6 +727,8 @@ final class ChatModel {
         } else if let wanted = pendingOpen {
             await open(wanted)
         }
+        // 可见性兜底（T019）：重连成功对一次 lastSeq，断线期间的尾部增量补齐。
+        await syncTailWithHost(reason: "reconnect")
     }
 
     // MARK: - Warm cache
@@ -1056,7 +1075,8 @@ final class ChatModel {
         }
     }
 
-    private func refreshSummary() async {
+    /// internal：ChatModel+Follow 的尾部追平要对一次 host 的 lastSeq（T018/T019）。
+    func refreshSummary() async {
         guard let client = store?.client, let current = session else { return }
         guard let value = try? await client.sessions(),
               let updated = value.items.first(where: { $0.sessionId == current.sessionId })
@@ -1593,6 +1613,8 @@ final class ChatModel {
         timeline.echoUserPrompt(requestId: requestId, text: text)
         scrollSignal += 1
         sendSignal += 1
+        // 发送自己的消息一律贴底（spec 009「跟底两态」钦定例外，tasks T017）。
+        noteWantsBottom()
         isAwaitingTurnStart = true
         // If the host is already mid-turn the message sits in its queue, and
         // `timeline.isTurnOpen` already reports running; otherwise a turn

@@ -104,6 +104,10 @@ final class ChatPipelineBridge {
     private func apply(_ diff: MessagePipeline.SnapshotDiff) {
         var messagesChanged = false
         var gapsChanged = false
+        // 尾部到达计数（T018 未读数）：只数"比现有最大 seq 还新"的插入——
+        // 向上翻页的 prepend 与首帧快照都不算（后者由 maxSeqBefore == nil 排除）。
+        let maxSeqBefore = records.keys.max()
+        var tailArrivals = 0
         for change in diff.changes {
             switch change {
             case .remove(let ids):
@@ -120,6 +124,7 @@ final class ChatPipelineBridge {
                 for row in rows {
                     switch row {
                     case .message(let message):
+                        if let before = maxSeqBefore, message.seq > before { tailArrivals += 1 }
                         records[message.seq] = message.record
                         rowSeqs[message.id.uuidString] = message.seq
                         messagesChanged = true
@@ -134,6 +139,7 @@ final class ChatPipelineBridge {
                 }
             }
         }
+        if tailArrivals > 0 { model?.noteTailArrivals(tailArrivals) }
         refold(messagesChanged: messagesChanged, gapsChanged: gapsChanged)
     }
 
@@ -170,6 +176,8 @@ final class ChatPipelineBridge {
 
     /// 缺口行集合：管道派生的中间缺口 + 顶部合成行（向上拉的 spinner 与中间
     /// 缺口是同一机制——前者是「窗口最顶端之上的缺口」，spec「缺口行的生命周期」）。
+    /// 尾部追平（点胶囊/可见性兜底，T018/T019）期间再补一行合成**底部**缺口
+    /// （spinner），区间集不表达"窗口之外的尾巴"，由这里显式占位。
     private func gapItems(
         _ pipelineGaps: [SessionPipeline.GapRow], topExhausted: Bool
     ) -> [TimelineItem] {
@@ -178,6 +186,10 @@ final class ChatPipelineBridge {
         }
         if let top = topGapItem(topExhausted: topExhausted) {
             items.insert(top, at: 0)
+        }
+        if model?.isCatchingUpTail == true {
+            // seq 取 Int.max-1：合成身份，排序恒在最后，不与任何真实缺口/数据行撞键。
+            items.append(ChatTimeline.gapItem(start: .max - 1, end: .max - 1, status: .loading))
         }
         return items
     }
@@ -268,6 +280,39 @@ final class ChatPipelineBridge {
     func dropRecords(below seq: Int) {
         records = records.filter { $0.key >= seq }
     }
+
+    // MARK: - 尾部追平（T018 点胶囊 / T019 可见性兜底）
+
+    /// 桥已收到的最大 seq（"本地对到哪儿了"的口径）。
+    func localNewestSeq() -> Int { records.keys.max() ?? 0 }
+
+    /// 尾部追平展示态变了（模型侧的 isCatchingUpTail）：底部合成缺口行生灭。
+    func noteCatchUpPresentationChanged() {
+        refold(messagesChanged: false, gapsChanged: true)
+    }
+
+    /// 把尾部对到 host 的 lastSeq（spec 009 场景 7 /「可见性兜底」）。
+    ///
+    /// - 差值 ≤ 5 页：`records(in:, .userVisible)` 逐段补齐，diff 正常回填，
+    ///   底部 spinner 由 `isCatchingUpTail` 期间的合成缺口行表达；
+    /// - 差值 > 5 页：降级为直接跳最新页（.jump），中间段丢弃——与跳转同语义，
+    ///   留下的洞是普通的中间缺口行（点它可按既有重试路径补齐）。
+    /// 幂等由管道的 in-flight 页表保证（同页合并）。
+    func catchUp(toHost lastSeq: Int) async {
+        guard let session, lastSeq > 0 else { return }
+        let localNewest = records.keys.max() ?? 0
+        let missing = lastSeq - localNewest
+        guard missing > 0 else { return }
+        if missing > Self.pageSize * Self.catchUpPageBudget {
+            let lower = max(1, lastSeq - Self.pageSize + 1)
+            _ = try? await session.records(in: lower...lastSeq, priority: .jump)
+        } else {
+            _ = try? await session.records(in: (localNewest + 1)...lastSeq, priority: .userVisible)
+        }
+    }
+
+    /// 点胶囊直跳最新的降级阈值（页）：超过就丢中间段（spec 场景 7）。
+    private static let catchUpPageBudget = 5
 
     /// 下行数据进管道（follow 快照 / WSS 事件）：合并进热窗口并经 diff 重建。
     func applyDownstream(records page: [SessionRecord]) {

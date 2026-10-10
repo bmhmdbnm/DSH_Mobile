@@ -189,6 +189,7 @@
 "图片加载失败，点按重试" = "Could not load the picture — tap to retry";
 "回到最新" = "Back to latest";
 "回到底部" = "Back to bottom";
+"↓ %lld 条新消息" = "↓ %lld new messages";
 "空会话" = "Empty session";
 "在下面输入内容，或从电脑端继续这个会话。" = "Type below, or continue this session from your computer.";
 "正在加载更早的消息…" = "Loading earlier messages…";

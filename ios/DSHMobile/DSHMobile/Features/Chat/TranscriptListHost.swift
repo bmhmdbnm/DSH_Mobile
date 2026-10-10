@@ -44,6 +44,8 @@ struct TranscriptListRepresentable: UIViewRepresentable {
     let onNeedRehydrate: ([Int]) -> Void
     /// 读者是否贴在最新那一头（唯一可靠的"跟随"依据）。
     let onBottomChanged: (Bool) -> Void
+    /// 009 跟底两态的几何输入（tasks T017）：距底距离 + 向上拖动中。
+    var onFollowGeometry: (CGFloat, Bool) -> Void = { _, _ in }
     /// 跳转目标行（spec 008 的 US2）：换窗口之后由宿主滚过去，**不经过 SwiftUI 的 ScrollViewProxy**。
     let jumpToId: String?
     /// 把宿主实例交回给 `ChatView`（回收/水合要用它把行交回来）。
@@ -60,6 +62,7 @@ struct TranscriptListRepresentable: UIViewRepresentable {
         host.onDiagnostic = onDiagnostic
         host.onScroll = onScroll
         host.onBottomChanged = onBottomChanged
+        host.onFollowGeometry = onFollowGeometry
         host.onNearTop = { [weak coordinator = context.coordinator] in
             coordinator?.requestOlder()
         }
@@ -272,6 +275,16 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
     var onNearTop: (() -> Void)?
     /// 读者是否贴在最新那一头（由滚动几何算，不信拖动位移）。
     var onBottomChanged: ((Bool) -> Void)?
+    /// 009 跟底两态（tasks T017）的几何输入：距底距离（点）+ 是否"用户手指向上拖动中"。
+    /// 阈值判定与状态迁移都在调用方（ChatModel+Follow），宿主只负责量。
+    var onFollowGeometry: ((CGFloat, Bool) -> Void)?
+    /// "用户手指向上拖动中"（往更早内容方向）：拖动期间即使几何贴底也不算 atBottom
+    /// （spec 009 场景 3：误判会把读者拽回底部）。
+    private(set) var isUserDraggingUp = false
+    /// 拖动起手时的 offset：没有速度信息的中段拖动靠位移方向判定。
+    private var dragStartOffsetY: CGFloat = 0
+    /// 上一帧 scroll 回调的 offset（拖动瞬时方向的判定基准）。
+    private var lastScrollOffsetY: CGFloat = 0
     /// 读者滚走（离开底部）时撤销"回到底部"的意图。
     func noteUserMovedAwayFromBottom() { wantsBottom = false }
     /// 内容变了之后要不要继续钉底：**只有本来就在底部**（或按钮刚点过）才钉。
@@ -798,6 +811,11 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
 extension TranscriptListHost {
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        // 拖动过程中的瞬时方向：按上一帧 offset 的走向更新（慢拖没有速度回调）。
+        if scrollView.isTracking {
+            isUserDraggingUp = scrollView.contentOffset.y < lastScrollOffsetY
+        }
+        lastScrollOffsetY = scrollView.contentOffset.y
         let distance = scrollView.contentOffset.y + scrollView.adjustedContentInset.top
         onScroll?(distance)
         scheduleReclaimCheck()
@@ -806,6 +824,7 @@ extension TranscriptListHost {
         let atBottom = bottomDistance() <= Self.bottomSlack
         lastReportedAtBottom = atBottom
         onBottomChanged?(atBottom)
+        reportFollowGeometry(scrollView)
         // **可见余量预取**：离顶端还有一屏半就开始要，而不是等贴到顶（真机反馈"预取太慢"）。
         // 贴着顶时也允许继续要 —— 读者一直往上拉就一页页接着给。
         if distance < prefetchMargin() {
@@ -816,6 +835,39 @@ extension TranscriptListHost {
         } else if distance > prefetchMargin() * 2 {
             nearTopArmed = true
         }
+    }
+
+    // MARK: - 009 跟底两态的拖动方向（tasks T017）
+
+    /// 上报一次跟底几何（距底距离 + 向上拖动中）。拖动开始/结束/减速结束各补一次：
+    /// 这几何时刻 offset 未必再变，不补的话"松手停在底部"会一直被判成阅读中。
+    private func reportFollowGeometry(_ scrollView: UIScrollView) {
+        onFollowGeometry?(bottomDistance(), isUserDraggingUp)
+    }
+
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        dragStartOffsetY = scrollView.contentOffset.y
+        isUserDraggingUp = false
+    }
+
+    func scrollViewWillEndDragging(_ scrollView: UIScrollView, withVelocity velocity: CGPoint,
+                                   targetContentOffset: UnsafeMutablePointer<CGPoint>) {
+        // 速度优先（快速甩动），速度近零时退到整段位移方向（慢拖）。
+        // offset 变小 = 往更早内容方向 = "向上"。
+        isUserDraggingUp = velocity.y < -0.05
+            || (abs(velocity.y) <= 0.05 && scrollView.contentOffset.y < dragStartOffsetY)
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if !decelerate {
+            isUserDraggingUp = false
+            reportFollowGeometry(scrollView)
+        }
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        isUserDraggingUp = false
+        reportFollowGeometry(scrollView)
     }
 }
 
