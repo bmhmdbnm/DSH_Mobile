@@ -186,14 +186,89 @@ final class SessionPipelineTests: XCTestCase {
         let first = await iterator.next()
         XCTAssertEqual(first?.inserted.count, 1)
         XCTAssertEqual(first?.inserted.first?.event.seq, 41)
-        XCTAssertEqual(first?.inserted.first?.event.data["text"]?.stringValue, "hello!")
+        // T020：provisional 记录与提交的 assistant/message 同形，带 stream 标记。
+        let provisional = first?.inserted.first?.event
+        XCTAssertEqual(provisional?.data["stream"], .bool(true))
+        let block = provisional?.data["message"]?["content"]?.arrayValue?.first
+        XCTAssertEqual(block?["type"]?.stringValue, "text")
+        XCTAssertEqual(block?["text"]?.stringValue, "hello!")
 
         // 下一 tick 的增量是第二次 diff。
         await pipeline.apply(stream: .chunk(attemptId: "a1", revision: 1, index: 3, time: nil, chunk: .textDelta(" again")))
         await gate.release()
         let second = await iterator.next()
         XCTAssertEqual(second?.updated.count, 1)
-        XCTAssertEqual(second?.updated.first?.event.data["text"]?.stringValue, "hello! again")
+        let updated = second?.updated.first?.event.data["message"]?["content"]?.arrayValue?.first
+        XCTAssertEqual(updated?["text"]?.stringValue, "hello! again")
+    }
+
+    /// T020：思考与正文分开成块；工具参数增量不进 provisional 文本。
+    func testStreamReasoningAndToolDeltasStayOutOfText() async throws {
+        let gate = TickGate()
+        let pipeline = makePipeline { await gate.tick() }
+        let diffs = await pipeline.diffs()
+        var iterator = diffs.makeAsyncIterator()
+
+        await pipeline.apply(stream: .start(attemptId: "a1", revision: 1, turn: 1, step: 1, startedAfterSeq: 10))
+        await pipeline.apply(stream: .chunk(attemptId: "a1", revision: 1, index: 0, time: nil, chunk: .reasoningDelta("想")))
+        await pipeline.apply(stream: .chunk(attemptId: "a1", revision: 1, index: 1, time: nil,
+                                            chunk: .toolCallDelta(id: "c1", name: "bash", index: 0, argumentsDelta: "{\"cmd\"")))
+        await pipeline.apply(stream: .chunk(attemptId: "a1", revision: 1, index: 2, time: nil, chunk: .textDelta("答")))
+        await gate.release()
+
+        let diff = await iterator.next()
+        let content = diff?.inserted.first?.event.data["message"]?["content"]?.arrayValue
+        XCTAssertEqual(content?.count, 2)
+        XCTAssertEqual(content?[0]["type"]?.stringValue, "reasoning")
+        XCTAssertEqual(content?[0]["text"]?.stringValue, "想")
+        XCTAssertEqual(content?[1]["type"]?.stringValue, "text")
+        XCTAssertEqual(content?[1]["text"]?.stringValue, "答")
+    }
+
+    /// T020：流被取消（end 无 committedSeq）→ provisional 行撤回；
+    /// 正常提交（committedSeq 同 seq）→ 行留着等提交事件覆盖。
+    func testStreamEndWithoutCommitRemovesProvisionalRow() async throws {
+        let gate = TickGate()
+        let pipeline = makePipeline { await gate.tick() }
+        let diffs = await pipeline.diffs()
+        var iterator = diffs.makeAsyncIterator()
+
+        await pipeline.apply(stream: .start(attemptId: "a1", revision: 1, turn: 1, step: 1, startedAfterSeq: 20))
+        await pipeline.apply(stream: .chunk(attemptId: "a1", revision: 1, index: 0, time: nil, chunk: .textDelta("hi")))
+        await gate.release()
+        _ = await iterator.next() // insert
+
+        // 取消：无 committedSeq → 撤回 provisional 行。
+        await pipeline.apply(stream: .end(attemptId: "a1", revision: 1, index: 1, committedSeq: nil))
+        let removed = await iterator.next()
+        XCTAssertEqual(removed?.removed, [21])
+        let snapshot = await pipeline.snapshot()
+        XCTAssertNil(snapshot.records.first(where: { $0.event.seq == 21 }))
+
+        // 正常提交：committedSeq 同 seq → 行保留，等提交事件覆盖。
+        await pipeline.apply(stream: .start(attemptId: "a2", revision: 1, turn: 1, step: 1, startedAfterSeq: 30))
+        await pipeline.apply(stream: .chunk(attemptId: "a2", revision: 1, index: 0, time: nil, chunk: .textDelta("ok")))
+        await gate.release()
+        _ = await iterator.next() // insert seq 31
+        await pipeline.apply(stream: .end(attemptId: "a2", revision: 1, index: 1, committedSeq: 31))
+        let stillThere = await pipeline.snapshot()
+        XCTAssertEqual(stillThere.records.first(where: { $0.event.seq == 31 })?
+            .event.data["stream"], .bool(true))
+
+        // 提交事件到达：同 seq 覆盖，stream 标记消失。
+        let committed = SessionEvent(
+            type: "assistant/message", seq: 31, time: nil,
+            data: .object(["message": .object(["content": .array([
+                .object(["type": .string("text"), "text": .string("ok!")]),
+            ])])]),
+            surfaceOp: nil)
+        await pipeline.apply(event: committed)
+        let committedDiff = await iterator.next()
+        XCTAssertEqual(committedDiff?.updated.count, 1)
+        XCTAssertNil(committedDiff?.updated.first?.event.data["stream"])
+        let final = await pipeline.snapshot()
+        XCTAssertEqual(final.records.first(where: { $0.event.seq == 31 })?
+            .event.data["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue, "ok!")
     }
 
     // MARK: - 失败语义

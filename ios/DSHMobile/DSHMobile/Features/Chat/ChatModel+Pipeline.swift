@@ -104,6 +104,11 @@ final class ChatPipelineBridge {
     private func apply(_ diff: MessagePipeline.SnapshotDiff) {
         var messagesChanged = false
         var gapsChanged = false
+        var hasRemove = false
+        /// T020 流式快进路候选：diff 里只有 provisional 行的 update 时，
+        /// 只改那一行的文本，不整树重折（每 token 一批 diff 时整树重折是主开销）。
+        var streamUpdates: [(seq: Int, text: String, reasoning: String)] = []
+        var onlyStreamingUpdates = true
         // 尾部到达计数（T018 未读数）：只数"比现有最大 seq 还新"的插入——
         // 向上翻页的 prepend 与首帧快照都不算（后者由 maxSeqBefore == nil 排除）。
         let maxSeqBefore = records.keys.max()
@@ -111,6 +116,8 @@ final class ChatPipelineBridge {
         for change in diff.changes {
             switch change {
             case .remove(let ids):
+                hasRemove = true
+                onlyStreamingUpdates = false
                 for id in ids {
                     if let seq = rowSeqs.removeValue(forKey: id) {
                         records.removeValue(forKey: seq)
@@ -121,6 +128,7 @@ final class ChatPipelineBridge {
                     }
                 }
             case .insert(let rows), .update(let rows):
+                if case .insert = change { onlyStreamingUpdates = false }
                 for row in rows {
                     switch row {
                     case .message(let message):
@@ -128,7 +136,12 @@ final class ChatPipelineBridge {
                         records[message.seq] = message.record
                         rowSeqs[message.id.uuidString] = message.seq
                         messagesChanged = true
+                        if onlyStreamingUpdates,
+                           let content = Self.streamingContent(of: message.record) {
+                            streamUpdates.append((message.seq, content.text, content.reasoning))
+                        }
                     case .gap(let gap):
+                        onlyStreamingUpdates = false
                         if let index = gaps.firstIndex(where: { $0.id == gap.id }) {
                             gaps[index] = gap
                         } else {
@@ -140,7 +153,32 @@ final class ChatPipelineBridge {
             }
         }
         if tailArrivals > 0 { model?.noteTailArrivals(tailArrivals) }
+        // 快进路：全部增量都是"流式行文本变长"且缺口/删除都没动 → 单行更新。
+        // 提交由 reconcile 走 008 统一锚一次修正（T021），不单独触发布局。
+        if onlyStreamingUpdates, !hasRemove, !gapsChanged, !streamUpdates.isEmpty,
+           let model, streamUpdates.allSatisfy({
+               model.applyStreamingRow(seq: $0.seq, text: $0.text, reasoning: $0.reasoning)
+           }) {
+            return
+        }
         refold(messagesChanged: messagesChanged, gapsChanged: gapsChanged)
+    }
+
+    /// provisional 记录的流式内容（text/reasoning）；非流式记录返回 nil。
+    /// 判定只看 `stream` 标记——管道在 SessionPipeline+Streaming 里打的。
+    private static func streamingContent(of record: SessionRecord) -> (text: String, reasoning: String)? {
+        guard case .assistantMessage(let message) = ChatEventDecoder.decode(record.event),
+              message.stream != nil else { return nil }
+        var text = ""
+        var reasoning = ""
+        for block in message.content {
+            switch block {
+            case .text(let value): text += value
+            case .reasoning(let value): reasoning += value
+            default: break
+            }
+        }
+        return (text, reasoning)
     }
 
     // MARK: - 折叠与落地
@@ -321,6 +359,14 @@ final class ChatPipelineBridge {
 
     func applyDownstream(event: SessionEvent) {
         applyDownstream(events: [event])
+    }
+
+    /// 流式帧进管道（T020）：经 SessionPipeline 的 frameTick 合并成 diff，
+    /// App 侧旧的 120ms 合流在管道模式下退役（非管道路径仍走 ChatModel 本地缓冲）。
+    func applyDownstream(stream frame: AssistantStreamFrame) {
+        Task { @MainActor [weak self] in
+            await self?.session?.apply(stream: frame)
+        }
     }
 
     private func applyDownstream(events: [SessionEvent]) {

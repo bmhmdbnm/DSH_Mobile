@@ -367,6 +367,11 @@ public actor SessionPipeline {
         guard !events.isEmpty else { return }
         var diff = Diff()
         var latestKey = 0
+        // 提交事件落地时作废旧流式缓冲：否则已排期的 flush 会用旧的
+        // provisional 文本把刚提交的正式内容盖回去（T020）。
+        discardStreamBuffers(committedAt: Set(events.compactMap {
+            $0.type == "assistant/message" ? $0.seq : nil
+        }))
         for event in events {
             let record = SessionRecord(event: event)
             if hotWindow[event.seq] == nil { diff.inserted.append(record) } else { diff.updated.append(record) }

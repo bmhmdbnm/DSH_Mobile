@@ -47,6 +47,9 @@ public struct TimelineItem: Identifiable, Sendable {
     public var kind: Kind
     /// The journal sequence that produced this row, used for ordering.
     public let seq: Int
+    /// 该行李自仍在流式的 provisional 记录（spec 009 tasks T020）：渲染降级为
+    /// 纯文本（代码块不高亮），消息结束后提交记录覆盖，标记消失并做一次完整解析。
+    public var isStreaming: Bool = false
 }
 
 /// One tool invocation and its outcome.
@@ -107,7 +110,8 @@ public struct ChatTimeline: Sendable {
         case reloaded
     }
 
-    public private(set) var items: [TimelineItem] = []
+    /// internal(set)：同模块扩展文件（Timeline+Streaming 的单行增量更新）要改行。
+    public internal(set) var items: [TimelineItem] = []
 
     /// In-flight assistant output, rendered as a trailing bubble.
     public private(set) var streaming: StreamingAttempt?
@@ -311,6 +315,9 @@ public struct ChatTimeline: Sendable {
         case .assistantMessage(let message):
             // The committed message supersedes any provisional streaming bubble.
             streaming = nil
+            // 009 T020：`stream` 非空 = 管道流式合并产出的 provisional 记录，
+            // 折出来的行标 isStreaming（渲染降级），提交记录覆盖时标记消失。
+            let provisional = message.stream != nil
             var change: Change = .none
             for (index, block) in message.content.enumerated() {
                 switch block {
@@ -319,14 +326,16 @@ public struct ChatTimeline: Sendable {
                     change = append(
                         kind: .assistantText(text: text),
                         seq: event.seq,
-                        identity: "assistant-\(event.seq)-\(index)"
+                        identity: "assistant-\(event.seq)-\(index)",
+                        streaming: provisional
                     )
                 case .reasoning(let text):
                     guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
                     change = append(
                         kind: .reasoning(text: text),
                         seq: event.seq,
-                        identity: "reasoning-\(event.seq)-\(index)"
+                        identity: "reasoning-\(event.seq)-\(index)",
+                        streaming: provisional
                     )
                 case .toolCall(let id, let name, let arguments):
                     let carried = carriedResult(for: id)
@@ -502,8 +511,10 @@ public struct ChatTimeline: Sendable {
         }
     }
 
-    private mutating func append(kind: TimelineItem.Kind, seq: Int, identity: String) -> Change {
-        let item = TimelineItem(id: identity, kind: kind, seq: seq)
+    private mutating func append(
+        kind: TimelineItem.Kind, seq: Int, identity: String, streaming: Bool = false
+    ) -> Change {
+        let item = TimelineItem(id: identity, kind: kind, seq: seq, isStreaming: streaming)
         // Ids are derived from the event identity so a re-delivered frame
         // updates the existing row instead of duplicating it.
         //

@@ -227,6 +227,46 @@ final class TimelineTests: XCTestCase {
         XCTAssertEqual(text, "正在处理", "the committed text must be the authoritative one")
     }
 
+    /// T020：带 stream 标记的 provisional 记录折出 isStreaming 行；
+    /// 单行增量更新只改写该行文本（不动其它行）；提交记录覆盖后标记消失。
+    func testProvisionalRecordFoldsAsStreamingAndUpdatesInPlace() throws {
+        let provisional = try event("""
+        {"type":"assistant/message","seq":41,"time":1789276359000,
+         "data":{"turn":1,"step":1,"stream":true,
+                 "message":{"role":"assistant","content":[
+                   {"type":"reasoning","text":"想"},
+                   {"type":"text","text":"答了一半"}]}}}
+        """)
+        var timeline = ChatTimeline()
+        _ = timeline.apply(try userMessage(seq: 40, text: "问"))
+        _ = timeline.apply(provisional)
+
+        XCTAssertEqual(timeline.items.count, 3)
+        XCTAssertFalse(timeline.items[0].isStreaming, "history rows stay non-streaming")
+        XCTAssertTrue(timeline.items[1].isStreaming)
+        XCTAssertTrue(timeline.items[2].isStreaming)
+
+        // 单行增量更新：只改写 seq 41 的两行，用户行不动。
+        XCTAssertTrue(timeline.applyStreamingUpdate(seq: 41, text: "答完了", reasoning: "想完了"))
+        guard case .reasoning(let reasoning) = timeline.items[1].kind,
+              case .assistantText(let text) = timeline.items[2].kind else {
+            return XCTFail("streaming rows must keep their kinds")
+        }
+        XCTAssertEqual(reasoning, "想完了")
+        XCTAssertEqual(text, "答完了")
+        XCTAssertEqual(timeline.items.count, 3, "in-place update must not add rows")
+
+        // 不在窗口的 seq → false（调用方回退整树重折）。
+        XCTAssertFalse(timeline.applyStreamingUpdate(seq: 99, text: "x", reasoning: ""))
+
+        // 提交记录（无 stream 标记）同 seq 同块形覆盖：身份一致、原地替换、标记消失。
+        _ = timeline.apply(try assistantMessage(seq: 41, turn: 1, step: 1,
+                                                blocks: #"{"type":"reasoning","text":"想完了"},{"type":"text","text":"答完了"}"#))
+        XCTAssertEqual(timeline.items.count, 3, "the committed record replaces the provisional rows in place")
+        XCTAssertFalse(timeline.items[1].isStreaming, "the committed record lifts the streaming mark")
+        XCTAssertFalse(timeline.items[2].isStreaming)
+    }
+
     func testResetMarksInterruptedToolsAsFinished() throws {
         var timeline = ChatTimeline()
         let records = [

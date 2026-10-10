@@ -982,11 +982,17 @@ final class ChatModel {
             reactToTurnLifecycle(event)
 
         case .assistantStream(let streamFrame):
-            // Coalesced rather than applied per token. A model emits many
-            // chunks a second, and each one otherwise re-renders the whole
-            // transcript; on a phone that is enough to make the UI stop
-            // responding while a session is streaming.
-            enqueueStreamFrame(streamFrame)
+            if let bridge = pipelineBridge {
+                // T020：管道模式下流式帧进 SessionPipeline 的 frameTick 合并
+                // （spec 剩余卡顿源①的口径在管道侧），App 侧 120ms 合流退役。
+                bridge.applyDownstream(stream: streamFrame)
+            } else {
+                // Coalesced rather than applied per token. A model emits many
+                // chunks a second, and each one otherwise re-renders the whole
+                // transcript; on a phone that is enough to make the UI stop
+                // responding while a session is streaming.
+                enqueueStreamFrame(streamFrame)
+            }
 
         case .unknown:
             break
@@ -1342,6 +1348,19 @@ final class ChatModel {
     func applyPipelineGaps(_ gaps: [TimelineItem]) {
         timeline.setGaps(gaps)
         scrollSignal += 1
+    }
+
+    /// T020 流式快进路落点：单行增量更新（只改写流式气泡行的文本，不整树
+    /// 重折）。返回 false = 该行还没折进时间线，调用方回退整树重折。
+    /// 提交走 `scrollSignal` → 宿主 reconcile（008 统一锚一次修正，T021），
+    /// 阅读中不冻结渲染也不推走视口。
+    @discardableResult
+    func applyStreamingRow(seq: Int, text: String, reasoning: String) -> Bool {
+        guard timeline.applyStreamingUpdate(seq: seq, text: text, reasoning: reasoning) else {
+            return false
+        }
+        scrollSignal += 1
+        return true
     }
 
     /// 管道模式下的「向上翻页」进行中（顶部缺口行 spinner 与旧版小字共用此位）。

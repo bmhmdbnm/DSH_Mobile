@@ -10,6 +10,9 @@ struct MarkdownText: View {
     let text: String
     /// Streaming text is rendered with a trailing caret and skips some work.
     var isStreaming: Bool = false
+    /// 所属消息的稳定身份（009 T020）：代码块高亮结果的 A 类缓存 key 前缀。
+    /// 流式期间代码块降级为纯文本，结束后的第一次完整渲染才算高亮并回填缓存。
+    var cacheKey: String = ""
 
     var body: some View {
         if isStreaming {
@@ -51,7 +54,7 @@ struct MarkdownText: View {
                         .padding(.top, level <= 2 ? DSHTheme.Spacing.hairline : 0)
 
                 case .code(let language, let code):
-                    CodeBlock(language: language, code: code)
+                    CodeBlock(language: language, code: code, cacheKey: "\(cacheKey)#\(block.id)")
 
                 case .listItem(let marker, let content):
                     HStack(alignment: .top, spacing: DSHTheme.Spacing.tight) {
@@ -128,6 +131,8 @@ private struct InlineMarkdown: View {
 private struct CodeBlock: View {
     let language: String?
     let code: String
+    /// 高亮结果的 A 类缓存 key（含块序号）；空串 = 不缓存（预览等一次性场景）。
+    var cacheKey: String = ""
     @State private var didCopy = false
 
     var body: some View {
@@ -158,7 +163,11 @@ private struct CodeBlock: View {
             Hairline()
 
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(code)
+                // 高亮只发生在完整渲染（流式期整块纯文本，根本走不到这里）；
+                // 结果进 A 类缓存，同一消息重渲染/回收回来都命中（T020）。
+                Text(cacheKey.isEmpty
+                     ? AttributedString(code)
+                     : ChatCodeHighlight.highlighted(code: code, language: language, cacheKey: cacheKey))
                     .font(DSHTheme.Typography.code)
                     .foregroundStyle(DSHTheme.labelPrimary)
                     .textSelection(.enabled)

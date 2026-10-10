@@ -52,7 +52,9 @@ struct TimelineRowView: View {
             )
 
         case .assistantText(let text):
-            MarkdownText(text: text)
+            // 流式行（isStreaming）整块按纯文本渲染，结束后一次完整解析
+            // （代码块补高亮并进 A 类缓存，key 带行身份，T020）。
+            MarkdownText(text: text, isStreaming: item.isStreaming, cacheKey: item.id)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
         case .reasoning(let text):
