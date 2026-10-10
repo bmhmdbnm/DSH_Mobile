@@ -78,6 +78,10 @@ final class ChatPipelineBridge {
     private var subscription: Task<Void, Never>?
     /// 折叠代数：慢折叠回来时若已过期就丢弃（新快照优先）。
     private var foldGeneration = 0
+    /// T023 跳转等待（事件驱动）：等「某 seq 折进时间线」的 waiter 与其超时任务。
+    /// 落地在 `refold` 的整树重建分支之后由 `resolveRebaseWaiters()` 唤醒。
+    private var rebaseWaiters: [UUID: (seq: Int, continuation: CheckedContinuation<String?, Never>)] = [:]
+    private var rebaseTimeouts: [UUID: Task<Void, Never>] = [:]
     /// 「向上翻页」进行中（顶部缺口行 spinner 由它驱动，镜像进 model.isLoadingOlder）。
     private var isLoadingOlder = false
     /// 最近一次取页失败原因（顶部缺口行据此转「点击重试」）。
@@ -98,6 +102,12 @@ final class ChatPipelineBridge {
     func stop() {
         subscription?.cancel()
         subscription = nil
+        // 关会话时唤醒还挂着的跳转 waiter，不让 continuation 泄漏。
+        let waiters = rebaseWaiters
+        rebaseWaiters.removeAll()
+        for task in rebaseTimeouts.values { task.cancel() }
+        rebaseTimeouts.removeAll()
+        for waiter in waiters.values { waiter.continuation.resume(returning: nil) }
     }
 
     // MARK: - 订阅
@@ -237,6 +247,8 @@ final class ChatPipelineBridge {
             model.applyPipelineRebuild(
                 folded, gaps: gapItems,
                 topExhausted: exhausted, oldestSeq: self.records.keys.min())
+            // T023：命中行已随这次折叠落进时间线，唤醒等待跳转的 waiter。
+            self.resolveRebaseWaiters()
         }
     }
 
@@ -313,20 +325,51 @@ final class ChatPipelineBridge {
     }
 
     /// 跳转（.jump）：抢占在途低优预取，只拉目标附近一段；返回命中行的 id。
+    ///
+    /// 等待是**事件驱动**而非轮询（T023 收口）：本地命中直接返回行 id；否则先
+    /// 登记「等 seq 落地」的 waiter，再向管道要页——快照 diff → 整树折叠落进
+    /// 时间线的那一刻（`refold` 落地分支调 `resolveRebaseWaiters()`）解析出
+    /// 命中行并唤醒 waiter。3 秒超时兜底（水合失败 / 目标已被裁剪等），
+    /// 超时返回 nil，视图侧的滚动梯子照旧兜底。
     func rebase(around seq: Int, leading: Int, limit: Int) async -> String? {
         guard let model, let session else { return nil }
+        // 本地命中（行已在时间线里）直接渲染，不等水合（spec「搜索策略」2）。
+        if let row = TranscriptHitLocator.row(forSeq: seq, in: model.timeline.items) {
+            return row.id
+        }
         let upper = seq + leading
         let lower = max(1, upper - limit + 1)
+        async let landed = waitForRebaseRow(seq: seq)
         _ = try? await session.records(in: lower...upper, priority: .jump)
-        // diff → 折叠是异步的：命中行落地的判定交给短轮询（视图侧另有滚动梯子兜底）。
-        for _ in 0..<20 {
-            try? await Task.sleep(for: .milliseconds(100))
-            if Task.isCancelled { return nil }
-            if let row = TranscriptHitLocator.row(forSeq: seq, in: model.timeline.items) {
-                return row.id
+        return await landed
+    }
+
+    /// 等一次整树折叠把 `seq` 折进时间线；落地返回行 id，超时（3s）返回 nil。
+    private func waitForRebaseRow(seq: Int) async -> String? {
+        let id = UUID()
+        return await withCheckedContinuation { continuation in
+            rebaseWaiters[id] = (seq: seq, continuation: continuation)
+            // 超时兜底：管道水合失败或快照里没有这条 seq 时，不能挂住跳转。
+            rebaseTimeouts[id] = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(3))
+                guard let self, let waiter = self.rebaseWaiters.removeValue(forKey: id)
+                else { return }
+                self.rebaseTimeouts.removeValue(forKey: id)
+                waiter.continuation.resume(returning: nil)
             }
         }
-        return nil
+    }
+
+    /// 整树折叠落地后调用：时间线里已出现 waiter 等的 seq 就解析行 id 并唤醒。
+    private func resolveRebaseWaiters() {
+        guard !rebaseWaiters.isEmpty, let model else { return }
+        for (id, waiter) in rebaseWaiters {
+            guard let row = TranscriptHitLocator.row(forSeq: waiter.seq, in: model.timeline.items)
+            else { continue }
+            rebaseWaiters.removeValue(forKey: id)
+            rebaseTimeouts.removeValue(forKey: id)?.cancel()
+            waiter.continuation.resume(returning: row.id)
+        }
     }
 
     /// 缺口行「点击重试」（T016）：清掉失败计数再拉；顶部行等价于重试向上翻页。

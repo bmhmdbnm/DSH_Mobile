@@ -978,6 +978,9 @@ struct ChatView: View {
         guard ownsTranscript else { return }
         isFollowing = false
         userScrolled = true
+        // 命中在窗口内时不走 rebaseWindow，模型侧也要强制「阅读中」（spec 场景 9：
+        // 否则跳转后到下一条几何上报之间来的增量会按 atBottom 计、还可能拽回底部）。
+        model.noteJumpToReading()
         // 命中可能在窗口**之外**（搜索是全会话的，时间线只装一窗）：先换窗口再滚，
         // 否则"按 seq 解析行"只会解析到窗口的第一行，怎么滚都落不到目标上（T068）。
         let windowOldest = model.timeline.firstSeq ?? Int.max
@@ -1027,6 +1030,7 @@ struct ChatView: View {
         guard ownsTranscript else { return }
         isFollowing = false
         userScrolled = true
+        model.noteJumpToReading() // 同 jumpToHit：跳转强制「阅读中」（spec 场景 9）。
         // 选中的那条可能还在"搜索缓冲"里（面板往前翻过历史、但没动时间线）：
         // 先把它并进时间线，下面的重试才找得到这一行。并入会往视口上方插内容，
         // 所以紧接着的跳转本身也是"把视口带到那一条"。
