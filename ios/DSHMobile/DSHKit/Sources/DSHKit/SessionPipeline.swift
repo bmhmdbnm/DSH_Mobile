@@ -1,0 +1,507 @@
+import Foundation
+
+/// 单会话内存流水线（spec 009 架构决定 §2/§6/§7 / tasks T008）。
+///
+/// 一个会话的全部运行时状态都串行在这个 actor 里：有效连续区间集（RangeIndex）、
+/// 热窗口（最近 500 条，超出淘汰最老）、in-flight 页表（同页合并/取消/抢占）、
+/// 落库队列（按消息去重）、流式按帧合并的缓冲。
+///
+/// 对外只有三件事：
+/// 1. `records(in:)` ——「取不到就拉」水合：区间集二分，命中走热窗口/磁盘，
+///    缺口按对齐页（50 条）经注入的 fetch 拉网络，回包合并进三处
+///    （热窗口 + 区间集 + 落库队列）并产出 `Diff`。
+/// 2. `apply(event:)` / `apply(stream:)` —— 下行合并。流式增量先进缓冲，
+///    经 `frameTick` 节拍（测试注入立即返回，产品接 CADisplayLink）合并成
+///    一次状态变更，一个 tick 内多次增量只出一个 diff（spec 剩余卡顿源①）。
+/// 3. `diffs()` —— 每次状态变化产出 `Diff`（insert/update 的记录、remove 的
+///    seq、由区间集派生的 gap 行列表），供 MessagePipeline 组装快照。
+///
+/// 失败语义（spec 可见性兜底）：拉取失败重试上限 3 次，超限的缺口标
+/// `failed(retryable: true)`；只有 `hasMore=false` 或 `clamped` 才允许「到头」，
+/// 网络失败永远不得静默当作到底。
+public actor SessionPipeline {
+
+    // MARK: - 对外类型
+
+    /// 网络取页的注入面（测试用内存脚本化假回包；产品侧适配 TranscriptPageFetcher）。
+    public struct FetchPage: Sendable {
+        public let records: [SessionRecord]
+        public let hasMore: Bool
+        /// 服务端日志被裁剪：允许「到头」（spec 场景 6 与 FR-038 语义沿用）。
+        public let clamped: Bool
+
+        public init(records: [SessionRecord], hasMore: Bool, clamped: Bool = false) {
+            self.records = records
+            self.hasMore = hasMore
+            self.clamped = clamped
+        }
+    }
+
+    public typealias PageFetch = @Sendable (ClosedRange<Int>) async throws -> FetchPage
+
+    /// 拉取优先级（沿用 InFlightPageTable：prefetch < userVisible < jump）。
+    public typealias FetchPriority = InFlightPageTable<Int>.Priority
+
+    /// 缺口行（spec「缺口行的生命周期」）：身份 `gap:<start>-<end>` 由区间集派生。
+    public struct GapRow: Sendable, Equatable, Identifiable {
+        public enum Status: Sendable, Equatable {
+            case loading
+            case failed(retryable: Bool)
+            /// 已到顶（hasMore=false / clamped），渲染「没有更多」。
+            case exhausted
+        }
+
+        public let start: Int
+        public let end: Int
+        public let status: Status
+
+        public var id: String { "gap:\(start)-\(end)" }
+
+        public init(start: Int, end: Int, status: Status) {
+            self.start = start
+            self.end = end
+            self.status = status
+        }
+    }
+
+    /// 一次状态变化给上层的增量（MessagePipeline 据此组装 SnapshotDiff）。
+    public struct Diff: Sendable {
+        public var inserted: [SessionRecord] = []
+        public var updated: [SessionRecord] = []
+        public var removed: [Int] = []
+        /// 当前窗口内全部 gap 行（派生量，每次整体给出，生灭交给 diff 消费方比对）。
+        public var gaps: [GapRow] = []
+
+        public var isEmpty: Bool { inserted.isEmpty && updated.isEmpty && removed.isEmpty }
+    }
+
+    public enum FetchError: Error, Equatable {
+        /// 该缺口已连续失败 3 次，转 retryable，不再自动拉（等用户点击重试）。
+        case gapFailed
+    }
+
+    // MARK: - 状态
+
+    public let scope: String
+    public let sessionId: String
+    private let pageSize: Int
+    private let hotLimit: Int
+    private let store: MessageStore?
+    private let fetch: PageFetch
+    private let frameTick: @Sendable () async -> Void
+    private let now: @Sendable () -> TimeInterval
+
+    /// 有效连续区间集：本地（热窗口 + 磁盘）确定完整的范围。
+    public private(set) var ranges = RangeIndex()
+
+    /// 热窗口：[seq: 记录] + 有序索引，超出 hotLimit 淘汰最老（只影响内存）。
+    private var hotWindow: [Int: SessionRecord] = [:]
+    private var hotOrder: [Int] = []
+
+    private var inFlight = InFlightPageTable<Int>()
+    /// 在途任务本体（页表只存代数；搭车者 await 同一个 Task，任务覆盖到合并完成）。
+    private var inFlightTasks: [Int: Task<Void, Error>] = [:]
+    private var writes = PendingWriteQueue<Int, MessageStore.RecordChange>()
+
+    /// 每页连续失败次数；≥ maxRetries 的缺口转 retryable。
+    private var failureCounts: [Int: Int] = [:]
+    /// 拉空（服务端尚无新数据）的页：避免预取瀑布反复打同一页。
+    private var knownEmptyPages: Set<Int> = []
+    /// 已到顶：只有 hasMore=false 或 clamped 才置位（spec 可见性兜底）。
+    public private(set) var topExhausted = false
+
+    /// 落库回调：队列 drain 的批次交给 MessageStore（盘写由上层异步消费）。
+    private let flushWrites: @Sendable ([MessageStore.RecordChange]) -> Void
+
+    // 流式合并缓冲（attemptId → 累计文本）。
+    private struct StreamBuffer {
+        var seq: Int
+        var text: String
+        var dirty: Bool
+    }
+    private var streamBuffers: [String: StreamBuffer] = [:]
+    private var streamFlushScheduled = false
+
+    // diff 广播（多订阅者：MessagePipeline 的泵 + 测试各拿一条流）。
+    private var diffContinuations: [UUID: AsyncStream<Diff>.Continuation] = [:]
+
+    private static let maxRetries = 3
+
+    public init(
+        scope: String,
+        sessionId: String,
+        store: MessageStore?,
+        fetch: @escaping PageFetch,
+        frameTick: @escaping @Sendable () async -> Void = {},
+        now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 },
+        pageSize: Int = 50,
+        hotLimit: Int = 500,
+        initialRanges: RangeIndex = RangeIndex(),
+        flushWrites: @escaping @Sendable ([MessageStore.RecordChange]) -> Void = { _ in }
+    ) {
+        self.scope = scope
+        self.sessionId = sessionId
+        self.store = store
+        self.fetch = fetch
+        self.frameTick = frameTick
+        self.now = now
+        self.pageSize = pageSize
+        self.hotLimit = hotLimit
+        self.ranges = initialRanges
+        self.flushWrites = flushWrites
+    }
+
+    // MARK: - diff 订阅
+
+    /// 每次状态变化的增量流（多订阅者各自独立）。
+    public func diffs() -> AsyncStream<Diff> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            diffContinuations[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeDiffContinuation(id) }
+            }
+        }
+    }
+
+    private func removeDiffContinuation(_ id: UUID) {
+        diffContinuations.removeValue(forKey: id)
+    }
+
+    private func emit(_ diff: Diff) {
+        guard !diff.isEmpty || !diff.gaps.isEmpty else { return }
+        for continuation in diffContinuations.values {
+            continuation.yield(diff)
+        }
+    }
+
+    // MARK: - 读（热窗口快照）
+
+    /// 当前热窗口内某 seq 的记录（MessagePipeline 组装索引用）。
+    public func record(at seq: Int) -> SessionRecord? { hotWindow[seq] }
+
+    /// 当前快照：热窗口全部记录（升序）+ 派生 gap 行。新订阅者的首帧数据源。
+    public func snapshot() -> (records: [SessionRecord], gaps: [GapRow]) {
+        (hotOrder.sorted().compactMap { hotWindow[$0] }, currentGaps())
+    }
+
+    // MARK: - 水合（取不到就拉，spec §6 三分支）
+
+    /// 取一个闭区间：命中部分本地直给，缺口按对齐页磁盘→网络补齐。
+    /// 磁盘是纯缓存：区间声称覆盖但磁盘读不出（被淘汰/未落盘）同样转网络。
+    public func records(
+        in range: ClosedRange<Int>,
+        priority: FetchPriority = .userVisible
+    ) async throws -> [SessionRecord] {
+        // 跳转抢占：取消低优先级预取，用户动作插队（spec 支撑机制 1）。
+        if priority == .jump { _ = inFlight.cancelAll(below: .jump) }
+
+        // ① 区间判定三分支：算出缺口。
+        var missing: [RangeIndex.Span]
+        switch ranges.coverage(of: range) {
+        case .full: missing = []
+        case .partial(_, let spans): missing = spans
+        case .none: missing = [RangeIndex.Span(range.lowerBound, range.upperBound)]
+        }
+
+        // ② 命中部分：热窗口优先，缺的读盘；盘也读不出的并入缺口转网络。
+        if let store, !ranges.isEmpty {
+            let coveredSpans = ranges.spans.filter { $0.end >= range.lowerBound && $0.start <= range.upperBound }
+            for span in coveredSpans {
+                let from = max(span.start, range.lowerBound)
+                let to = min(span.end, range.upperBound)
+                let absent = (from...to).filter { hotWindow[$0] == nil }.sorted()
+                guard !absent.isEmpty else { continue }
+                let diskRecords = (try? await store.records(
+                    scope: scope, sessionId: sessionId, in: from...to)) ?? []
+                var found = Set<Int>()
+                for record in diskRecords where record.event.seq >= from && record.event.seq <= to {
+                    mergeIntoHotWindow(record)
+                    found.insert(record.event.seq)
+                }
+                // 磁盘短收：把连续的空洞段并入 missing，走同一条网络补齐路径。
+                var runStart: Int?
+                var previous = Int.min
+                for seq in absent where !found.contains(seq) {
+                    if runStart == nil { runStart = seq }
+                    if seq != previous + 1, let start = runStart, start < seq {
+                        missing.append(RangeIndex.Span(start, previous))
+                        runStart = seq
+                    }
+                    previous = seq
+                }
+                if let start = runStart {
+                    missing.append(RangeIndex.Span(start, previous))
+                }
+            }
+        }
+
+        // ③ 缺口按对齐页拉网络（含整段缺失/跳转型完全不命中）。
+        if !missing.isEmpty {
+            try await fetchMissing(missing, priority: priority)
+        }
+
+        // ④ 组装结果 + 预取瀑布（spec §7：距边界约 1 页提前水合下一页）。
+        let result = range.compactMap { hotWindow[$0] }
+        triggerPrefetch(around: range)
+        return result
+    }
+
+    /// 缺口 → 对齐页集合，逐页拉取并合并。某页失败不阻塞其它页。
+    private func fetchMissing(_ missing: [RangeIndex.Span], priority: FetchPriority) async throws {
+        var firstError: Error?
+        for span in missing {
+            for page in alignedPages(covering: span) {
+                do {
+                    try await fetchPage(page, priority: priority)
+                } catch {
+                    if firstError == nil { firstError = error }
+                }
+            }
+        }
+        if let firstError { throw firstError }
+    }
+
+    /// 单页拉取：in-flight 页表同页合并/可抢占，回包按代数核销。
+    private func fetchPage(_ page: ClosedRange<Int>, priority: FetchPriority) async throws {
+        let key = page.lowerBound
+        if failureCounts[key, default: 0] >= Self.maxRetries {
+            emit(Diff(gaps: currentGaps()))
+            throw FetchError.gapFailed
+        }
+        // 已知为空的页：预取不重复打网络；用户主动读取不受此限（点回来了就要真拉）。
+        if priority == .prefetch, knownEmptyPages.contains(key) { return }
+
+        switch inFlight.begin(key, priority: priority) {
+        case .joined:
+            // 同页在途：搭车等待同一个任务（任务覆盖到合并完成，见下）。
+            if let task = inFlightTasks[key] { try await task.value }
+            return
+        case .start(let generation):
+            let fetch = self.fetch
+            // 任务本体包含回包合并：搭车者 await 到的一定是「合并后」。
+            let task = Task<Void, Error> {
+                do {
+                    let result = try await fetch(page)
+                    self.completeFetch(result, key: key, generation: generation, requested: page)
+                } catch {
+                    self.failFetch(error, key: key, generation: generation)
+                    throw error
+                }
+            }
+            inFlightTasks[key] = task
+            try await task.value
+        }
+    }
+
+    /// 回包核销 + 合并（代数不符 = 已被取消，丢弃）。
+    private func completeFetch(
+        _ result: FetchPage, key: Int, generation: Int, requested: ClosedRange<Int>
+    ) {
+        inFlightTasks.removeValue(forKey: key)
+        guard inFlight.finish(key, generation: generation) else { return }
+        failureCounts.removeValue(forKey: key)
+        mergeFetchedPage(result, pageKey: key, requested: requested)
+    }
+
+    /// 失败核销：计数 + 重发 gap 状态；3 次上限由 fetchPage 入口挡。
+    private func failFetch(_ error: Error, key: Int, generation: Int) {
+        inFlightTasks.removeValue(forKey: key)
+        _ = inFlight.finish(key, generation: generation)
+        failureCounts[key] = failureCounts[key, default: 0] + 1
+        emit(Diff(gaps: currentGaps())) // 失败次数变化可能改写 gap 状态
+    }
+
+    /// 回包合并：热窗口 + 区间集 + 落库队列三路，一次 diff 产出（spec §2 下行）。
+    private func mergeFetchedPage(_ page: FetchPage, pageKey: Int, requested: ClosedRange<Int>) {
+        var diff = Diff()
+        let pageRecords = page.records.sorted { $0.event.seq < $1.event.seq }
+        // 「到头」只在拉最底页（对齐起点 1）且服务端说 hasMore=false 或被裁剪时成立
+        // （spec 可见性兜底：网络失败永远不得当作到底）。
+        let isBottomPage = requested.lowerBound == 1
+        if pageRecords.isEmpty {
+            knownEmptyPages.insert(pageKey)
+            if isBottomPage, page.hasMore == false || page.clamped { topExhausted = true }
+        } else {
+            for record in pageRecords {
+                if hotWindow[record.event.seq] == nil { diff.inserted.append(record) } else { diff.updated.append(record) }
+                mergeIntoHotWindow(record)
+            }
+            ranges.insert(pageRecords.first!.event.seq...pageRecords.last!.event.seq)
+            enqueueWrite(.upsertRecords(scope: scope, sessionId: sessionId, records: pageRecords),
+                         key: pageRecords.last!.event.seq)
+            knownEmptyPages.removeAll()
+            if isBottomPage, page.hasMore == false || page.clamped { topExhausted = true }
+            diff.removed = evictIfNeeded()
+        }
+        diff.gaps = currentGaps()
+        emit(diff)
+    }
+
+    // MARK: - 下行合并（WSS 推送 / 流式）
+
+    /// 服务端提交的日志事件：直接合并（流式帧走 apply(stream:)）。
+    public func apply(event: SessionEvent) {
+        let record = SessionRecord(event: event)
+        var diff = Diff()
+        if hotWindow[event.seq] == nil { diff.inserted.append(record) } else { diff.updated.append(record) }
+        mergeIntoHotWindow(record)
+        ranges.insert(event.seq)
+        enqueueWrite(.upsertRecords(scope: scope, sessionId: sessionId, records: [record]), key: event.seq)
+        knownEmptyPages.removeAll()
+        diff.removed = evictIfNeeded()
+        diff.gaps = currentGaps()
+        emit(diff)
+    }
+
+    /// 流式增量：先进缓冲，按帧节拍合并（tick 内多次只出一次 diff）。
+    public func apply(stream frame: AssistantStreamFrame) {
+        switch frame {
+        case .start(let attemptId, _, _, _, let startedAfterSeq):
+            streamBuffers[attemptId] = StreamBuffer(seq: startedAfterSeq + 1, text: "", dirty: false)
+        case .chunk(let attemptId, _, _, _, let chunk):
+            guard var buffer = streamBuffers[attemptId], let text = chunk.text else { return }
+            buffer.text += text
+            buffer.dirty = true
+            streamBuffers[attemptId] = buffer
+            scheduleStreamFlush()
+        case .end(let attemptId, _, _, _):
+            // 提交的 assistant/message 事件会随后到达并覆盖；缓冲直接丢。
+            streamBuffers.removeValue(forKey: attemptId)
+        case .unknown:
+            break
+        }
+    }
+
+    private func scheduleStreamFlush() {
+        guard !streamFlushScheduled else { return }
+        streamFlushScheduled = true
+        Task { [frameTick] in
+            await frameTick()
+            self.flushStreams()
+        }
+    }
+
+    /// 一帧一次：把 tick 内累计的所有流式文本合并成一次状态变更。
+    private func flushStreams() {
+        streamFlushScheduled = false
+        var diff = Diff()
+        for (attemptId, var buffer) in streamBuffers where buffer.dirty {
+            buffer.dirty = false
+            streamBuffers[attemptId] = buffer
+            let record = SessionRecord(event: SessionEvent(
+                type: "assistant/message", seq: buffer.seq, time: nil,
+                data: .object(["text": .string(buffer.text)]), surfaceOp: nil))
+            if hotWindow[buffer.seq] == nil { diff.inserted.append(record) } else { diff.updated.append(record) }
+            mergeIntoHotWindow(record)
+            enqueueWrite(.upsertRecords(scope: scope, sessionId: sessionId, records: [record]),
+                         key: buffer.seq)
+        }
+        guard !diff.isEmpty else { return }
+        diff.removed = evictIfNeeded()
+        diff.gaps = currentGaps()
+        emit(diff)
+    }
+
+    // MARK: - 上行（MessagePipeline 的 send 走这里落库排队）
+
+    /// 乐观记录入队（pending）/ 确认替换（confirm）：不进热窗口——上行行
+    /// 的身份与排序由 MessagePipeline 持有，这里只管落库队列。
+    public func enqueueWrite(_ change: MessageStore.RecordChange, key: Int) {
+        writes.enqueue(key, change, now: now())
+        if writes.shouldFlush(now: now()) {
+            flushWrites(writes.drain(now: now()).map(\.value))
+        }
+    }
+
+    /// 强制落盘（测试与退后台路径用）。
+    public func flushPendingWrites() {
+        guard !writes.isEmpty else { return }
+        flushWrites(writes.drain(now: now()).map(\.value))
+    }
+
+    // MARK: - 预取瀑布（spec §7）
+
+    /// 窗口滑动带提前量：距热窗口/本地区间边缘约 1 页时，以 .prefetch 触发
+    /// 向下一页的水合（与用户主动请求同一路径、可被 .jump 抢占）。
+    private func triggerPrefetch(around range: ClosedRange<Int>) {
+        guard let oldest = ranges.oldest, let newest = ranges.newest else { return }
+        if !topExhausted, oldest > 1, range.lowerBound - oldest < pageSize {
+            prefetch(alignedPage(containing: oldest - 1))
+        }
+        if newest - range.upperBound < pageSize {
+            prefetch(alignedPage(containing: newest + 1))
+        }
+    }
+
+    private func prefetch(_ page: ClosedRange<Int>) {
+        let key = page.lowerBound
+        guard !inFlight.isInFlight(key),
+              inFlightTasks[key] == nil,
+              failureCounts[key, default: 0] < Self.maxRetries,
+              !knownEmptyPages.contains(key)
+        else { return }
+        switch ranges.coverage(of: page) {
+        case .none, .partial:
+            Task { try? await self.fetchPage(page, priority: .prefetch) }
+        case .full:
+            return
+        }
+    }
+
+    // MARK: - 内部工具
+
+    private func mergeIntoHotWindow(_ record: SessionRecord) {
+        let seq = record.event.seq
+        if hotWindow[seq] == nil { hotOrder.append(seq) }
+        hotWindow[seq] = record
+    }
+
+    /// 热窗口超上限淘汰最老（只影响内存，磁盘由落库队列负责）。
+    /// 返回被淘汰的 seq（diff 的 removed）。
+    private func evictIfNeeded() -> [Int] {
+        guard hotOrder.count > hotLimit else { return [] }
+        hotOrder.sort()
+        let evicted = Array(hotOrder.prefix(hotOrder.count - hotLimit))
+        hotOrder.removeFirst(evicted.count)
+        for seq in evicted { hotWindow.removeValue(forKey: seq) }
+        return evicted
+    }
+
+    /// 缺口行由区间集派生（spec「缺口行的生命周期」）：窗口 = 最老…最新。
+    private func currentGaps() -> [GapRow] {
+        guard let oldest = ranges.oldest, let newest = ranges.newest, oldest <= newest else { return [] }
+        return ranges.gaps(within: oldest...newest).map { span in
+            GapRow(start: span.start, end: span.end, status: gapStatus(for: span))
+        }
+    }
+
+    private func gapStatus(for span: RangeIndex.Span) -> GapRow.Status {
+        // 该缺口覆盖的对齐页里有到 3 次失败的 → retryable。
+        let firstPage = alignedPages(covering: span).first
+        if let key = firstPage?.lowerBound, failureCounts[key, default: 0] >= Self.maxRetries {
+            return .failed(retryable: true)
+        }
+        return .loading
+    }
+
+    /// 覆盖某缺口的对齐页集合（页大小对齐，spec §6 页边界）。
+    private func alignedPages(covering span: RangeIndex.Span) -> [ClosedRange<Int>] {
+        var pages: [ClosedRange<Int>] = []
+        var start = alignedStart(for: span.start)
+        while start <= span.end {
+            pages.append(start...(start + pageSize - 1))
+            start += pageSize
+        }
+        return pages
+    }
+
+    private func alignedPage(containing seq: Int) -> ClosedRange<Int> {
+        let start = alignedStart(for: seq)
+        return start...(start + pageSize - 1)
+    }
+
+    private func alignedStart(for seq: Int) -> Int {
+        max(1, ((max(1, seq) - 1) / pageSize) * pageSize + 1)
+    }
+}
