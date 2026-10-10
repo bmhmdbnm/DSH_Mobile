@@ -1616,6 +1616,13 @@ final class ChatModel {
         let owner = session.sessionId
 
         let mode: SessionPromptRequest.Mode = (steerNext && isRunning) ? .steer : .queue
+        // T022：管道模式下纯文本走 MessagePipeline（乐观插入贴底 → 落库 pending →
+        // 网络 → 下行 rpcId 确认原地替换）。带附件仍走旧路径——附件的压缩/上传与
+        // echo 耦合在现有 send 里，管道化留给后续任务（本任务不接管）。
+        if images.isEmpty, pipelineBridge != nil {
+            await sendViaPipeline(text: text, mode: mode, owner: owner)
+            return
+        }
         // Which conversation this text belongs to, fixed here: the user may
         // switch away while the send is in flight, and neither the clear nor a
         // failure's restore may land on whatever happens to be on screen then.
@@ -1670,6 +1677,35 @@ final class ChatModel {
                 if draft.isEmpty { draft = text }
                 if draftImages.isEmpty { draftImages = images }
             }
+            lastError = ConnectionStore.describe(error)
+        }
+    }
+
+    /// T022 管道发送（纯文本、渲染数据源已切 009 时）：乐观插入由管道快照流
+    /// 进入时间线（贴底），requestId 就是管道 clientId，确认走下行 rpcId 回流
+    /// 原地替换——不经过旧的 `echoUserPrompt` 回声（身份只有一套）。
+    /// 发送失败行留在时间线上可点重发，所以草稿不回填（文字没丢，行还在）。
+    private func sendViaPipeline(text: String, mode: SessionPromptRequest.Mode, owner: String) async {
+        guard let pipeline = messageLayer?.pipeline, let scope = sessionScope else { return }
+        draft = ""
+        drafts.removeValue(forKey: owner)
+        scrollSignal += 1
+        sendSignal += 1
+        // 发送自己的消息一律贴底（spec 009「跟底两态」钦定例外，tasks T017）。
+        noteWantsBottom()
+        isAwaitingTurnStart = true
+        awaitingTimeout?.cancel()
+        awaitingTimeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(20))
+            guard !Task.isCancelled else { return }
+            self?.isAwaitingTurnStart = false
+        }
+        let ref = MessagePipeline.SessionRef(scope: scope, sessionId: owner)
+        do {
+            _ = try await pipeline.send(text: text, to: ref, steer: mode == .steer)
+        } catch {
+            // 行已由管道标 failed（可点重发）；错误同时上错误条。
+            isAwaitingTurnStart = false
             lastError = ConnectionStore.describe(error)
         }
     }

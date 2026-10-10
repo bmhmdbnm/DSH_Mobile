@@ -92,31 +92,40 @@ public actor MessagePipeline {
         }
     }
 
-    /// 上行发送的网络面（测试注入假回包）：返回服务端确认的正式记录。
-    public typealias Sender = @Sendable (SessionRef, String, UUID) async throws -> SessionRecord
+    /// 上行发送的网络面（测试注入假回包）。参数：会话、文本、clientId（同时是
+    /// 发给服务端的 requestId——身份只有这一套，spec 场景 11）、是否 steer。
+    /// 返回服务端确认的正式记录；返回 nil 表示"已受理，确认走下行回流"——
+    /// 下行记录里的 `source.rpcId == clientId` 时由管道原地替换（T022）。
+    public typealias Sender = @Sendable (SessionRef, String, UUID, Bool) async throws -> SessionRecord?
+    /// 重发前的查重面（T022 重启恢复）：按 clientId 对服务端最新页查一次，
+    /// 命中说明崩溃前其实已确认（没落库），只替换不重发。返回 nil = 没查到。
+    public typealias ConfirmationLookup = @Sendable (SessionRef, UUID) async -> SessionRecord?
     /// 每会话的取页器工厂（产品适配 TranscriptPageFetcher，测试给假 fetcher）。
     public typealias PageFetchFactory = @Sendable (SessionRef) -> SessionPipeline.PageFetch
 
     // MARK: - 状态
 
-    private let store: MessageStore?
+    let store: MessageStore?  // internal：上行扩展（+Send）要用
     private let fetchFactory: PageFetchFactory
-    private let sender: Sender
+    let sender: Sender // internal：+Send
+    let confirmationLookup: ConfirmationLookup? // internal：+Send
     private let frameTick: @Sendable () async -> Void
-    private let now: @Sendable () -> TimeInterval
+    let now: @Sendable () -> TimeInterval // internal：+Send
     private let pageSize: Int
     private let hotLimit: Int
 
     private var pipelines: [SessionRef: SessionPipeline] = [:]
-    private var states: [SessionRef: SessionState] = [:]
+    var states: [SessionRef: SessionState] = [:] // internal：+Send
 
     /// 每会话的聚合状态：行表 + 订阅者 + 泵任务。
-    private struct SessionState {
+    struct SessionState { // internal：+Send
         /// 行表：排序键 → 渲染消息（pending 用 Int.max 起递减的合成键）。
         var rows: [Int: RenderedMessage] = [:]
         /// 下行数据行的身份映射：seq → UUID（身份稳定，重复水合不换 id）。
         var identities: [Int: UUID] = [:]
-        /// clientId → 合成 seq（确认时找到要原地替换的行）。
+        /// clientId → 行键（确认时找到要原地替换的行）。pending 与 failed 都留着
+        /// ——只有确认（下行 rpcId 命中或 sender 回包）才摘除，这样"标了失败但服务端
+        /// 其实已收到"的消息能被下行确认救回来。
         var pendingSeqs: [UUID: Int] = [:]
         var nextSyntheticSeq = Int.max
         var gaps: [GapRow] = []
@@ -128,6 +137,7 @@ public actor MessagePipeline {
         store: MessageStore?,
         fetchFactory: @escaping PageFetchFactory,
         sender: @escaping Sender,
+        confirmationLookup: ConfirmationLookup? = nil,
         frameTick: @escaping @Sendable () async -> Void = {},
         now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 },
         pageSize: Int = 50,
@@ -136,6 +146,7 @@ public actor MessagePipeline {
         self.store = store
         self.fetchFactory = fetchFactory
         self.sender = sender
+        self.confirmationLookup = confirmationLookup
         self.frameTick = frameTick
         self.now = now
         self.pageSize = pageSize
@@ -184,7 +195,7 @@ public actor MessagePipeline {
     /// 懒建聚合状态：用 SessionPipeline 现有快照 prime（订阅前已水合的数据
     /// 不能丢），再启动泵（把 SessionPipeline 的 Diff 翻译成 SnapshotDiff 广播）。
     /// 返回该订阅的首帧（当前全量）。
-    private func ensurePrimedState(for session: SessionRef) async -> SnapshotDiff {
+    func ensurePrimedState(for session: SessionRef) async -> SnapshotDiff {
         if let state = states[session] {
             return snapshotDiff(state)
         }
@@ -230,22 +241,26 @@ public actor MessagePipeline {
 
     // MARK: - 下行：SessionPipeline.Diff → SnapshotDiff 广播
 
-    private func applyPipelineDiff(_ diff: SessionPipeline.Diff, for session: SessionRef) {
+    private func applyPipelineDiff(_ diff: SessionPipeline.Diff, for session: SessionRef) async {
         guard var state = states[session] else { return }
         var changes: [SnapshotDiff.Change] = []
+        /// 下行确认到的上行消息（rpcId 命中 pending/failed 行）：落库确认。
+        var confirmations: [(UUID, SessionRecord)] = []
 
-        let removed = diff.removed.compactMap { seq -> String? in
-            guard let id = state.identities[seq] else { return nil }
-            state.identities.removeValue(forKey: seq)
-            state.rows.removeValue(forKey: seq)
-            return id.uuidString
-        }
+        let removed = applyRemovals(diff.removed, state: &state)
         if !removed.isEmpty { changes.append(.remove(removed)) }
 
         // pending 确认后 WSS 回流同 seq：行已存在 → update，否则 insert（身份稳定）。
         var insertedRows: [Row] = []
         var reclassifiedUpdates: [Row] = []
         for record in diff.inserted {
+            if let clientId = Self.confirmationClientId(of: record),
+               let confirmed = confirmPendingRow(
+                   clientId: clientId, with: record, state: &state) {
+                reclassifiedUpdates.append(confirmed)
+                confirmations.append((clientId, record))
+                continue
+            }
             let id = state.identities[record.event.seq] ?? {
                 let id = UUID()
                 state.identities[record.event.seq] = id
@@ -274,6 +289,54 @@ public actor MessagePipeline {
         states[session] = state
         guard !changes.isEmpty else { return }
         broadcast(SnapshotDiff(changes: changes), to: state.continuations)
+        await enqueueConfirmations(confirmations, for: session)
+    }
+
+    /// 按 seq 核销行（返回被删行的 id 列表，供 .remove 广播）。
+    private func applyRemovals(_ seqs: [Int], state: inout SessionState) -> [String] {
+        seqs.compactMap { seq -> String? in
+            guard let id = state.identities[seq] else { return nil }
+            state.identities.removeValue(forKey: seq)
+            state.rows.removeValue(forKey: seq)
+            return id.uuidString
+        }
+    }
+
+    /// 下行确认的落库（pending 行换正式行）。按序 await：confirm 不得抢在
+    /// 该消息此前的 upsertPending 之前进写队列。
+    private func enqueueConfirmations(
+        _ confirmations: [(UUID, SessionRecord)], for session: SessionRef
+    ) async {
+        guard !confirmations.isEmpty else { return }
+        let pipeline = pipeline(for: session)
+        for (clientId, record) in confirmations {
+            await pipeline.enqueueWrite(.confirmPending(
+                scope: session.scope, sessionId: session.sessionId,
+                clientId: clientId.uuidString, record: record), key: record.event.seq)
+        }
+    }
+
+    /// T022 下行确认：durable 用户消息的 source.rpcId 就是发送时的 clientId
+    /// （同一套 UUID 身份）。命中则 tempId→serverId 原地替换，不产生第二行；
+    /// 标了 failed 但实际已发出的也在此救回。返回替换后的行（update 广播用）。
+    private func confirmPendingRow(
+        clientId: UUID, with record: SessionRecord, state: inout SessionState
+    ) -> Row? {
+        guard let synthetic = state.pendingSeqs[clientId] else { return nil }
+        state.pendingSeqs.removeValue(forKey: clientId)
+        state.rows.removeValue(forKey: synthetic)
+        let message = RenderedMessage(id: clientId, seq: record.event.seq, record: record, status: .sent)
+        state.rows[record.event.seq] = message
+        state.identities[record.event.seq] = clientId
+        return .message(message)
+    }
+
+    /// 一条下行记录是不是某条上行消息的确认：durable 用户消息且 source.rpcId
+    /// 是个 UUID（发送时把 clientId 当 requestId 发出，host 原样落在 source 上）。
+    private static func confirmationClientId(of record: SessionRecord) -> UUID? {
+        guard case .userMessage(let message) = ChatEventDecoder.decode(record.event),
+              message.isFromHuman, let rpcId = message.rpcId else { return nil }
+        return UUID(uuidString: rpcId)
     }
 
     /// 两组 gap（派生量）比对出生灭：消失的整体 remove，新生/状态变化 insert/update。
@@ -290,69 +353,7 @@ public actor MessagePipeline {
         return changes
     }
 
-    // MARK: - 上行：发送五拍（spec 场景 11 / 状态机 draft→pending→sent）
-
-    /// 发送一条用户消息。乐观插入（pending，UUID 身份）→ 落库 → 网络 →
-    /// 确认后原地替换（身份不变）。失败标 failed（可重发，不丢身份）。
-    @discardableResult
-    public func send(text: String, to session: SessionRef) async throws -> UUID {
-        _ = await ensurePrimedState(for: session)
-        let clientId = UUID()
-        guard var state = states[session] else { return clientId }
-
-        // ① 稳定 UUID + 合成 seq（排在当前尾部之后）。
-        let syntheticSeq = state.nextSyntheticSeq
-        state.nextSyntheticSeq -= 1
-        let pending = SessionRecord(event: SessionEvent(
-            type: "user/message", seq: syntheticSeq, time: now() * 1000,
-            data: .object(["text": .string(text)]), surfaceOp: nil))
-        let message = RenderedMessage(id: clientId, seq: syntheticSeq, record: pending, status: .pending)
-        state.rows[syntheticSeq] = message
-        state.pendingSeqs[clientId] = syntheticSeq
-        states[session] = state
-        broadcast(SnapshotDiff(changes: [.insert([.message(message)])]), to: state.continuations)
-
-        // ② 落库队列（按消息去重，先落 pending 再发——重启可见未发出消息）。
-        let pipeline = pipeline(for: session)
-        await pipeline.enqueueWrite(.upsertPending(
-            scope: session.scope, sessionId: session.sessionId,
-            clientId: clientId.uuidString, record: pending), key: syntheticSeq)
-
-        // ③ 网络 → ④ 确认原地替换 / 失败标 failed。
-        do {
-            let confirmed = try await sender(session, text, clientId)
-            replacePending(clientId: clientId, with: confirmed, status: .sent, for: session)
-            await pipeline.enqueueWrite(.confirmPending(
-                scope: session.scope, sessionId: session.sessionId,
-                clientId: clientId.uuidString, record: confirmed), key: confirmed.event.seq)
-        } catch {
-            replacePending(clientId: clientId, with: nil, status: .failed, for: session)
-            throw error
-        }
-        return clientId
-    }
-
-    /// pending → sent/failed 原地替换：同一 UUID、同一行位置语义，只换内容与状态。
-    private func replacePending(
-        clientId: UUID, with confirmed: SessionRecord?,
-        status: RenderedMessage.Status, for session: SessionRef
-    ) {
-        guard var state = states[session],
-              let syntheticSeq = state.pendingSeqs[clientId],
-              let old = state.rows[syntheticSeq]
-        else { return }
-        state.rows.removeValue(forKey: syntheticSeq)
-        state.pendingSeqs.removeValue(forKey: clientId)
-        let record = confirmed ?? old.record
-        let seq = confirmed?.event.seq ?? syntheticSeq
-        let message = RenderedMessage(id: clientId, seq: seq, record: record, status: status)
-        state.rows[seq] = message
-        if confirmed != nil { state.identities[seq] = clientId }
-        states[session] = state
-        broadcast(SnapshotDiff(changes: [.update([.message(message)])]), to: state.continuations)
-    }
-
-    private func broadcast(
+    func broadcast(
         _ diff: SnapshotDiff,
         to continuations: [UUID: AsyncStream<SnapshotDiff>.Continuation]
     ) {

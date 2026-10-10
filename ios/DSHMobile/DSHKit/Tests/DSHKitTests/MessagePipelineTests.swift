@@ -32,10 +32,11 @@ final class MessagePipelineTests: XCTestCase {
 
     /// 空取页器（这些用例不走网络水合，只测聚合与上行）。
     private func makePipeline(
-        sender: @escaping MessagePipeline.Sender = { ref, text, _ in
+        sender: @escaping MessagePipeline.Sender = { _, text, _, _ in
             let json = #"{"type":"user/message","seq":42,"time":1789276358733,"data":{"text":"\#(text)"}}"#
             return SessionRecord(event: try! JSONDecoder().decode(SessionEvent.self, from: Data(json.utf8)))
-        }
+        },
+        confirmationLookup: MessagePipeline.ConfirmationLookup? = nil
     ) -> MessagePipeline {
         MessagePipeline(
             store: store,
@@ -43,6 +44,7 @@ final class MessagePipelineTests: XCTestCase {
                 SessionPipeline.FetchPage(records: [], hasMore: false, clamped: false)
             } },
             sender: sender,
+            confirmationLookup: confirmationLookup,
             now: { 1000 })
     }
 
@@ -117,7 +119,7 @@ final class MessagePipelineTests: XCTestCase {
         let pipeline = MessagePipeline(
             store: store,
             fetchFactory: { _ in { range in try await stub.fetch(range) } },
-            sender: { _, _, _ in throw TestError.sendFailed },
+            sender: { _, _, _, _ in throw TestError.sendFailed },
             now: { 1000 })
         let sessionPipeline = await pipeline.pipeline(for: session)
         // 下行事件预置两段窗口（不经 records()，避免预取提前填洞造成竞态）。
@@ -185,7 +187,7 @@ final class MessagePipelineTests: XCTestCase {
     }
 
     func testSendFailureMarksRowFailedWithSameIdentity() async throws {
-        let pipeline = makePipeline { _, _, _ in throw TestError.sendFailed }
+        let pipeline = makePipeline { _, _, _, _ in throw TestError.sendFailed }
         let stream = await pipeline.snapshots(for: session)
         var iterator = stream.makeAsyncIterator()
         _ = await iterator.next()
@@ -216,6 +218,180 @@ final class MessagePipelineTests: XCTestCase {
         let records = try await store.records(scope: "mac", sessionId: "s1", in: 1...50)
         XCTAssertEqual(records.map(\.event.seq), [42])
         XCTAssertEqual(records.first?.event.data["text"]?.stringValue, "落库") // sender 回包带回原文
+    }
+
+    // MARK: - T022 下行确认 / 重发去重 / 重启恢复
+
+    /// 服务端确认走下行：sender 回 nil（已受理，确认等回流），durable 用户消息的
+    /// source.rpcId == clientId 到达时 tempId→serverId 原地替换（身份不变）。
+    func testDownstreamConfirmationReplacesPendingInPlace() async throws {
+        let pipeline = makePipeline(sender: { _, _, _, _ in nil })
+        let stream = await pipeline.snapshots(for: session)
+        var iterator = stream.makeAsyncIterator()
+        _ = await iterator.next()
+
+        let clientId = try await pipeline.send(text: "你好", to: session)
+        guard case .insert(let inserted)? = await iterator.next()?.changes.first,
+              case .message(let pending) = inserted.first else {
+            return XCTFail("应有 pending 插入")
+        }
+        XCTAssertEqual(pending.status, .pending)
+
+        // 下行回流：同一 clientId 的 durable 记录（seq=42）。
+        let confirmed = Self.userRecord(seq: 42, text: "你好", rpcId: clientId.uuidString)
+        let sessionPipeline = await pipeline.pipeline(for: session)
+        await sessionPipeline.apply(events: [confirmed.event])
+        guard case .update(let rows)? = await iterator.next()?.changes.first,
+              case .message(let sent) = rows.first else {
+            return XCTFail("应有确认 update")
+        }
+        XCTAssertEqual(sent.id, clientId) // 原地替换：身份不变
+        XCTAssertEqual(sent.seq, 42)
+        XCTAssertEqual(sent.status, .sent)
+    }
+
+    /// 重发去重（T022）：clientId 已在服务端最新页（崩溃前确认了没落库）→
+    /// 不重发，只原地替换。
+    func testResendSkipsNetworkWhenServerAlreadyHasClientId() async throws {
+        let sendCount = SendCounter()
+        let lookup = LookupStub()
+        let pipeline = makePipeline(
+            sender: { _, _, _, _ in
+                await sendCount.increment()
+                throw TestError.sendFailed
+            },
+            confirmationLookup: { _, _ in await lookup.record })
+        let stream = await pipeline.snapshots(for: session)
+        var iterator = stream.makeAsyncIterator()
+        _ = await iterator.next()
+        _ = try? await pipeline.send(text: "hi", to: session)
+        guard case .insert(let inserted)? = await iterator.next()?.changes.first,
+              case .message(let pending) = inserted.first else {
+            return XCTFail("应有 pending 插入")
+        }
+        let clientId = pending.id
+        _ = await iterator.next() // failed update
+        do { let sends = await sendCount.value; XCTAssertEqual(sends, 1) }
+
+        // 查重命中：服务端其实已有（seq=42）→ 不重发，行直接转 sent。
+        await lookup.set(Self.userRecord(seq: 42, text: "hi", rpcId: clientId.uuidString))
+        try await pipeline.resend(clientId: clientId, for: session)
+        do { let sends = await sendCount.value; XCTAssertEqual(sends, 1) } // 网络没有被再调一次
+        guard case .update(let rows)? = await iterator.next()?.changes.first,
+              case .message(let sent) = rows.first else {
+            return XCTFail("应有查重命中的原地替换")
+        }
+        XCTAssertEqual(sent.id, clientId)
+        XCTAssertEqual(sent.seq, 42)
+        XCTAssertEqual(sent.status, .sent)
+    }
+
+    /// 查重未命中 → 正常重发：failed 回到 pending，sender 回包后原地替换为 sent。
+    func testResendFallsBackToNetworkWhenLookupMisses() async throws {
+        let sendCount = SendCounter()
+        let pipeline = makePipeline(
+            sender: { _, text, _, _ in
+                let count = await sendCount.increment()
+                if count == 1 { throw TestError.sendFailed } // 第一次失败造 failed 行
+                return Self.userRecord(seq: 42, text: text, rpcId: nil)
+            },
+            confirmationLookup: { _, _ in nil })
+        let stream = await pipeline.snapshots(for: session)
+        var iterator = stream.makeAsyncIterator()
+        _ = await iterator.next()
+        _ = try? await pipeline.send(text: "hi", to: session)
+        guard case .insert(let inserted)? = await iterator.next()?.changes.first,
+              case .message(let pending) = inserted.first else {
+            return XCTFail("应有 pending 插入")
+        }
+        let clientId = pending.id
+        _ = await iterator.next() // failed update
+
+        try await pipeline.resend(clientId: clientId, for: session)
+        do { let sends = await sendCount.value; XCTAssertEqual(sends, 2) } // 重发真走了网络
+        var sawPending = false
+        var sawSent = false
+        for _ in 0..<3 {
+            guard case .update(let rows)? = await iterator.next()?.changes.first,
+                  case .message(let message) = rows.first else { break }
+            XCTAssertEqual(message.id, clientId)
+            if message.status == .pending { sawPending = true }
+            if message.status == .sent { sawSent = true; break }
+        }
+        XCTAssertTrue(sawPending) // 重发开始先回标 pending
+        XCTAssertTrue(sawSent)
+    }
+
+    /// 重启恢复（T022）：磁盘里的 pending 记录以「未发出」（failed）呈现，
+    /// 并自动重发一次（成功则原地转 sent）。
+    func testRestorePendingRendersFailedAndResendsOnce() async throws {
+        let clientId = UUID()
+        let optimistic = SessionRecord(event: SessionEvent(
+            type: "user/message", seq: Int.max, time: 1_789_276_358_000,
+            data: .object([
+                "text": .string("重启前没发出去"),
+                "source": .object(["kind": .string("user"), "rpcId": .string(clientId.uuidString)]),
+            ]), surfaceOp: nil))
+        try await store.applyWrites([.upsertPending(
+            scope: "mac", sessionId: "s1", clientId: clientId.uuidString, record: optimistic)])
+
+        let sendCount = SendCounter()
+        let pipeline = makePipeline(
+            sender: { _, text, _, _ in
+                await sendCount.increment()
+                return Self.userRecord(seq: 42, text: text, rpcId: clientId.uuidString)
+            },
+            confirmationLookup: { _, _ in nil })
+        let stream = await pipeline.snapshots(for: session)
+        var iterator = stream.makeAsyncIterator()
+        _ = await iterator.next() // 首帧（空）
+
+        await pipeline.restorePending(for: session)
+        guard case .insert(let rows)? = await iterator.next()?.changes.first,
+              case .message(let restored) = rows.first else {
+            return XCTFail("应恢复出未发出行")
+        }
+        XCTAssertEqual(restored.id, clientId)
+        XCTAssertEqual(restored.status, .failed) // 未发出、可点重发
+
+        // 自动重发一次：pending → sent（同一 clientId，网络只调一次）。
+        var sawPending = false
+        var sawSent = false
+        for _ in 0..<4 {
+            guard case .update(let updates)? = await iterator.next()?.changes.first,
+                  case .message(let message) = updates.first else { break }
+            if message.status == .pending { sawPending = true }
+            if message.status == .sent { sawSent = true; break }
+        }
+        XCTAssertTrue(sawPending)
+        XCTAssertTrue(sawSent)
+        // 重发是 Task 异步派发的，等它落定再数。
+        try await Task.sleep(nanoseconds: 200_000_000)
+        do { let sends = await sendCount.value; XCTAssertEqual(sends, 1) }
+    }
+
+    /// durable 用户消息（带 source.rpcId），模拟服务端确认回流的记录。
+    private static func userRecord(seq: Int, text: String, rpcId: String?) -> SessionRecord {
+        var source: [String: JSONValue] = ["kind": .string("user")]
+        if let rpcId { source["rpcId"] = .string(rpcId) }
+        let data: JSONValue = .object([
+            "text": .string(text),
+            "content": .array([.object(["type": .string("text"), "text": .string(text)])]),
+            "source": .object(source),
+        ])
+        return SessionRecord(event: SessionEvent(
+            type: "user/message", seq: seq, time: 1_789_276_358_733, data: data, surfaceOp: nil))
+    }
+
+    private actor SendCounter {
+        private(set) var value = 0
+        @discardableResult
+        func increment() -> Int { value += 1; return value }
+    }
+
+    private actor LookupStub {
+        private(set) var record: SessionRecord?
+        func set(_ record: SessionRecord) { self.record = record }
     }
 
     // MARK: - 假件

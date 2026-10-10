@@ -26,6 +26,19 @@ extension ChatModel {
         guard let pipeline = messageLayer?.pipeline, let scope = sessionScope else { return }
         let ref = MessagePipeline.SessionRef(scope: scope, sessionId: summary.sessionId)
         pipelineBridge = ChatPipelineBridge(model: self, pipeline: pipeline, ref: ref)
+        // T022 重启恢复：上次没发出去的消息（磁盘 status='pending'）以「未发出」
+        // 呈现并进时间线，管道内部各尝试重发一次（重发前按 clientId 查重）。
+        Task { await pipeline.restorePending(for: ref) }
+    }
+
+    /// 失败用户消息「点击重发」（T022）：行身份 `user-<clientId>` 去掉前缀就是
+    /// 管道的稳定 UUID。重发走管道状态机；失败只回错误条，行保持 failed。
+    func retrySend(rowId: String) async {
+        guard let bridge = pipelineBridge, rowId.hasPrefix("user-"),
+              let clientId = UUID(uuidString: String(rowId.dropFirst("user-".count)))
+        else { return }
+        // 失败不用另外上报：行仍保持 failed（可再点），这就是反馈。
+        try? await bridge.resend(clientId: clientId)
     }
 
     /// 关会话/换连接时停掉订阅（订阅的 onTermination 会自行从管道注销）。
@@ -54,6 +67,9 @@ final class ChatPipelineBridge {
     private var records: [Int: SessionRecord] = [:]
     /// 行 id → seq（.remove 按行 id 核销用）。
     private var rowSeqs: [String: Int] = [:]
+    /// T022 上行状态（seq → pending/failed/sent）：折叠后回标到时间线行
+    /// （pending 回声样式、failed 可点重发），状态变化不改行身份。
+    private var sendStatuses: [Int: MessagePipeline.RenderedMessage.Status] = [:]
     /// 当前缺口行（派生量的最新一份）。
     private var gaps: [SessionPipeline.GapRow] = []
     /// 管道判定的「已到最早」（hasMore=false / clamped；网络失败永不置位）。
@@ -121,6 +137,7 @@ final class ChatPipelineBridge {
                 for id in ids {
                     if let seq = rowSeqs.removeValue(forKey: id) {
                         records.removeValue(forKey: seq)
+                        sendStatuses.removeValue(forKey: seq)
                         messagesChanged = true
                     } else if gaps.contains(where: { $0.id == id }) {
                         gaps.removeAll { $0.id == id }
@@ -133,8 +150,15 @@ final class ChatPipelineBridge {
                     switch row {
                     case .message(let message):
                         if let before = maxSeqBefore, message.seq > before { tailArrivals += 1 }
+                        // T022 原地替换：同一行 id 换 seq（tempId→serverId）时，
+                        // 旧合成 seq 的记录必须核销，否则折叠出两行。
+                        if let oldSeq = rowSeqs[message.id.uuidString], oldSeq != message.seq {
+                            records.removeValue(forKey: oldSeq)
+                            sendStatuses.removeValue(forKey: oldSeq)
+                        }
                         records[message.seq] = message.record
                         rowSeqs[message.id.uuidString] = message.seq
+                        sendStatuses[message.seq] = message.status
                         messagesChanged = true
                         if onlyStreamingUpdates,
                            let content = Self.streamingContent(of: message.record) {
@@ -191,6 +215,7 @@ final class ChatPipelineBridge {
         let generation = foldGeneration
         let snapshot = records.sorted { $0.key < $1.key }.map(\.value)
         let currentGaps = gaps
+        let statuses = sendStatuses
         Task { @MainActor [weak self] in
             guard let self, let model = self.model else { return }
             let exhausted = await self.session?.topExhausted ?? false
@@ -202,6 +227,9 @@ final class ChatPipelineBridge {
             let folded = await Task.detached(priority: .userInitiated) {
                 var timeline = ChatTimeline()
                 _ = timeline.reset(with: snapshot)
+                // T022：发送状态回标（pending 回声样式 / failed 可点重发），
+                // 状态变化不改行身份、不改行高（spec 场景 11）。
+                timeline.markSendStates(statuses)
                 return timeline
             }.value
             guard generation == self.foldGeneration else { return }
@@ -317,6 +345,13 @@ final class ChatPipelineBridge {
     /// 否则下一次 diff 重建会把刚丢的行补回来。
     func dropRecords(below seq: Int) {
         records = records.filter { $0.key >= seq }
+        sendStatuses = sendStatuses.filter { $0.key >= seq }
+    }
+
+    /// T022 失败行「点击重发」：交给管道的重发状态机（查重 → pending → 网络 →
+    /// 确认原地替换），行身份不变。
+    func resend(clientId: UUID) async throws {
+        try await pipeline.resend(clientId: clientId, for: ref)
     }
 
     // MARK: - 尾部追平（T018 点胶囊 / T019 可见性兜底）

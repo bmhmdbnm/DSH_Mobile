@@ -50,6 +50,9 @@ public struct TimelineItem: Identifiable, Sendable {
     /// 该行李自仍在流式的 provisional 记录（spec 009 tasks T020）：渲染降级为
     /// 纯文本（代码块不高亮），消息结束后提交记录覆盖，标记消失并做一次完整解析。
     public var isStreaming: Bool = false
+    /// 009 上行状态（T022）：这条用户消息没发出去（发送失败/重启恢复未发出），
+    /// 行尾给「发送失败，点击重发」。只由 `markSendStates` 回标，折叠本身不产生。
+    public var sendFailed: Bool = false
 }
 
 /// One tool invocation and its outcome.
@@ -593,6 +596,29 @@ public struct ChatTimeline: Sendable {
         self.streaming = streaming
         for echo in echoes where !items.contains(where: { $0.id == echo.id }) {
             items.append(echo)
+        }
+    }
+
+    /// 009 上行状态回标（T022，spec 场景 11「pending→sent 原地替换」）：
+    /// 管道折叠只还原文本，发送状态（pending/failed）由内存层按 seq 回标——
+    /// pending 走回声样式（降透明度 + 等待提示），failed 给可点重发标记。
+    /// 身份与行位置都不动，只翻状态位。
+    public mutating func markSendStates(_ statuses: [Int: MessagePipeline.RenderedMessage.Status]) {
+        for index in items.indices {
+            guard let status = statuses[items[index].seq],
+                  case .userMessage(let text, let images, let isSteering, _, let isAgentSent) = items[index].kind
+            else { continue }
+            switch status {
+            case .sent:
+                items[index].sendFailed = false
+            case .pending:
+                items[index].sendFailed = false
+                items[index].kind = .userMessage(
+                    text: text, images: images, isSteering: isSteering,
+                    isPending: true, isAgentSent: isAgentSent)
+            case .failed:
+                items[index].sendFailed = true
+            }
         }
     }
 

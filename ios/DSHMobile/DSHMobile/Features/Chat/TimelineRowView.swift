@@ -38,6 +38,8 @@ struct TimelineRowView: View {
     /// 缺口行被点（失败态的「点击重试」）：把缺口范围交回给调用方（ChatModel）。
     /// 默认 nil：列表宿主之外（搜索面板等）的行不可点。
     var onGapRetry: ((_ start: Int, _ end: Int) -> Void)?
+    /// T022 失败用户消息被点（「发送失败，点击重发」）：把行身份交回调用方。
+    var onSendRetry: ((_ rowId: String) -> Void)?
 
     @ViewBuilder
     private var row: some View {
@@ -48,7 +50,9 @@ struct TimelineRowView: View {
                 images: images,
                 isSteering: isSteering,
                 isPending: isPending,
-                isAgentSent: isAgentSent
+                isAgentSent: isAgentSent,
+                sendFailed: item.sendFailed,
+                onResend: item.sendFailed ? { onSendRetry?(item.id) } : nil
             )
 
         case .assistantText(let text):
@@ -148,6 +152,9 @@ private struct UserMessageRow: View {
     let isPending: Bool
     /// True when the agent sent this, not the person holding the phone.
     let isAgentSent: Bool
+    /// T022：没发出去（发送失败 / 重启恢复未发出），行尾给可点的重发入口。
+    var sendFailed: Bool = false
+    var onResend: (() -> Void)?
 
     /// The agent's own messages sit on the agent's side, like every other thing
     /// it says. They arrive as prompts — the protocol's only door for a picture
@@ -162,6 +169,19 @@ private struct UserMessageRow: View {
                     Text("插入当前轮次")
                         .font(DSHTheme.Typography.micro)
                         .foregroundStyle(DSHTheme.brand)
+                } else if sendFailed {
+                    // T022：复用缺口行的重试视觉（箭头 + 品牌色小字），点击重发。
+                    Button(action: { onResend?() }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 9, weight: .semibold))
+                            Text("发送失败，点击重发")
+                                .font(DSHTheme.Typography.micro)
+                        }
+                        .foregroundStyle(DSHTheme.danger)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("chat.send.retry")
                 } else if isPending {
                     // Immediate acknowledgement that the message was accepted,
                     // before the host has had time to start its turn.

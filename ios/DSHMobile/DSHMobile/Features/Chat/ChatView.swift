@@ -699,6 +699,10 @@ struct ChatView: View {
         rowView.onGapRetry = { start, end in
             Task { await model.retryGap(start: start, end: end) }
         }
+        // T022 失败用户消息「发送失败，点击重发」：管道的重发状态机接管。
+        rowView.onSendRetry = { rowId in
+            Task { await model.retrySend(rowId: rowId) }
+        }
         return rowView
             // 搜索跳过来的那一行：淡底 + 左侧色条，一眼能认出"就是这条"。
             .background(alignment: .leading) {

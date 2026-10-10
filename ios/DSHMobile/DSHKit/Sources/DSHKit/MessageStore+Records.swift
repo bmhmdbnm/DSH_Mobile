@@ -103,6 +103,29 @@ extension MessageStore {
         }
     }
 
+    /// 未发出的上行消息（status='pending'，T022 重启恢复）：clientId + 乐观记录，
+    /// 按合成 seq 升序（老→新）。崩溃前确认没落库的消息也在其中，重发前由内存层
+    /// 按 clientId 对服务端查重。
+    public func pendingRecords(
+        scope: String, sessionId: String
+    ) async throws -> [(clientId: String, record: SessionRecord)] {
+        try await pool.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT client_id, payload FROM record
+                WHERE scope = ? AND session_id = ? AND status = 'pending' AND client_id IS NOT NULL
+                ORDER BY seq ASC
+                """, arguments: [scope, sessionId])
+            let decoder = JSONDecoder()
+            return rows.compactMap { row -> (String, SessionRecord)? in
+                guard let clientId: String = row["client_id"],
+                      let payload: Data = row["payload"],
+                      let record = try? decoder.decode(SessionRecord.self, from: payload)
+                else { return nil }
+                return (clientId, record)
+            }
+        }
+    }
+
     /// 某 seq 之前的一页（降序取、返回升序），向上翻页用。
     public func windowBefore(
         scope: String, sessionId: String, seq: Int, limit: Int

@@ -16,8 +16,6 @@ final class MessageLayer {
         case notConnected
         /// 该会话没有注册过拉取地址（不在当前列表里）。
         case noAddress
-        /// 上行发送还没接进 009 管道（现有发送路径不变，见 ChatModel）。
-        case sendUnsupported
     }
 
     /// 会话 id → 拉取地址。subagent 会话的地址需要父 id 与 mode，只能从列表行的
@@ -80,7 +78,32 @@ final class MessageLayer {
                         clamped: value.clamped ?? false)
                 }
             },
-            sender: { _, _, _ in throw FetchFailure.sendUnsupported },
+            // T022 上行：requestId 就是管道给的 clientId（同一套稳定 UUID，
+            // 不并存第二套身份）——host 把它落在 durable 消息的 source.rpcId 上，
+            // 确认走下行回流（follow → SessionPipeline → rpcId 命中原地替换），
+            // 所以这里受理即返回 nil，不伪造回包。附件发送不走这里（见 ChatModel）。
+            sender: { ref, text, clientId, steer in
+                guard let client = client() else { throw FetchFailure.notConnected }
+                try await client.prompt(SessionPromptRequest(
+                    requestId: clientId.uuidString,
+                    sessionId: ref.sessionId,
+                    mode: steer ? .steer : .queue,
+                    content: [.text(text)]))
+                return nil
+            },
+            // T022 重发去重：崩溃前可能确认了没落库。重发前按 clientId 对服务端
+            // 最新页查一次（before=.max 即最新），已有则只替换不重发。
+            confirmationLookup: { ref, clientId in
+                guard let client = client(),
+                      let address = addresses.address(for: ref.sessionId) else { return nil }
+                let value = try? await client.historyWindow(HistoryWindowRequest(
+                    address: address, before: .max, limit: 50, maxBytes: 256 * 1024))
+                return value?.records.first { record in
+                    guard case .userMessage(let message) = ChatEventDecoder.decode(record.event)
+                    else { return false }
+                    return message.isFromHuman && message.rpcId == clientId.uuidString
+                }
+            },
             hotLimit: 5000
         )
     }
