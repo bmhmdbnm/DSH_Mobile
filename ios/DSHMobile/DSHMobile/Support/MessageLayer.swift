@@ -61,6 +61,8 @@ final class MessageLayer {
         }
         guard let store, pipeline == nil else { return }
         let addresses = self.addresses
+        // hotLimit 暂不裁剪：热窗口裁剪回看是 T026 的事（水合空白带要走缺口行
+        // 占位，US2 只换渲染数据源）。给足上限让淘汰在 US2 路径上永不触发。
         pipeline = MessagePipeline(
             store: store,
             fetchFactory: { ref in
@@ -78,7 +80,8 @@ final class MessageLayer {
                         clamped: value.clamped ?? false)
                 }
             },
-            sender: { _, _, _ in throw FetchFailure.sendUnsupported }
+            sender: { _, _, _ in throw FetchFailure.sendUnsupported },
+            hotLimit: 5000
         )
     }
 }

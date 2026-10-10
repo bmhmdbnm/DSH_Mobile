@@ -231,6 +231,10 @@ final class ChatModel {
     private var eventTask: Task<Void, Never>?
     /// 取页游标状态机：每个会话一份，是全 App 唯一的"更早历史"状态来源。
     private var pager: TranscriptPager?
+    /// 009 渲染数据源桥（tasks T013）：非 nil 时，时间线由 MessagePipeline 的
+    /// 快照驱动（订阅/折叠/重试全在 ChatModel+Pipeline.swift 的桥里）；
+    /// nil = 回退到自有 pager/fetcher/store 路径（管道不可用时不劣于现状）。
+    var pipelineBridge: ChatPipelineBridge?
     /// 本地窗口的最老 seq（投影自 pager，供搜索缓冲与落盘使用）。
     private var oldestSeq: Int? { pager?.oldestLoadedSeq }
     /// DEBUG 故障注入：让前 N 次取页失败（`-DSHProbeFailPage <n>`）。
@@ -371,6 +375,8 @@ final class ChatModel {
         syncPlanRef = syncPlan
         // T011：点开的会话以 .jump 插队水合最新页进 009 磁盘层（抢占在途预取）。
         warmMessageLayer(for: summary)
+        // T013：渲染数据源切到 MessagePipeline 快照（管道缺位时桥为 nil，走原路径）。
+        startPipelineSubscription(for: summary)
         startFollowing(client: client, summary: summary, maxMessages: syncPlan.maxMessages)
         await restoreSearchHistory()
         pendingOpen = nil
@@ -381,6 +387,7 @@ final class ChatModel {
     /// Stops the live streams and keeps the transcript warm for a revisit.
     func close() async {
         // 顺序要紧：先把记录和转写写下去，再清状态。
+        stopPipelineSubscription()
         persistTranscriptNow()
         await flushTranscript()
         saveToCache()
@@ -547,6 +554,10 @@ final class ChatModel {
     ///
     /// 只从**本地库**读（0 网络）；库里没有这一段就返回 nil，界面保持原地并留一条诊断。
     func rebaseWindow(around seq: Int, leading: Int = 20, limit: Int = 80) async -> String? {
+        // T013：跳转 = 管道的 .jump（抢占在途低优预取，只拉目标对齐页）。
+        if let bridge = pipelineBridge {
+            return await bridge.rebase(around: seq, leading: leading, limit: limit)
+        }
         guard let sessionId = session?.sessionId, let scope = sessionScope else { return nil }
         let before = max(0, seq + leading)
         var records = (try? await transcriptStore.loadWindow(
@@ -609,7 +620,17 @@ final class ChatModel {
     /// 丢掉最老端 `count` 行（宿主那边会用同一批 id 做原子丢弃）。
     @discardableResult
     func dropOldestRows(_ count: Int) -> Int {
-        timeline.dropOldestRows(count)
+        let dropped = timeline.dropOldestRows(count)
+        // 管道模式：桥里的记录也要同步丢到同一界线，否则下一次 diff 重建
+        // 会把刚丢的行原样补回来，预算裁剪被架空（008 FR-002）。
+        if dropped > 0, let bridge = pipelineBridge,
+           let newFirst = timeline.items.first(where: { item in
+               if case .gap = item.kind { return false }
+               return true
+           })?.seq {
+            bridge.dropRecords(below: newFirst)
+        }
+        return dropped
     }
 
     /// 按 seq 把行内容从**本地库**取回来（spec 008 的 US3 / SC-004：水合 1 秒内、0 网络）。
@@ -887,7 +908,11 @@ final class ChatModel {
                 || TranscriptSyncPlan.stillNeedsReBase(
                     localLastSeq: recentRecords.last?.event.seq,
                     snapshotFirstSeq: snapshot.records.first?.event.seq)
-            if timeline.items.isEmpty || needsReBase {
+            // T013：管道接管渲染时，快照不再直接折进时间线——记录喂给管道，
+            // 由它的 diff 统一重建（时间线、缺口行、"已到最早"都来自同一事实来源）。
+            if let bridge = pipelineBridge {
+                bridge.applyDownstream(records: snapshot.records)
+            } else if timeline.items.isEmpty || needsReBase {
                 timeline.reset(with: snapshot.records)
                 if needsReBase, !timeline.items.isEmpty, localLastAtSnapshot != nil {
                     ViewportProbe.note("transcript.rebased", [
@@ -904,15 +929,17 @@ final class ChatModel {
             throughSeq = max(throughSeq, snapshot.cursor)
             // 本地可能已经存着比这次快照更老的一段（冷启动缓存）：取更小的那个，
             // 否则"往前翻"会从快照的第一条开始要，等于把本地已有的又拉一遍。
-            pager?.observe(oldestSeq: snapshot.records.first?.event.seq,
-                           newestSeq: snapshot.cursor,
-                           hasMore: snapshot.hasMore)
-            // 以 host 为准：`hasMore=false` 意味着这次快照的窗口已经退到日志开头，
-            // 那就真的没有更早的了。以前写成 `|| hasOlder`，本地旧状态会把"到底了"
-            // 硬说成"还能往前翻"，点下去什么也加载不出来。
-            syncOlderState()
+            if pipelineBridge == nil {
+                pager?.observe(oldestSeq: snapshot.records.first?.event.seq,
+                               newestSeq: snapshot.cursor,
+                               hasMore: snapshot.hasMore)
+                // 以 host 为准：`hasMore=false` 意味着这次快照的窗口已经退到日志开头，
+                // 那就真的没有更早的了。以前写成 `|| hasOlder`，本地旧状态会把"到底了"
+                // 硬说成"还能往前翻"，点下去什么也加载不出来。
+                syncOlderState()
+            }
             phase = .ready
-            scrollSignal += 1
+            if pipelineBridge == nil { scrollSignal += 1 }
             // 快照要**并进**本地尾部，不能替换：本地可能存着 200 条，而这次的快照
             // 只有 20 条（本地很新时故意少要），直接替换等于把已落盘的历史截掉
             // ——用户看到的就是"切后台回来少了一部分记录"。
@@ -921,8 +948,13 @@ final class ChatModel {
 
         case .event(let event):
             flushStreamFrames()
-            let change = timeline.apply(event)
-            if case .none = change {} else { scrollSignal += 1 }
+            if let bridge = pipelineBridge {
+                // T013：事件进管道，由管道 diff 重建时间线（单一路径，不双写）。
+                bridge.applyDownstream(event: event)
+            } else {
+                let change = timeline.apply(event)
+                if case .none = change {} else { scrollSignal += 1 }
+            }
             mergeTail([SessionRecord(event: event)])
             persistIfDue()
             // A live event proves the stream is healthy even if the summary
@@ -1102,6 +1134,12 @@ final class ChatModel {
     /// published `session/page` workaround only when the connector lacks the
     /// capability (FR-002/FR-003/FR-037/FR-038).
     func loadOlder() async {
+        // T013：管道接管渲染时，"向上翻页"是向管道请求对应范围（.userVisible），
+        // 缺口/重试/到头全部由管道的状态机表达（T016）。
+        if let bridge = pipelineBridge {
+            await bridge.loadOlder()
+            return
+        }
         guard !isLoadingOlder else { return }
         // 先看本地：窗口裁剪掉的、或上一次冷启动没画出来的那一段，读库就有，不联网。
         if await backfillFromStore() { return }
@@ -1246,6 +1284,67 @@ final class ChatModel {
         autoRetryTask?.cancel()
         didAutoRetry = false
         syncOlderState()
+    }
+
+    // MARK: - 009 管道重建落点（tasks T013/T016；桥在 ChatModel+Pipeline.swift）
+
+    /// 桥算好的整棵折叠结果落进时间线。在这里（而不是扩展里）落地，是因为它
+    /// 要写 `timeline` / `hasOlder` / `pager` 这些 private(private(set) 成员。
+    ///
+    /// 在飞状态（流式气泡、发送中的乐观回声）不在下行记录里，重建时必须接回
+    /// （`restoreTransient`），否则每一次快照 diff 都会把它们抹掉一帧。
+    func applyPipelineRebuild(
+        _ folded: ChatTimeline, gaps: [TimelineItem],
+        topExhausted: Bool, oldestSeq: Int?
+    ) {
+        let oldFirstSeq = timeline.items.first(where: { !Self.isGapRow($0) })?.seq
+        var next = folded
+        next.record(usage: timeline.lastUsage)
+        next.restoreTransient(streaming: timeline.streaming, echoes: Self.pendingEchoes(in: timeline.items))
+        next.setGaps(gaps)
+        let newFirstSeq = next.items.first(where: { !Self.isGapRow($0) })?.seq
+        timeline = next
+        // 头部变老 = 补页（prependSignal，宿主锚回视口）；其余 = 内容变化。
+        if let newFirstSeq, newFirstSeq != oldFirstSeq,
+           oldFirstSeq == nil || newFirstSeq < (oldFirstSeq ?? .max) {
+            prependSignal += 1
+        } else {
+            scrollSignal += 1
+        }
+        // T016：「已到最早」只在管道判到顶（hasMore=false / clamped）时成立。
+        hostHasMore = !topExhausted
+        hasOlder = !topExhausted && (oldestSeq ?? 1) > 1
+        pager?.observe(oldestSeq: oldestSeq, newestSeq: nil, hasMore: !topExhausted)
+        searchScopeVersion += 1
+    }
+
+    /// 只刷新缺口行（加载/失败/到头三态变化，数据行不动）。
+    func applyPipelineGaps(_ gaps: [TimelineItem]) {
+        timeline.setGaps(gaps)
+        scrollSignal += 1
+    }
+
+    /// 管道模式下的「向上翻页」进行中（顶部缺口行 spinner 与旧版小字共用此位）。
+    func notePipelineLoadingOlder(_ loading: Bool) {
+        isLoadingOlder = loading
+    }
+
+    /// 管道模式下的取页失败（顶部缺口行转「点击重试」，绝不写成"没有更多"）。
+    func notePipelineOlderFailure(_ message: String?) {
+        olderFailure = message
+    }
+
+    static func isGapRow(_ item: TimelineItem) -> Bool {
+        if case .gap = item.kind { return true }
+        return false
+    }
+
+    /// 仍在等服务端确认的本地回声行（上行在飞，重建时由 restoreTransient 接回）。
+    static func pendingEchoes(in items: [TimelineItem]) -> [TimelineItem] {
+        items.filter { item in
+            guard case .userMessage(_, _, _, let isPending, _) = item.kind else { return false }
+            return isPending
+        }
     }
 
     /// Projects the pager's state onto the two values the view reads.

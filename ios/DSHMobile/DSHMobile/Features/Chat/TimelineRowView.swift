@@ -31,8 +31,13 @@ struct TimelineRowView: View {
         case .notice: return "row.notice"
         case .turnDivider: return "row.turnEnd"
         case .unknown: return "row.unknown"
+        case .gap: return "row.gap"
         }
     }
+
+    /// 缺口行被点（失败态的「点击重试」）：把缺口范围交回给调用方（ChatModel）。
+    /// 默认 nil：列表宿主之外（搜索面板等）的行不可点。
+    var onGapRetry: ((_ start: Int, _ end: Int) -> Void)?
 
     @ViewBuilder
     private var row: some View {
@@ -64,8 +69,71 @@ struct TimelineRowView: View {
 
         case .unknown:
             EmptyView()
+
+        case .gap(let start, let end, let status):
+            GapRowView(status: status) { onGapRetry?(start, end) }
         }
     }
+}
+
+// MARK: - 缺口行（spec 009 / tasks T014）
+
+/// 缺口占位行：固定高度（44pt），三态——spinner / 「加载失败，点击重试」（可点）/
+/// 「已到最早」。高度定死是关键纪律：加载态只以缺口行表达，数据行一旦出现排版
+/// 必然已完成，不存在「先占位后变高」的数据行（spec 009「UI 刷新推导」）。
+private struct GapRowView: View {
+    let status: TimelineItem.GapStatus
+    let onRetry: () -> Void
+
+    var body: some View {
+        content
+            .frame(maxWidth: .infinity)
+            .frame(height: Self.height)
+            .contentShape(Rectangle())
+            .accessibilityIdentifier("row.gap.\(accessibilityState)")
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch status {
+        case .loading:
+            HStack(spacing: DSHTheme.Spacing.hairline) {
+                ProgressView().controlSize(.mini)
+                Text("正在加载…")
+                    .font(DSHTheme.Typography.micro)
+                    .foregroundStyle(DSHTheme.labelTertiary)
+            }
+        case .failed(let retryable):
+            Button(action: onRetry) {
+                HStack(spacing: DSHTheme.Spacing.hairline) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("加载失败，点击重试")
+                        .font(DSHTheme.Typography.micro)
+                }
+                .foregroundStyle(DSHTheme.brand)
+            }
+            .buttonStyle(.plain)
+            .disabled(!retryable)
+            .accessibilityIdentifier("chat.gap.retry")
+        case .exhausted:
+            Text("已到最早")
+                .font(DSHTheme.Typography.micro)
+                .foregroundStyle(DSHTheme.labelTertiary)
+        }
+    }
+
+    private var accessibilityState: String {
+        switch status {
+        case .loading: return "loading"
+        case .failed: return "failed"
+        case .exhausted: return "exhausted"
+        }
+    }
+
+    /// 固定高度：缺口补齐走「删缺口行 + 插数据行 + 位移修正」一次事务，
+    /// 高度自始至终不变是位移残差 ≤8pt 的前提之一。
+    static let height: CGFloat = 44
 }
 
 // MARK: - User message

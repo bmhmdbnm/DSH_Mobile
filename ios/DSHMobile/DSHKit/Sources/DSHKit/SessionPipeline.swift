@@ -344,16 +344,39 @@ public actor SessionPipeline {
         emit(diff)
     }
 
+    /// 读者点了「加载失败，点击重试」（spec 009 失败语义 / tasks T016）：
+    /// 清掉该范围覆盖对齐页的失败计数，再走一次「取不到就拉」。
+    /// 除此之外没有任何路径能清零计数——失败到上限的缺口不会自己偷偷重试。
+    public func retry(range: ClosedRange<Int>) async throws {
+        for page in alignedPages(covering: RangeIndex.Span(range.lowerBound, range.upperBound)) {
+            failureCounts.removeValue(forKey: page.lowerBound)
+        }
+        _ = try await records(in: range, priority: .userVisible)
+    }
+
     // MARK: - 下行合并（WSS 推送 / 流式）
 
     /// 服务端提交的日志事件：直接合并（流式帧走 apply(stream:)）。
     public func apply(event: SessionEvent) {
-        let record = SessionRecord(event: event)
+        apply(events: [event])
+    }
+
+    /// 一批日志事件（follow 快照下行）：合并成**一次** diff——逐条 apply 会让
+    /// 订阅方按条数重建（009 ChatModel 接线实测要避免的写放大）。
+    public func apply(events: [SessionEvent]) {
+        guard !events.isEmpty else { return }
         var diff = Diff()
-        if hotWindow[event.seq] == nil { diff.inserted.append(record) } else { diff.updated.append(record) }
-        mergeIntoHotWindow(record)
-        ranges.insert(event.seq)
-        enqueueWrite(.upsertRecords(scope: scope, sessionId: sessionId, records: [record]), key: event.seq)
+        var latestKey = 0
+        for event in events {
+            let record = SessionRecord(event: event)
+            if hotWindow[event.seq] == nil { diff.inserted.append(record) } else { diff.updated.append(record) }
+            mergeIntoHotWindow(record)
+            ranges.insert(event.seq)
+            latestKey = max(latestKey, event.seq)
+        }
+        enqueueWrite(.upsertRecords(
+            scope: scope, sessionId: sessionId,
+            records: events.map(SessionRecord.init)), key: latestKey)
         knownEmptyPages.removeAll()
         diff.removed = evictIfNeeded()
         diff.gaps = currentGaps()

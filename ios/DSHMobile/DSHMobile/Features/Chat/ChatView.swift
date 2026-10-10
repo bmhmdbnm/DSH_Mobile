@@ -471,7 +471,10 @@ struct ChatView: View {
                     }
                 },
                 jumpToId: listJumpId,
-                hostRef: $listHostRef
+                hostRef: $listHostRef,
+                // 009（T013/T015）：管道快照的每次变化都是多段混合变更，
+                // 必须作为一次原子更新提交（统一锚位移修正）。
+                atomicApply: model.pipelineActive
             )
             .accessibilityIdentifier("chat.transcript.list")
         } else if ProbeVariants.lazyStack {
@@ -570,7 +573,8 @@ struct ChatView: View {
     /// 能行动的话和一个按钮，失败就不再是死路。
     @ViewBuilder
     private var olderRetryBar: some View {
-        if let reason = model.olderFailure {
+        // 009 管道模式下失败态由顶部缺口行（点击重试）表达，不再叠这条胶囊。
+        if !model.pipelineActive, let reason = model.olderFailure {
             Button {
                 ViewportProbe.note("older.retry.tap", ["reason": reason], force: true)
                 Task { await model.retryOlder() }
@@ -613,7 +617,8 @@ struct ChatView: View {
         // （或 3 秒后那一次自动补试）。两者互斥，屏幕上也才看得出"现在是失败态"。
         // 预取现在提前一屏半发生，所以这行小字会在读者快到顶之前就出现——
         // 真机反馈过"加载中要有小字，否则以为获取历史有问题"。
-        if model.isLoadingOlder, model.olderFailure == nil {
+        // 009 管道模式下加载态由顶部缺口行（spinner）表达，不再叠这条小字。
+        if !model.pipelineActive, model.isLoadingOlder, model.olderFailure == nil {
             HStack(spacing: DSHTheme.Spacing.hairline) {
                 ProgressView().controlSize(.mini)
                 Text("正在加载更早的消息…")
@@ -632,7 +637,12 @@ struct ChatView: View {
 
     /// 一行消息。抽出来是为了让"懒加载/非懒加载"两种排布共用同一份定义。
     private func row(_ item: TimelineItem) -> some View {
-        TimelineRowView(item: item)
+        var rowView = TimelineRowView(item: item)
+        // 缺口行「加载失败，点击重试」（T016）：重试由管道的状态机接管。
+        rowView.onGapRetry = { start, end in
+            Task { await model.retryGap(start: start, end: end) }
+        }
+        return rowView
             // 搜索跳过来的那一行：淡底 + 左侧色条，一眼能认出"就是这条"。
             .background(alignment: .leading) {
                 if highlightedItemId == item.id {

@@ -48,6 +48,10 @@ struct TranscriptListRepresentable: UIViewRepresentable {
     let jumpToId: String?
     /// 把宿主实例交回给 `ChatView`（回收/水合要用它把行交回来）。
     let hostRef: Binding<TranscriptListHost?>
+    /// 009 数据源（MessagePipeline 快照）模式：每次 `items` 变化都是一次多段
+    /// 混合变更，必须作为**一次原子更新**提交（统一锚位移修正，tasks T015），
+    /// 不再走「prepend / setRows 二选一」的启发式（那会拆成两次提交或误锚尾部）。
+    var atomicApply: Bool = false
 
     func makeUIView(context: Context) -> TranscriptListHost {
         let host = TranscriptListHost()
@@ -80,8 +84,11 @@ struct TranscriptListRepresentable: UIViewRepresentable {
         let known = context.coordinator.known
         let incoming = items.filter { !known.contains($0.id) }
         let removed = known.subtracting(items.map(\.id))
-        // 变少了（裁剪/换窗口）⇒ 整批重来；只多出来且都在前面 ⇒ 原子前插。
-        if !removed.isEmpty {
+        if atomicApply {
+            // 009：多段混合变更一次原子提交（统一锚位移修正，tasks T015）。
+            host.apply(.reconcile(items, reason: "pipeline"))
+        } else if !removed.isEmpty {
+            // 变少了（裁剪/换窗口）⇒ 整批重来；只多出来且都在前面 ⇒ 原子前插。
             host.apply(.setRows(items, anchorId: items.last?.id))
         } else if !incoming.isEmpty {
             if TranscriptListSection.isPrepend(incoming, current: host.rows.compactMap(\.item)) {
@@ -245,6 +252,10 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         case dropOldest(count: Int)
         case reclaim([String])
         case rehydrate([String])
+        /// 一次原子提交的多段混合变更（spec 009 tasks T015）：头部插入 + 缺口
+        /// 生灭 + 尾部更新合在同一次快照应用里；位移修正走唯一位移锚
+        /// （视口顶部首个完整可见行 + 行内偏移，上方高度差汇总一次应用）。
+        case reconcile([TimelineItem], reason: String)
     }
 
     private(set) var rows: [TranscriptRowPayload] = []
@@ -368,7 +379,106 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         case .rehydrate(let ids):
             for index in rows.indices where ids.contains(rows[index].id) { rows[index].contentVersion += 1 }
             diagnostic("list.rehydrate", ["rows": String(ids.count), "ms": "0", "net": "0"])
+        case .reconcile(let items, let reason):
+            reconcile(items, reason: reason)
         }
+    }
+
+    /// 009 的统一锚一次提交（spec「唯一位移锚」/ tasks T015）。
+    ///
+    /// 与 `prepend`/`dropOldest` 同一套纪律——量锚、一次应用快照、把上方高度差
+    /// 汇总后**一次**加回 `contentOffset`，残差超容差再修一次（仍只改 offset，
+    /// 不滚到行）。区别只在两点：
+    /// - 变更可以是多段混合（头部插入 + 缺口生灭 + 尾部更新），所以锚不能取
+    ///   「当前第一行」（它可能正在被换掉），要取**视口顶部首个完整可见行**；
+    /// - 被回收的行保留回收态（身份与高度不变，内容仍由水合路径要回）。
+    /// 上一次 reconcile 应用的行签名（id + 内容签名）：都没变就整次跳过
+    /// （SwiftUI 每次 body 重算都会路过这里，真去 apply + layoutIfNeeded
+    /// 会把打字都变成一次布局——T015 的性能纪律）。
+    private var lastReconcile: [(id: String, signature: String)] = []
+
+    func reconcile(_ items: [TimelineItem], reason: String) {
+        let started = CFAbsoluteTimeGetCurrent()
+        let ordered = TranscriptListSection.ordered(items)
+        let incoming = ordered.map { (id: $0.id, signature: Self.signature(of: $0)) }
+        guard incoming.map(\.signature) != lastReconcile.map(\.signature)
+                || incoming.map(\.id) != lastReconcile.map(\.id) else { return }
+        var changedIds = Set<String>()
+        for (index, pair) in incoming.enumerated() {
+            guard index < lastReconcile.count, lastReconcile[index].id == pair.id else { continue }
+            if lastReconcile[index].signature != pair.signature { changedIds.insert(pair.id) }
+        }
+        lastReconcile = incoming
+        let anchorId = firstFullyVisibleRowId() ?? rows.first?.id
+        let before = visualY(of: anchorId)
+        let reclaimedById = Dictionary(
+            rows.filter(\.isReclaimed).map { ($0.id, $0.state) },
+            uniquingKeysWith: { old, _ in old })
+        rows = ordered.map { item in
+            var payload = TranscriptRowPayload(item: item)
+            if let reclaimed = reclaimedById[item.id] { payload.state = reclaimed }
+            return payload
+        }
+        applySnapshot(reloading: changedIds)
+        collectionView.layoutIfNeeded()
+        let after = visualY(of: anchorId)
+        var delta = (after ?? 0) - (before ?? 0)
+        if delta != 0 {
+            collectionView.contentOffset.y += delta
+            collectionView.layoutIfNeeded()
+        }
+        var residual = (visualY(of: anchorId) ?? before ?? 0) - (before ?? 0)
+        if abs(residual) > Self.tolerance {
+            collectionView.contentOffset.y += residual
+            collectionView.layoutIfNeeded()
+            delta += residual
+            residual = (visualY(of: anchorId) ?? before ?? 0) - (before ?? 0)
+        }
+        diagnostic("list.reconcile", [
+            "rows": String(rows.count),
+            "deltaPt": String(format: "%.0f", delta),
+            "ms": String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - started) * 1000),
+            "reason": reason,
+        ])
+        settle(anchorId: anchorId ?? "-", moved: residual)
+        satisfyBottomIntent()
+        if distanceToTop() < prefetchMargin() {
+            nearTopArmed = true
+            onNearTop?()
+        }
+    }
+
+    /// 行内容签名：身份之外「内容有没有变」的判定（相同 id 的行被更新时要
+    /// reload cell，缺口行的三态也在签名里）。回收态保留原签名——内容没变。
+    private static func signature(of item: TimelineItem) -> String {
+        let base = "\(item.id)#\(TranscriptRowPayload(item: item).payloadBytes)"
+        switch item.kind {
+        case .gap(_, _, let status):
+            return "\(item.id)|gap:\(status)"
+        case .userMessage(_, _, let isSteering, let isPending, _):
+            // pending→sent 原地替换不改字节数，状态位必须进签名，否则徽标永远停在"等待开始"。
+            return "\(base)|u:\(isSteering):\(isPending)"
+        case .toolCall(let invocation):
+            return "\(base)|t:\(invocation.isRunning):\(invocation.isError)"
+        default:
+            return base
+        }
+    }
+
+    /// 唯一位移锚（spec 009）：视口顶部**首个完整可见行**的 id。
+    /// 量不到（行还没布局出来）时返回 nil，调用方退而用第一行。
+    private func firstFullyVisibleRowId() -> String? {
+        let top = collectionView.contentOffset.y
+        for index in rows.indices {
+            let path = IndexPath(item: index, section: 0)
+            guard let attributes = collectionView.collectionViewLayout
+                .layoutAttributesForItem(at: path) else { continue }
+            if attributes.frame.maxY <= top { continue }
+            // 首个与视口相交的行：完整可见（minY 不低于视口顶）才够格当锚，
+            // 否则继续找下一行——被切掉半行的锚会量出半个行高的假位移。
+            if attributes.frame.minY >= top { return rows[index].id }
+        }
+        return nil
     }
 
     /// 往上插一页：量出锚点位移，同一次更新内把 offset 修回去。
@@ -650,7 +760,7 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         rows.reduce(0) { $0 + $1.payloadBytes }
     }
 
-    private func applySnapshot() {
+    private func applySnapshot(reloading reloadIds: Set<String> = []) {
         var snapshot = NSDiffableDataSourceSnapshot<String, String>()
         snapshot.appendSections([TranscriptListSection.main])
         // 防御：diffable 对重复 identifier 会**直接断言打死 App**。身份稳定是本设计的承诺，
@@ -663,6 +773,10 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
             rows = rows.filter { seen.contains($0.id) }
         }
         snapshot.appendItems(identifiers, toSection: TranscriptListSection.main)
+        // 身份不变但内容变了的行（流式增长、缺口三态、pending→sent）要 reload
+        // 才会重配 cell；同一事务里完成，不拆第二次提交。
+        let reloadable = reloadIds.intersection(identifiers)
+        if !reloadable.isEmpty { snapshot.reloadItems(Array(reloadable)) }
         dataSource.apply(snapshot, animatingDifferences: false)
     }
 

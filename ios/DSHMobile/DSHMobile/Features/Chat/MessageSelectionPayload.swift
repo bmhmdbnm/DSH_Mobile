@@ -22,7 +22,7 @@ extension TimelineItem {
             guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return ("工具 · \(invocation.name)", body, true)
 
-        case .reasoning, .notice, .turnDivider, .unknown:
+        case .reasoning, .notice, .turnDivider, .unknown, .gap:
             return nil
         }
     }

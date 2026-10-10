@@ -27,6 +27,20 @@ public struct TimelineItem: Identifiable, Sendable {
         case turnDivider(turn: Int, reason: String, duration: TimeInterval?)
         /// An event this build does not render, kept so nothing is silently lost.
         case unknown(type: String)
+        /// 缺口占位行（spec 009「缺口行的生命周期」/ tasks T014）：两段已加载
+        /// 区间之间、或窗口顶端之上的未水合范围。固定高度，身份 `gap:<start>-<end>`
+        /// 由区间集派生；补齐时整行被数据行原子替换，不原地变高。
+        case gap(start: Int, end: Int, status: GapStatus)
+    }
+
+    /// 缺口行的三态（与 SessionPipeline.GapRow.Status 一一对应）。
+    public enum GapStatus: Sendable, Equatable {
+        /// 正在拉取（spinner）。
+        case loading
+        /// 连续失败到上限（3 次），只能由读者点击重试。
+        case failed(retryable: Bool)
+        /// 已到最早（hasMore=false 或 clamped），永不显示成网络失败。
+        case exhausted
     }
 
     public let id: String
@@ -549,6 +563,43 @@ public struct ChatTimeline: Sendable {
     /// The seq of the topmost row, i.e. how far back the reader can scroll without
     /// a local read-back.
     public var firstSeq: Int? { items.first?.seq }
+
+    // MARK: - 缺口行（spec 009 / tasks T013/T014）
+
+    /// 造一行缺口占位项：身份 `gap:<start>-<end>`（与区间集派生一致，spec 009
+    /// 「缺口行的生命周期」），排序键取 `start`——缺口覆盖的 seq 区间里不存在
+    /// 数据行，所以不会与数据行撞键。
+    public static func gapItem(start: Int, end: Int, status: TimelineItem.GapStatus) -> TimelineItem {
+        TimelineItem(id: "gap:\(start)-\(end)", kind: .gap(start: start, end: end, status: status), seq: start)
+    }
+
+    /// 把「在飞」状态接回一棵刚重建的时间线（spec 009 tasks T013）：
+    /// 管道快照折叠出的只有下行记录；本地乐观回声（pending 用户消息）与
+    /// 流式气泡属于上行/在飞状态，重建时必须原样接回，否则每次快照 diff
+    /// 都会把它们抹掉。回声按身份去重——服务端确认回流后同一 id 的正式行
+    /// 已在折叠结果里，回声让位。
+    public mutating func restoreTransient(streaming: StreamingAttempt?, echoes: [TimelineItem]) {
+        self.streaming = streaming
+        for echo in echoes where !items.contains(where: { $0.id == echo.id }) {
+            items.append(echo)
+        }
+    }
+
+    /// 用一组新的缺口行替换现有缺口行（数据行不动）。
+    ///
+    /// 缺口是区间集的**派生量**：每次快照重建后整体重设，身份相同的行被更新
+    /// （spinner → 点击重试），消失的行被移除——与 008 宿主「删缺口行 + 插数据行
+    /// + 位移修正」一次事务的提交方式对齐（tasks T015）。
+    public mutating func setGaps(_ gaps: [TimelineItem]) {
+        items.removeAll { item in
+            if case .gap = item.kind { return true }
+            return false
+        }
+        for gap in gaps {
+            let index = items.firstIndex { $0.seq > gap.seq } ?? items.count
+            items.insert(gap, at: index)
+        }
+    }
 
     private mutating func reindexTools() {
         toolIndex.removeAll(keepingCapacity: true)

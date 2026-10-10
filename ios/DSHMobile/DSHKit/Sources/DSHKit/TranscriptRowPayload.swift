@@ -21,6 +21,8 @@ public struct TranscriptRowPayload {
         case reasoning
         case toolCall
         case notice
+        /// 缺口占位行（009）：回收只换载荷，占位高度不变。
+        case gap
     }
 
     public let id: String
@@ -83,6 +85,7 @@ public struct TranscriptRowPayload {
         case .reasoning: return .reasoning
         case .toolCall: return .toolCall
         case .notice: return .notice
+        case .gap: return .gap
         default: return .notice
         }
     }
