@@ -990,20 +990,16 @@ extension HostEventHub {
 
 
 extension RootView {
-    /// 本地历史的日常清理：7 天没打开就归档、超预算就按最久未打开淘汰。
+    /// 本地历史的启动期清理（T027：007 `TranscriptStore` 退役）。
     ///
-    /// 以前这两件事由 JSON 缓存的 `prune()` 在启动时做；换成 SQLite 之后语义不变、
-    /// 只是走新存储（spec 007 FR-034）。
+    /// 009 `MessageStore` 是纯缓存、没有 TTL/预算淘汰（取用失败即拉取兜底），
+    /// 所以日常清理只剩 DEBUG 探针的整库清空；附件磁盘缓存的 `prune()`
+    /// 仍在调用点照旧执行。
     static func housekeepTranscriptStore() async {
-        let store = TranscriptStore()
         #if DEBUG
-        if ProbeVariants.clearTranscriptStore {
+        if ProbeVariants.clearTranscriptStore, let store = try? MessageStore() {
             try? await store.clearAll()
-            return
         }
         #endif
-        _ = try? await store.evictExpired()
-        _ = try? await store.enforceBudget()
-        await store.close()
     }
 }

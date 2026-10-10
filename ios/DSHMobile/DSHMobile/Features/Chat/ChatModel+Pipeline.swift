@@ -339,8 +339,19 @@ final class ChatPipelineBridge {
         }
         let upper = seq + leading
         let lower = max(1, upper - limit + 1)
+        // T027 修补（US8 报告的同构问题）：跳页只拉目标对齐页，目标与当前窗口
+        // 之间的缺口不在任何在飞拉取里，会停在 .loading 永远转圈——与 catchUp
+        // 的降级分支同构，同样置为可重试失败（点它才拉，符合跳页省流量语义）。
+        let windowOldest = records.keys.min()
+        let windowNewest = records.keys.max()
         async let landed = waitForRebaseRow(seq: seq)
         _ = try? await session.records(in: lower...upper, priority: .jump)
+        if let windowOldest, upper + 1 <= windowOldest - 1 {
+            await session.abandonGap((upper + 1)...(windowOldest - 1))
+        }
+        if let windowNewest, windowNewest + 1 <= lower - 1 {
+            await session.abandonGap((windowNewest + 1)...(lower - 1))
+        }
         return await landed
     }
 

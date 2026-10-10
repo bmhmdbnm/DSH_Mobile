@@ -25,8 +25,4 @@ final class PathSlugTests: XCTestCase {
         XCTAssertEqual(PathSlug.slug(String(repeating: "a", count: 400)).count, 120)
     }
 
-    func testTheThreeCachesShareOneRuleWhileTheOldTypeIsRetired() {
-        XCTAssertEqual(SessionTranscriptCache.slug("a/b"), PathSlug.slug("a/b"))
-        XCTAssertEqual(TranscriptStore.slug("a/b"), PathSlug.slug("a/b"))
-    }
 }

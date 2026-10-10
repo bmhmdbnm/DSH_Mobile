@@ -168,12 +168,17 @@ final class ChatModel {
     /// `searchItems` 的结果缓存，键是"缓冲条数 + 时间线条数"。
     private var cachedSearchItems: (key: String, items: [TimelineItem])?
 
-    /// 转写尾部的落盘缓存（每个"电脑 + 会话"一份）。
+    /// 转写尾部的落盘层（T027：007 `TranscriptStore` 退役，统一到 009 `MessageStore`）。
     ///
     /// 内存缓存让"再进同一个会话"很快，但 App 一冷启动就归零，于是打开会话仍然是
     /// 空白 + 转圈。落盘的是**原始记录**的尾部——和 `session/follow` 打开时给的快照
     /// 是同一种东西，所以恢复路径与合并路径都复用现成逻辑。
-    private let transcriptStore = TranscriptStore()
+    /// 磁盘层缺位（建库失败）时读写一律空转，行为退化为"只有内存缓存"。
+    private var messageStore: MessageStore? { messageLayer?.store }
+    /// 落盘尾部保留多少条（沿用 007 `SessionTranscriptCache.maxRecords` 的值）。
+    private static let tailRecordLimit = 200
+    /// 搜索缓冲一次从磁盘读多少条（沿用 007 `maxOlderRecords` 的值）。
+    private static let searchBufferDiskLimit = 3000
     /// Writes are chained instead of fired in parallel: an actor serializes them,
     /// but *creation* order is what keeps "the newer page wins" true. Awaiting the
     /// chain is how a flush is expressed.
@@ -341,7 +346,7 @@ final class ChatModel {
             phase = .ready
             scrollSignal += 1
         } else if let scope = sessionScope,
-                  let stored = await loadColdStartTail(scope: scope, sessionId: key) {
+                  let stored = await loadStoredTail(scope: scope, sessionId: key) {
             // 窗口按"本地落后 host 多少"来定：落后很多时要更大的窗口，否则
             // 快照接不上本地尾部，时间线中间会留一个永远补不上的洞。
             syncPlan = TranscriptSyncPlan.plan(
@@ -461,18 +466,19 @@ final class ChatModel {
         // 窗口恰好覆盖了缓冲时（正常且更理想），旧启发式会什么都找不到，冷启动后
         // "只看我的提问"就只剩窗口那一段（T069 实测）。
         var usable: [SessionRecord] = []
-        if let raw = try? await transcriptStore.meta(Self.searchRangeKey(sessionId), scope: scope),
+        if let store = messageStore,
+           let raw = try? await store.meta(Self.searchRangeKey(sessionId), scope: scope),
            let range = Self.parseSearchRange(raw) {
-            let stored = (try? await transcriptStore.loadWindow(
-                scope: scope, sessionId: sessionId, before: range.newest + 1,
-                limit: SessionTranscriptCache.maxOlderRecords)) ?? []
+            let stored = (try? await store.windowBefore(
+                scope: scope, sessionId: sessionId, seq: range.newest + 1,
+                limit: Self.searchBufferDiskLimit)) ?? []
             usable = stored.filter { $0.event.seq >= range.oldest && $0.event.seq <= range.newest }
         }
-        if usable.isEmpty {
+        if usable.isEmpty, let store = messageStore {
             let windowOldest = oldestSeq ?? Int.max
-            let stored = (try? await transcriptStore.loadWindow(
-                scope: scope, sessionId: sessionId, before: windowOldest,
-                limit: SessionTranscriptCache.maxOlderRecords)) ?? []
+            let stored = (try? await store.windowBefore(
+                scope: scope, sessionId: sessionId, seq: windowOldest,
+                limit: Self.searchBufferDiskLimit)) ?? []
             usable = stored.filter { $0.event.seq < windowOldest }
         }
         guard !usable.isEmpty else {
@@ -577,8 +583,8 @@ final class ChatModel {
         }
         guard let sessionId = session?.sessionId, let scope = sessionScope else { return nil }
         let before = max(0, seq + leading)
-        var records = (try? await transcriptStore.loadWindow(
-            scope: scope, sessionId: sessionId, before: before, limit: limit)) ?? []
+        var records = (try? await messageStore?.windowBefore(
+            scope: scope, sessionId: sessionId, seq: before, limit: limit)) ?? []
         var source = "disk"
         if records.isEmpty, let fetcher = makePageFetcher(pageSize: limit),
            let page = try? await fetcher.page(before: before) {
@@ -652,13 +658,15 @@ final class ChatModel {
 
     /// 按 seq 把行内容从**本地库**取回来（spec 008 的 US3 / SC-004：水合 1 秒内、0 网络）。
     ///
-    /// 只读 `TranscriptStore`，绝不碰 `TranscriptPageFetcher`——水合不该产生任何请求。
+    /// 只读磁盘层（T027 起为 `MessageStore`），绝不碰 `TranscriptPageFetcher`——
+    /// 水合不该产生任何请求。
     func items(forSeqs seqs: [Int]) async -> [TimelineItem] {
-        guard let sessionId = session?.sessionId, let scope = sessionScope, !seqs.isEmpty else { return [] }
+        guard let sessionId = session?.sessionId, let scope = sessionScope,
+              let store = messageStore, !seqs.isEmpty else { return [] }
         let newest = (seqs.max() ?? 0) + 1
         let oldest = seqs.min() ?? 0
-        let records = (try? await transcriptStore.loadWindow(
-            scope: scope, sessionId: sessionId, before: newest,
+        let records = (try? await store.windowBefore(
+            scope: scope, sessionId: sessionId, seq: newest,
             limit: max(Self.hitContextLimit, newest - oldest + 1))) ?? []
         let wanted = Set(seqs)
         var timeline = ChatTimeline()
@@ -671,11 +679,12 @@ final class ChatModel {
     /// 把命中所在的那一段从本地库读回时间线（0 网络），这样命中才有行可指。
     private func loadContextForHits(_ hits: [HistorySearchHit]) async {
         guard let sessionId = session?.sessionId, let scope = sessionScope,
+              let store = messageStore,
               let lowest = hits.map(\.seq).min() else { return }
         let before = max(0, lowest + 1)
         guard (timeline.firstSeq ?? Int.max) > lowest else { return }
-        let records = (try? await transcriptStore.loadWindow(
-            scope: scope, sessionId: sessionId, before: before,
+        let records = (try? await store.windowBefore(
+            scope: scope, sessionId: sessionId, seq: before,
             limit: Self.hitContextLimit)) ?? []
         guard !records.isEmpty else { return }
         let change = timeline.prepend(older: records)
@@ -696,8 +705,8 @@ final class ChatModel {
         let newest = searchRecords.last?.event.seq ?? 0
         let key = Self.searchRangeKey(sessionId)
         let value = "\(oldest):\(newest)"
-        enqueueWrite { [transcriptStore] in
-            try? await transcriptStore.setMeta(key, value, scope: scope)
+        enqueueWrite { [store = messageStore] in
+            try? await store?.setMeta(key, value, scope: scope)
         }
     }
 
@@ -764,14 +773,15 @@ final class ChatModel {
     /// 600 条 ≈ 300 行：足够填满一屏并留出上下滑动的余量，又不至于把上万条的会话一次性装进内存。
     private static let restoreRecordLimit = 600
 
-    /// internal：009 优先的包装（loadColdStartTail）在 ChatModel+ColdStart.swift。
+    /// 冷启动尾部恢复（T027 起直接读 009 `MessageStore`：session_state + 最新页）。
     func loadStoredTail(scope: String, sessionId: String) async -> StoredTail? {
-        guard let state = try? await transcriptStore.state(scope: scope, sessionId: sessionId) else { return nil }
-        let records = (try? await transcriptStore.loadWindow(
-            scope: scope, sessionId: sessionId, before: Int.max,
-            limit: min(SessionTranscriptCache.maxRecords, Self.restoreRecordLimit))) ?? []
+        guard let store = messageStore,
+              let state = try? await store.sessionState(scope: scope, sessionId: sessionId)
+        else { return nil }
+        let records = (try? await store.windowBefore(
+            scope: scope, sessionId: sessionId, seq: Int.max,
+            limit: min(Self.tailRecordLimit, Self.restoreRecordLimit))) ?? []
         guard !records.isEmpty else { return nil }
-        try? await transcriptStore.touch(scope: scope, sessionId: sessionId)
         // `state.oldestSeq` 是"库里存的最老一条"；恢复被限流之后，时间线的最老一条
         // 可能比它新——pager 必须按**实际恢复**的那一条算，否则会以为"更早的都在手上"。
         let restoredOldest = records.first?.event.seq ?? state.oldestSeq
@@ -810,7 +820,7 @@ final class ChatModel {
         cache.removeValue(forKey: sessionId)
         cacheOrder.removeAll { $0 == sessionId }
         let scope = sessionScope ?? scopeId
-        enqueueWrite { [transcriptStore] in try? await transcriptStore.clear(scope: scope, sessionId: sessionId) }
+        enqueueWrite { [store = messageStore] in try? await store?.clear(scope: scope, sessionId: sessionId) }
     }
 
     /// 当前会话属于哪台电脑——缓存按它分目录，换电脑不会串味。
@@ -825,8 +835,8 @@ final class ChatModel {
         var bySeq = Dictionary(recentRecords.map { ($0.event.seq, $0) }, uniquingKeysWith: { _, new in new })
         for record in incoming { bySeq[record.event.seq] = record }
         var merged = bySeq.values.sorted { $0.event.seq < $1.event.seq }
-        if merged.count > SessionTranscriptCache.maxRecords {
-            merged.removeFirst(merged.count - SessionTranscriptCache.maxRecords)
+        if merged.count > Self.tailRecordLimit {
+            merged.removeFirst(merged.count - Self.tailRecordLimit)
         }
         if merged.count > recentRecords.count { unsavedRecords += merged.count - recentRecords.count }
         recentRecords = merged
@@ -845,13 +855,16 @@ final class ChatModel {
         guard force || due else { return }
         lastDiskSave = now
         unsavedRecords = 0
+        // 管道接管渲染时，下行记录已由 SessionPipeline 经 PendingWriteQueue 落进
+        // 同一个 MessageStore（T027 统一落库），这里再写一遍是重复劳动，跳过。
+        guard pipelineBridge == nil else { return }
         ViewportProbe.note("transcript.saved", [
             "session": sessionId,
             "records": String(recentRecords.count),
             "lastSeq": String(recentRecords.last?.event.seq ?? -1),
         ], force: true)
         // 写的是**这一段记录**：库里的游标由写入的 seq 推导，不信调用方传的值。
-        enqueueAppend(scope: scope, sessionId: sessionId, records: recentRecords, openedAt: now)
+        enqueueAppend(scope: scope, sessionId: sessionId, records: recentRecords)
     }
 
     /// 立刻落盘（退到后台、离开会话时用：那些时刻之后进程可能就没了）。
@@ -864,14 +877,12 @@ final class ChatModel {
         await writeChain?.value
     }
 
-    private func enqueueAppend(scope: String, sessionId: String, records: [SessionRecord],
-                               openedAt: Date? = nil) {
+    private func enqueueAppend(scope: String, sessionId: String, records: [SessionRecord]) {
         guard !records.isEmpty else { return }
-        let hasMore = hostHasMore
-        let when = openedAt ?? Date()
-        enqueueWrite { [transcriptStore] in
-            try? await transcriptStore.append(scope: scope, sessionId: sessionId, records: records,
-                                              hasMore: hasMore, openedAt: when)
+        enqueueWrite { [store = messageStore] in
+            try? await store?.applyWrites([
+                .upsertRecords(scope: scope, sessionId: sessionId, records: records),
+            ])
         }
     }
 
@@ -1226,10 +1237,11 @@ final class ChatModel {
     /// means "do not call the host".
     private func backfillFromStore() async -> Bool {
         guard let sessionId = session?.sessionId, let scope = sessionScope,
+              let store = messageStore,
               let firstRow = timeline.firstSeq,
               let from = oldestSeq, from < firstRow else { return false }
-        let records = (try? await transcriptStore.loadWindow(
-            scope: scope, sessionId: sessionId, before: firstRow,
+        let records = (try? await store.windowBefore(
+            scope: scope, sessionId: sessionId, seq: firstRow,
             limit: Self.windowBackfillLimit)) ?? []
         let older = records.filter { $0.event.seq < firstRow }
         guard !older.isEmpty else { return false }
@@ -1415,7 +1427,7 @@ final class ChatModel {
     }
 
     /// 搜索缓冲一次从本地读多少条。
-    private static let SessionTranscriptStoreSearchLimit = 300
+    private static let localSearchReadLimit = 300
     /// 为一条命中补上下文时读多少条（命中要能落到某一个已加载的行上）。
     private static let hitContextLimit = 60
     /// 行载荷预算（spec 008 的契约默认值：32MB）。DEBUG 下可被探针压小，
@@ -1500,9 +1512,10 @@ final class ChatModel {
         defer { isExtendingSearch = false }
         // 先看本地：搜索缓冲要的是"更早的一段"，本地库通常就有（还能省一次往返）。
         if let scope = sessionScope, let sessionId = session?.sessionId,
-           let local = try? await transcriptStore.loadWindow(
-               scope: scope, sessionId: sessionId, before: from,
-               limit: Self.SessionTranscriptStoreSearchLimit) {
+           let store = messageStore,
+           let local = try? await store.windowBefore(
+               scope: scope, sessionId: sessionId, seq: from,
+               limit: Self.localSearchReadLimit) {
             let fresh = local.filter { $0.event.seq < from }
             if !fresh.isEmpty {
                 searchRecords.insert(contentsOf: fresh, at: 0)
