@@ -62,8 +62,9 @@ final class MessageLayer {
         }
         guard let store, pipeline == nil else { return }
         let addresses = self.addresses
-        // hotLimit 暂不裁剪：热窗口裁剪回看是 T026 的事（水合空白带要走缺口行
-        // 占位，US2 只换渲染数据源）。给足上限让淘汰在 US2 路径上永不触发。
+        // T026：热窗口按 spec 裁决的 500 条裁剪（US2 期间为避免淘汰后回看
+        // 静默丢行临时放宽到 5000；空白带根因——磁盘水合不发 diff——已在
+        // SessionPipeline 修复，这里调回预算值）。
         pipeline = MessagePipeline(
             store: store,
             fetchFactory: { ref in
@@ -107,7 +108,7 @@ final class MessageLayer {
                     return message.isFromHuman && message.rpcId == clientId.uuidString
                 }
             },
-            hotLimit: 5000
+            hotLimit: 500
         )
     }
 

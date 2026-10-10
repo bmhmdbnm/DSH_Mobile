@@ -295,6 +295,77 @@ final class SessionPipelineTests: XCTestCase {
         XCTAssertEqual(requests, 3)
     }
 
+    // MARK: - T026：磁盘水合发 diff + 锚点定向淘汰
+
+    /// 热窗口淘汰后回看：区间集仍声称覆盖（磁盘有），读盘补回后必须发 diff，
+    /// 否则订阅方永远看不到这段——US2 遗留的静默空白带（hotLimit 被迫调到
+    /// 5000 的根因）。同时验证锚点淘汰：留下读者正在看的老段，丢最远端。
+    func testDiskHydrationAfterEvictionEmitsDiff() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try MessageStore(path: directory.appendingPathComponent("test.sqlite3"))
+        // 预置磁盘 1...100（模拟此前会话落库）。
+        try await store.applyWrites([.upsertRecords(
+            scope: "mac", sessionId: "s1", records: (1...100).map { record($0) })])
+        let stub = stub!
+        let pipeline = SessionPipeline(
+            scope: "mac", sessionId: "s1", store: store,
+            fetch: { range in try await stub.fetch(range) },
+            now: { 1000 }, pageSize: 50, hotLimit: 60,
+            initialRanges: RangeIndex(spans: [RangeIndex.Span(1, 100)]))
+        // 热窗口只持有最新 60（模拟淘汰后的稳态）。
+        for seq in 41...100 { await pipeline.apply(event: record(seq).event) }
+        var snapshot = await pipeline.snapshot()
+        XCTAssertEqual(snapshot.records.map(\.event.seq), Array(41...100))
+
+        let diffs = await pipeline.diffs()
+        var iterator = diffs.makeAsyncIterator()
+        // 回看到被裁段：区间命中 → 磁盘水合（零网络）→ 必须发 diff。
+        let records = try await pipeline.records(in: 1...40)
+        XCTAssertEqual(records.map(\.event.seq), Array(1...40))
+        let diff = await iterator.next()
+        XCTAssertEqual(diff?.inserted.map(\.event.seq), Array(1...40))
+        // 锚点（20）靠近老端：淘汰丢最远的新端 61...100，不是正在读的段。
+        XCTAssertEqual(diff?.removed, Array(61...100))
+        snapshot = await pipeline.snapshot()
+        XCTAssertEqual(snapshot.records.map(\.event.seq), Array(1...60))
+        // 区间集不受内存淘汰影响（磁盘兜底语义不变）。
+        let ranges = await pipeline.ranges
+        XCTAssertEqual(ranges.spans, [RangeIndex.Span(1, 100)])
+        // 全程零网络。
+        let requests = await stub.allRequests()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    // MARK: - T026：降级跳转的僵尸缺口
+
+    /// >5 页降级直跳最新页后，被丢弃的中间段没有在任何在飞拉取里，
+    /// 不能停在 .loading 永远转圈（US3 遗留）：置为可重试失败，不发网络；
+    /// 用户点重试才真拉，缺口随后消亡。
+    func testAbandonedGapTurnsRetryableAndWaitsForUserRetry() async throws {
+        let pipeline = makePipeline()
+        for seq in 1...50 { await pipeline.apply(event: record(seq).event) }
+        for seq in 101...150 { await pipeline.apply(event: record(seq).event) }
+
+        await pipeline.abandonGap(51...100)
+        var snapshot = await pipeline.snapshot()
+        XCTAssertEqual(snapshot.gaps.map(\.id), ["gap:51-100"])
+        XCTAssertEqual(snapshot.gaps.first?.status, .failed(retryable: true))
+        // 省流量语义：丢弃中间段不得自动发网络。
+        var requests = await stub.allRequests()
+        XCTAssertTrue(requests.isEmpty)
+
+        // 用户点「点击重试」：清计数后真拉，缺口消亡。
+        await stub.set(51...100, .page(page(51...100)))
+        try await pipeline.retry(range: 51...60)
+        snapshot = await pipeline.snapshot()
+        XCTAssertTrue(snapshot.gaps.isEmpty)
+        XCTAssertEqual(snapshot.records.count, 150)
+        requests = await stub.allRequests()
+        XCTAssertEqual(requests, [51...100])
+    }
+
     // MARK: - 预取瀑布
 
     func testPrefetchTriggersWithinOnePageOfCoverageEdge() async throws {

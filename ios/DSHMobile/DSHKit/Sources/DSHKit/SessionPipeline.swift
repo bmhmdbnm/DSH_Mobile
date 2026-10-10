@@ -84,7 +84,7 @@ public actor SessionPipeline {
 
     public let scope: String
     public let sessionId: String
-    private let pageSize: Int
+    let pageSize: Int // internal：+Paging 扩展（页对齐工具）要用
     private let hotLimit: Int
     private let store: MessageStore?
     private let fetch: PageFetch
@@ -105,7 +105,8 @@ public actor SessionPipeline {
     private var writes = PendingWriteQueue<Int, MessageStore.RecordChange>()
 
     /// 每页连续失败次数；≥ maxRetries 的缺口转 retryable。
-    private var failureCounts: [Int: Int] = [:]
+    /// internal：gap 派生（+Paging 扩展）要读。
+    var failureCounts: [Int: Int] = [:]
     /// 拉空（服务端尚无新数据）的页：避免预取瀑布反复打同一页。
     private var knownEmptyPages: Set<Int> = []
     /// 已到顶：只有 hasMore=false 或 clamped 才置位（spec 可见性兜底）。
@@ -122,7 +123,7 @@ public actor SessionPipeline {
     // diff 广播（多订阅者：MessagePipeline 的泵 + 测试各拿一条流）。
     private var diffContinuations: [UUID: AsyncStream<Diff>.Continuation] = [:]
 
-    private static let maxRetries = 3
+    static let maxRetries = 3 // internal：gap 派生（+Paging 扩展）要读
 
     public init(
         scope: String,
@@ -211,35 +212,15 @@ public actor SessionPipeline {
         }
 
         // ② 命中部分：热窗口优先，缺的读盘；盘也读不出的并入缺口转网络。
-        if let store, !ranges.isEmpty {
-            let coveredSpans = ranges.spans.filter { $0.end >= range.lowerBound && $0.start <= range.upperBound }
-            for span in coveredSpans {
-                let from = max(span.start, range.lowerBound)
-                let to = min(span.end, range.upperBound)
-                let absent = (from...to).filter { hotWindow[$0] == nil }.sorted()
-                guard !absent.isEmpty else { continue }
-                let diskRecords = (try? await store.records(
-                    scope: scope, sessionId: sessionId, in: from...to)) ?? []
-                var found = Set<Int>()
-                for record in diskRecords where record.event.seq >= from && record.event.seq <= to {
-                    mergeIntoHotWindow(record)
-                    found.insert(record.event.seq)
-                }
-                // 磁盘短收：把连续的空洞段并入 missing，走同一条网络补齐路径。
-                var runStart: Int?
-                var previous = Int.min
-                for seq in absent where !found.contains(seq) {
-                    if runStart == nil { runStart = seq }
-                    if seq != previous + 1, let start = runStart, start < seq {
-                        missing.append(RangeIndex.Span(start, previous))
-                        runStart = seq
-                    }
-                    previous = seq
-                }
-                if let start = runStart {
-                    missing.append(RangeIndex.Span(start, previous))
-                }
-            }
+        //    磁盘水合的记录必须发 diff（T026 修复 US2 遗留：淘汰后回看，
+        //    区间集仍声称覆盖、读盘合并了却不广播，订阅方永远看不到——
+        //        静默空白带的根因）。
+        let hydrated = await hydrateCoveredSpans(of: range, missing: &missing)
+        if !hydrated.isEmpty {
+            var diff = Diff(inserted: hydrated)
+            diff.removed = evictIfNeeded(anchor: Self.anchor(of: range))
+            diff.gaps = currentGaps()
+            emit(diff)
         }
 
         // ③ 缺口按对齐页拉网络（含整段缺失/跳转型完全不命中）。
@@ -251,6 +232,49 @@ public actor SessionPipeline {
         let result = range.compactMap { hotWindow[$0] }
         triggerPrefetch(around: range)
         return result
+    }
+
+    /// 区间集声称覆盖、但热窗口已淘汰的段：读盘补回热窗口。
+    /// 返回本次水合的记录（调用方据此发 diff）；磁盘短收的连续空洞
+    /// 并入 `missing`，走同一条网络补齐路径（磁盘只是缓存，崩丢由
+    /// 「取用失败即拉取」兜底，区间集不回删）。
+    private func hydrateCoveredSpans(
+        of range: ClosedRange<Int>, missing: inout [RangeIndex.Span]
+    ) async -> [SessionRecord] {
+        guard let store, !ranges.isEmpty else { return [] }
+        var hydrated: [SessionRecord] = []
+        let coveredSpans = ranges.spans.filter {
+            $0.end >= range.lowerBound && $0.start <= range.upperBound
+        }
+        for span in coveredSpans {
+            let from = max(span.start, range.lowerBound)
+            let to = min(span.end, range.upperBound)
+            let absent = (from...to).filter { hotWindow[$0] == nil }.sorted()
+            guard !absent.isEmpty else { continue }
+            let diskRecords = (try? await store.records(
+                scope: scope, sessionId: sessionId, in: from...to)) ?? []
+            var found = Set<Int>()
+            for record in diskRecords where record.event.seq >= from && record.event.seq <= to {
+                mergeIntoHotWindow(record)
+                found.insert(record.event.seq)
+                hydrated.append(record)
+            }
+            // 磁盘短收：把连续的空洞段并入 missing。
+            var runStart: Int?
+            var previous = Int.min
+            for seq in absent where !found.contains(seq) {
+                if runStart == nil { runStart = seq }
+                if seq != previous + 1, let start = runStart, start < seq {
+                    missing.append(RangeIndex.Span(start, previous))
+                    runStart = seq
+                }
+                previous = seq
+            }
+            if let start = runStart {
+                missing.append(RangeIndex.Span(start, previous))
+            }
+        }
+        return hydrated
     }
 
     /// 缺口 → 对齐页集合，逐页拉取并合并。某页失败不阻塞其它页。
@@ -338,7 +362,7 @@ public actor SessionPipeline {
                          key: pageRecords.last!.event.seq)
             knownEmptyPages.removeAll()
             if isBottomPage, page.hasMore == false || page.clamped { topExhausted = true }
-            diff.removed = evictIfNeeded()
+            diff.removed = evictIfNeeded(anchor: Self.anchor(of: requested))
         }
         diff.gaps = currentGaps()
         emit(diff)
@@ -444,51 +468,27 @@ public actor SessionPipeline {
         hotWindow[seq] = record
     }
 
-    /// 热窗口超上限淘汰最老（只影响内存，磁盘由落库队列负责）。
+    /// 热窗口超上限淘汰（只影响内存，磁盘由落库队列负责）。
+    /// 默认丢最老（尾部到达，spec「超出丢最老已读」）；给锚点（回看水合）
+    /// 时丢离锚点更远的一端——回看时把正在读的段抽走会立刻触发再水合，
+    /// 形成「水合→淘汰→空白」死循环（T026）。
     /// 返回被淘汰的 seq（diff 的 removed）。
-    func evictIfNeeded() -> [Int] {
+    func evictIfNeeded(anchor: Int? = nil) -> [Int] {
         guard hotOrder.count > hotLimit else { return [] }
         hotOrder.sort()
-        let evicted = Array(hotOrder.prefix(hotOrder.count - hotLimit))
-        hotOrder.removeFirst(evicted.count)
+        let excess = hotOrder.count - hotLimit
+        let evictOldest: Bool
+        if let anchor, let first = hotOrder.first, let last = hotOrder.last {
+            evictOldest = anchor - first >= last - anchor
+        } else {
+            evictOldest = true
+        }
+        let evicted = evictOldest ? Array(hotOrder.prefix(excess)) : Array(hotOrder.suffix(excess))
+        if evictOldest { hotOrder.removeFirst(excess) } else { hotOrder.removeLast(excess) }
         for seq in evicted { hotWindow.removeValue(forKey: seq) }
         return evicted
     }
 
     /// 缺口行由区间集派生（spec「缺口行的生命周期」）：窗口 = 最老…最新。
-    func currentGaps() -> [GapRow] {
-        guard let oldest = ranges.oldest, let newest = ranges.newest, oldest <= newest else { return [] }
-        return ranges.gaps(within: oldest...newest).map { span in
-            GapRow(start: span.start, end: span.end, status: gapStatus(for: span))
-        }
-    }
-
-    private func gapStatus(for span: RangeIndex.Span) -> GapRow.Status {
-        // 该缺口覆盖的对齐页里有到 3 次失败的 → retryable。
-        let firstPage = alignedPages(covering: span).first
-        if let key = firstPage?.lowerBound, failureCounts[key, default: 0] >= Self.maxRetries {
-            return .failed(retryable: true)
-        }
-        return .loading
-    }
-
-    /// 覆盖某缺口的对齐页集合（页大小对齐，spec §6 页边界）。
-    private func alignedPages(covering span: RangeIndex.Span) -> [ClosedRange<Int>] {
-        var pages: [ClosedRange<Int>] = []
-        var start = alignedStart(for: span.start)
-        while start <= span.end {
-            pages.append(start...(start + pageSize - 1))
-            start += pageSize
-        }
-        return pages
-    }
-
-    private func alignedPage(containing seq: Int) -> ClosedRange<Int> {
-        let start = alignedStart(for: seq)
-        return start...(start + pageSize - 1)
-    }
-
-    private func alignedStart(for seq: Int) -> Int {
-        max(1, ((max(1, seq) - 1) / pageSize) * pageSize + 1)
-    }
+    /// 实现在 SessionPipeline+Paging.swift（主文件 500 行上限）。
 }

@@ -422,6 +422,12 @@ final class ChatPipelineBridge {
         if missing > Self.pageSize * Self.catchUpPageBudget {
             let lower = max(1, lastSeq - Self.pageSize + 1)
             _ = try? await session.records(in: lower...lastSeq, priority: .jump)
+            // T026 修复 US3 遗留：降级丢弃的中间段不在任何在飞拉取里，
+            // 停在 .loading 永远转圈。置为可重试失败——用户点它才拉，
+            // 符合「丢弃中间段」的省流量语义（spec 场景 7）。
+            if localNewest + 1 <= lower - 1 {
+                await session.abandonGap((localNewest + 1)...(lower - 1))
+            }
         } else {
             _ = try? await session.records(in: (localNewest + 1)...lastSeq, priority: .userVisible)
         }
