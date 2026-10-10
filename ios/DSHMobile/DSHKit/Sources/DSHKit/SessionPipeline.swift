@@ -88,14 +88,15 @@ public actor SessionPipeline {
     private let hotLimit: Int
     private let store: MessageStore?
     private let fetch: PageFetch
-    private let frameTick: @Sendable () async -> Void
+    let frameTick: @Sendable () async -> Void
     private let now: @Sendable () -> TimeInterval
 
     /// 有效连续区间集：本地（热窗口 + 磁盘）确定完整的范围。
     public private(set) var ranges = RangeIndex()
 
     /// 热窗口：[seq: 记录] + 有序索引，超出 hotLimit 淘汰最老（只影响内存）。
-    private var hotWindow: [Int: SessionRecord] = [:]
+    /// internal：流式半边（SessionPipeline+Streaming）要查行是否存在。
+    var hotWindow: [Int: SessionRecord] = [:]
     private var hotOrder: [Int] = []
 
     private var inFlight = InFlightPageTable<Int>()
@@ -113,14 +114,10 @@ public actor SessionPipeline {
     /// 落库回调：队列 drain 的批次交给 MessageStore（盘写由上层异步消费）。
     private let flushWrites: @Sendable ([MessageStore.RecordChange]) -> Void
 
-    // 流式合并缓冲（attemptId → 累计文本）。
-    private struct StreamBuffer {
-        var seq: Int
-        var text: String
-        var dirty: Bool
-    }
-    private var streamBuffers: [String: StreamBuffer] = [:]
-    private var streamFlushScheduled = false
+    // 流式合并状态在 SessionPipeline+Streaming.swift（internal：同模块扩展可见，
+    // 并发安全仍由本 actor 保证，沿用 MessageStore 拆文件的先例）。
+    var streamBuffers: [String: StreamBuffer] = [:]
+    var streamFlushScheduled = false
 
     // diff 广播（多订阅者：MessagePipeline 的泵 + 测试各拿一条流）。
     private var diffContinuations: [UUID: AsyncStream<Diff>.Continuation] = [:]
@@ -168,7 +165,7 @@ public actor SessionPipeline {
         diffContinuations.removeValue(forKey: id)
     }
 
-    private func emit(_ diff: Diff) {
+    func emit(_ diff: Diff) {
         guard !diff.isEmpty || !diff.gaps.isEmpty else { return }
         for continuation in diffContinuations.values {
             continuation.yield(diff)
@@ -354,54 +351,7 @@ public actor SessionPipeline {
         emit(diff)
     }
 
-    /// 流式增量：先进缓冲，按帧节拍合并（tick 内多次只出一次 diff）。
-    public func apply(stream frame: AssistantStreamFrame) {
-        switch frame {
-        case .start(let attemptId, _, _, _, let startedAfterSeq):
-            streamBuffers[attemptId] = StreamBuffer(seq: startedAfterSeq + 1, text: "", dirty: false)
-        case .chunk(let attemptId, _, _, _, let chunk):
-            guard var buffer = streamBuffers[attemptId], let text = chunk.text else { return }
-            buffer.text += text
-            buffer.dirty = true
-            streamBuffers[attemptId] = buffer
-            scheduleStreamFlush()
-        case .end(let attemptId, _, _, _):
-            // 提交的 assistant/message 事件会随后到达并覆盖；缓冲直接丢。
-            streamBuffers.removeValue(forKey: attemptId)
-        case .unknown:
-            break
-        }
-    }
-
-    private func scheduleStreamFlush() {
-        guard !streamFlushScheduled else { return }
-        streamFlushScheduled = true
-        Task { [frameTick] in
-            await frameTick()
-            self.flushStreams()
-        }
-    }
-
-    /// 一帧一次：把 tick 内累计的所有流式文本合并成一次状态变更。
-    private func flushStreams() {
-        streamFlushScheduled = false
-        var diff = Diff()
-        for (attemptId, var buffer) in streamBuffers where buffer.dirty {
-            buffer.dirty = false
-            streamBuffers[attemptId] = buffer
-            let record = SessionRecord(event: SessionEvent(
-                type: "assistant/message", seq: buffer.seq, time: nil,
-                data: .object(["text": .string(buffer.text)]), surfaceOp: nil))
-            if hotWindow[buffer.seq] == nil { diff.inserted.append(record) } else { diff.updated.append(record) }
-            mergeIntoHotWindow(record)
-            enqueueWrite(.upsertRecords(scope: scope, sessionId: sessionId, records: [record]),
-                         key: buffer.seq)
-        }
-        guard !diff.isEmpty else { return }
-        diff.removed = evictIfNeeded()
-        diff.gaps = currentGaps()
-        emit(diff)
-    }
+    /// 流式增量在 SessionPipeline+Streaming.swift（文件按职责拆分，见该文件头注）。
 
     // MARK: - 上行（MessagePipeline 的 send 走这里落库排队）
 
@@ -451,7 +401,7 @@ public actor SessionPipeline {
 
     // MARK: - 内部工具
 
-    private func mergeIntoHotWindow(_ record: SessionRecord) {
+    func mergeIntoHotWindow(_ record: SessionRecord) {
         let seq = record.event.seq
         if hotWindow[seq] == nil { hotOrder.append(seq) }
         hotWindow[seq] = record
@@ -459,7 +409,7 @@ public actor SessionPipeline {
 
     /// 热窗口超上限淘汰最老（只影响内存，磁盘由落库队列负责）。
     /// 返回被淘汰的 seq（diff 的 removed）。
-    private func evictIfNeeded() -> [Int] {
+    func evictIfNeeded() -> [Int] {
         guard hotOrder.count > hotLimit else { return [] }
         hotOrder.sort()
         let evicted = Array(hotOrder.prefix(hotOrder.count - hotLimit))
@@ -469,7 +419,7 @@ public actor SessionPipeline {
     }
 
     /// 缺口行由区间集派生（spec「缺口行的生命周期」）：窗口 = 最老…最新。
-    private func currentGaps() -> [GapRow] {
+    func currentGaps() -> [GapRow] {
         guard let oldest = ranges.oldest, let newest = ranges.newest, oldest <= newest else { return [] }
         return ranges.gaps(within: oldest...newest).map { span in
             GapRow(start: span.start, end: span.end, status: gapStatus(for: span))
