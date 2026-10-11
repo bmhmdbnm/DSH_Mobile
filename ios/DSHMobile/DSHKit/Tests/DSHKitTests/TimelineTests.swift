@@ -267,6 +267,73 @@ final class TimelineTests: XCTestCase {
         XCTAssertFalse(timeline.items[2].isStreaming)
     }
 
+    /// 慢闸场景⑤（run 20261011-105530）根因：思考先行、正文后到的流式里，
+    /// provisional 记录折叠时正文块为空被跳过（Timeline.swift 335/343），
+    /// 时间线只有 reasoning 行。正文开始增长后，单行增量更新只能改到
+    /// reasoning 行（内容没变），却返回 true——桥据此走快进路、不再整树重折，
+    /// 正文行永远插不进来，画面冻结在 66pt 的思考行上。
+    /// 单行更新必须对「该有却没有的行」返回 false，让调用方回退整树重折。
+    func testStreamingUpdateReturnsFalseWhenTextRowNotYetFolded() throws {
+        // 思考先行：provisional 记录的正文块为空（折叠跳过），只有 reasoning 行。
+        let reasoningOnly = try event("""
+        {"type":"assistant/message","seq":41,"time":1789276359000,
+         "data":{"turn":1,"step":1,"stream":true,
+                  "message":{"role":"assistant","content":[
+                    {"type":"reasoning","text":"想了一段"},
+                    {"type":"text","text":""}]}}}
+        """)
+        var timeline = ChatTimeline()
+        _ = timeline.apply(try userMessage(seq: 40, text: "问"))
+        _ = timeline.apply(reasoningOnly)
+        XCTAssertEqual(timeline.items.count, 2, "empty text block folds no row")
+        guard case .reasoning = timeline.items[1].kind else {
+            return XCTFail("expected the reasoning row only")
+        }
+
+        // 正文开始到达：该有 assistantText 行却没有 → 必须 false（回退重折），
+        // 不能靠「改到了 reasoning 行」假报成功。
+        XCTAssertFalse(
+            timeline.applyStreamingUpdate(seq: 41, text: "第一段正文", reasoning: "想了一段"),
+            "a missing text row must force the caller back to a full refold")
+        // reasoning 行不应被这次失败的更新改写。
+        guard case .reasoning(let reasoning) = timeline.items[1].kind else {
+            return XCTFail("reasoning row must survive")
+        }
+        XCTAssertEqual(reasoning, "想了一段")
+
+        // 对称情形：正文先行、思考后到，缺 reasoning 行同样要 false。
+        let textOnly = try event("""
+        {"type":"assistant/message","seq":51,"time":1789276360000,
+         "data":{"turn":1,"step":1,"stream":true,
+                  "message":{"role":"assistant","content":[
+                    {"type":"text","text":"正文半段"}]}}}
+        """)
+        var second = ChatTimeline()
+        _ = second.apply(try userMessage(seq: 50, text: "问"))
+        _ = second.apply(textOnly)
+        XCTAssertFalse(
+            second.applyStreamingUpdate(seq: 51, text: "正文半段", reasoning: "补到的思考"),
+            "a missing reasoning row must also force a full refold")
+
+        // 回退重折（管道下一轮 diff 会带来含正文的 provisional 记录）之后，
+        // 行齐了，快进路恢复 true 且只原地改写。
+        let grown = try event("""
+        {"type":"assistant/message","seq":41,"time":1789276361000,
+         "data":{"turn":1,"step":1,"stream":true,
+                  "message":{"role":"assistant","content":[
+                    {"type":"reasoning","text":"想了一段"},
+                    {"type":"text","text":"第一段正文"}]}}}
+        """)
+        _ = timeline.apply(grown)
+        XCTAssertEqual(timeline.items.count, 3, "refold materializes the text row")
+        XCTAssertTrue(timeline.applyStreamingUpdate(seq: 41, text: "第一段正文加长", reasoning: "想了一段"))
+        guard case .assistantText(let text) = timeline.items[2].kind else {
+            return XCTFail("expected the text row")
+        }
+        XCTAssertEqual(text, "第一段正文加长")
+        XCTAssertEqual(timeline.items.count, 3, "fast path must not add rows once rows exist")
+    }
+
     func testResetMarksInterruptedToolsAsFinished() throws {
         var timeline = ChatTimeline()
         let records = [
