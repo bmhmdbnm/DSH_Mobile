@@ -160,4 +160,24 @@ final class UserInputBackfillTests: XCTestCase {
         let syncedAfter = try await store.userInputsSyncedAt(scope: "mac", sessionId: "s1")
         XCTAssertNotNil(syncedAfter)
     }
+
+    /// 完整性标记的读侧契约（T036：「我问过的」本地路径按它判回退）：
+    /// 从未灌过的会话（含灌库进行中、降级跳过）读出来是 nil → 调用方回退
+    /// 连接器路径；灌全置标记 → 走本地零网络。
+    func testSyncMarkerGatesLocalReadPath() async throws {
+        let store = self.store!
+        // 从未灌过：nil（回退）。
+        var marker = try await store.userInputsSyncedAt(scope: "mac", sessionId: "s1")
+        XCTAssertNil(marker)
+        // 有数据但没灌全标记（例如灌库进行中的半成品）：仍是 nil。
+        try await store.applyWrites([
+            .upsertRecords(scope: "mac", sessionId: "s1", records: [makeRecord(10)]),
+        ])
+        marker = try await store.userInputsSyncedAt(scope: "mac", sessionId: "s1")
+        XCTAssertNil(marker)
+        // 灌全置标记：非 nil（走本地）。
+        try await store.setUserInputsSyncedAt(scope: "mac", sessionId: "s1", at: Date())
+        marker = try await store.userInputsSyncedAt(scope: "mac", sessionId: "s1")
+        XCTAssertNotNil(marker)
+    }
 }

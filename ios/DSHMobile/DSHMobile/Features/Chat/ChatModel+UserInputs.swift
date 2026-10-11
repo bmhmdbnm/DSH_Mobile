@@ -18,6 +18,11 @@ extension ChatModel {
               let scope = sessionScope,
               let sessionId = session?.sessionId
         else { return nil }
+        // 完整性闸门（data-model v3）：灌库串行进行期间本地只有最新窗口的几条，
+        // 拿它当全量会显示不全还谎报「已经读到最开头」（T036 慢闸抓出）。
+        // 未灌全回退连接器路径（能翻页拿全量），灌全后才走本地零网络。
+        guard (try? await store.userInputsSyncedAt(scope: scope, sessionId: sessionId)) != nil
+        else { return nil }
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let entries: [MessageStore.UserInputEntry]
         do {
@@ -43,12 +48,14 @@ extension ChatModel {
     }
 
     /// 记录正文：data.text 优先，blocks 拼接兜底（与 MessageStore.snippet 同一约定）。
+    /// 真实 user/message 的正文在 `data.content[]`（blocks 形态）——读错键会让
+    /// 本地列表整列丢光只剩 live 尾巴的几条（T036 慢闸抓出）。
     private static func snippet(of record: SessionRecord) -> String? {
         let data = record.event.data
         if let text = data["text"]?.stringValue, !text.isEmpty {
             return String(text.replacingOccurrences(of: "\n", with: " ").prefix(120))
         }
-        if let blocks = data["blocks"]?.arrayValue {
+        if let blocks = data["content"]?.arrayValue ?? data["blocks"]?.arrayValue {
             let joined = blocks.compactMap { $0["text"]?.stringValue }.joined(separator: " ")
             if !joined.isEmpty {
                 return String(joined.replacingOccurrences(of: "\n", with: " ").prefix(120))
