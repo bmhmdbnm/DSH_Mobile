@@ -61,6 +61,10 @@ export const SERVER_CAPABILITIES = [
   // session-search: it answers `_link/sessionFind` (in-session literal search). The
   // phone switches channels on these and falls back to `session/page` without them.
   'history-window', 'session-search',
+  // history-role-filter: `_link/sessionWindow` accepts `roles` (e.g. just the
+  // "me" role) and returns only matching records; seq cursor semantics are
+  // unchanged (spec 009 T031).
+  'history-role-filter',
 ]
 
 export function isHelloMethod(method) {

@@ -212,7 +212,7 @@ function fakeSearchQuery(log, { searchEvents } = {}) {
       return log
         .filter((event) => event.seq >= range.from && event.seq <= range.to)
         .filter((event) => String(event.data?.text ?? '').toLowerCase().includes(text.toLowerCase()))
-        .map((event) => ({ seq: event.seq, type: event.type, time: event.time, text: event.data?.text ?? '' }))
+        .map((event) => ({ seq: event.seq, type: event.type, time: event.time, text: event.data?.text ?? '', data: event.data }))
     },
     ...(searchEvents === undefined ? {} : { searchEvents }),
   }
@@ -324,4 +324,94 @@ test('sessionFind 无关键词又无 roles 仍然拒绝（没有范围的扫描�
   const result = await service.handle(FIND_METHOD, { address: ADDRESS, query: '' })
   assert.equal(result.ok, false)
   assert.equal(result.error.code, 'link/query-too-short')
+})
+
+// ---------------------------------------------------------------------------
+// spec 009 T031：roleOf 的 source 判定 + sessionWindow 的 roles 过滤
+// ---------------------------------------------------------------------------
+
+/// user/message 事件的三种来源：真用户（无 source，老数据）、插件注入、代理代发。
+function sourcedLog() {
+  const at = (seq, type, source) => ({
+    seq,
+    type,
+    time: 1_700_000_000_000 + seq,
+    data: { text: `event ${seq} needle`, ...(source === undefined ? {} : { source }) },
+  })
+  return [
+    at(0, 'user/message', undefined),                            // 老数据：me
+    at(1, 'user/message', { kind: 'plugin' }),                   // 插件注入：不算 me
+    at(2, 'user/message', { kind: 'user', rpcId: 'agent-42' }),  // 代理代发：不算 me
+    at(3, 'user/message', { kind: 'user', rpcId: 'rpc-7' }),     // 真用户：me
+    at(4, 'assistant/message', undefined),
+    at(5, 'user/message', { kind: 'system' }),                   // 系统注入：不算 me
+    at(6, 'user/message', { kind: 'user' }),                     // 真用户：me
+  ]
+}
+
+test('plugin 注入与 agent- 代发的 user/message 不算 me，缺省 source 的老数据算 me', async () => {
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeSearchQuery(sourcedLog()))
+  const result = await service.handle(FIND_METHOD, { ...FIND_ARGS, roles: ['me'], limit: 20, chunk: 40 })
+  assert.equal(result.ok, true)
+  const seqs = result.value.hits.map((hit) => hit.seq).sort((a, b) => a - b)
+  assert.deepEqual(seqs, [0, 3, 6], '只留真用户的提问')
+})
+
+test('roles 缺省时全文搜索仍能看到插件注入的消息', async () => {
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeSearchQuery(sourcedLog()))
+  const result = await service.handle(FIND_METHOD, { ...FIND_ARGS, limit: 20, chunk: 40 })
+  assert.equal(result.ok, true)
+  const seqs = result.value.hits.map((hit) => hit.seq)
+  assert.ok(seqs.includes(1) && seqs.includes(2) && seqs.includes(5), '不带 roles 不过滤')
+})
+
+test('sessionWindow 的 roles 过滤只改返回内容，不改 seq 边界', async () => {
+  // 0..29：seq%3===0 是真用户提问，其余是 assistant；过滤后一页 10 条跨 30 个 seq。
+  const log = makeLog(30)
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeQuery(log))
+  const page = await service.handle(WINDOW_METHOD, { address: ADDRESS, before: 30, limit: 10, roles: ['me'] })
+  assert.equal(page.ok, true)
+  const { records, startSeq, endSeq, hasMore } = page.value
+  assert.equal(records.length, 10)
+  assert.ok(records.every((record) => record.event.type === 'user/message'))
+  assert.equal(endSeq, 27, '最新的匹配是 seq 27，窗口右缘仍按 before 定')
+  assert.equal(startSeq, 0, '10 条 me 恰好铺满整个日志')
+  assert.equal(hasMore, false, '已经扫到日志开头')
+})
+
+test('sessionWindow roles 过滤的分页：hasMore 反映"更早还有匹配"，游标按 startSeq 续', async () => {
+  const log = makeLog(100) // seq%3===0 是 me（0,3,…,99 → 34 条）
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeQuery(log))
+  const first = await service.handle(WINDOW_METHOD, { address: ADDRESS, before: 100, limit: 10, roles: ['me'] })
+  assert.equal(first.ok, true)
+  assert.equal(first.value.records.length, 10)
+  assert.equal(first.value.hasMore, true, '日志更深处还有 me')
+  assert.equal(first.value.endSeq, 99)
+  const second = await service.handle(WINDOW_METHOD, {
+    address: ADDRESS, before: first.value.startSeq, limit: 10, roles: ['me'],
+  })
+  assert.equal(second.ok, true)
+  const firstSeqs = first.value.records.map((record) => record.event.seq)
+  const secondSeqs = second.value.records.map((record) => record.event.seq)
+  assert.equal(new Set([...firstSeqs, ...secondSeqs]).size, firstSeqs.length + secondSeqs.length, '两页不重复')
+  assert.ok(Math.max(...secondSeqs) < Math.min(...firstSeqs), '第二页更旧')
+})
+
+test('sessionWindow 拒绝未知的 role 词', async () => {
+  const log = makeLog(10)
+  const query = fakeQuery(log)
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), query)
+  const result = await service.handle(WINDOW_METHOD, { address: ADDRESS, before: 10, roles: ['me', 'alien'] })
+  assert.equal(result.ok, false)
+  assert.equal(result.error.code, 'gateway/bad-request')
+  assert.equal(query.calls.length, 0, '坏参数不该触达 Host')
+})
+
+test('sessionWindow 带 roles 但整页无匹配时返回空页且 hasMore 如实', async () => {
+  const log = makeLog(10).map((event) => ({ ...event, type: 'assistant/message' }))
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeQuery(log))
+  const result = await service.handle(WINDOW_METHOD, { address: ADDRESS, before: 10, roles: ['me'] })
+  assert.equal(result.ok, true)
+  assert.equal(result.value.records.length, 0)
+  assert.equal(result.value.hasMore, false, '已扫到日志开头，没有更多')
 })

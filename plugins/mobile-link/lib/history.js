@@ -30,7 +30,10 @@ export const WINDOW_METHOD = '_link/sessionWindow'
 export const FIND_METHOD = '_link/sessionFind'
 
 /// Declared in `_link/hello`; the phone switches channels on these.
-export const HISTORY_CAPABILITIES = ['history-window', 'session-search']
+/// `history-role-filter`: `_link/sessionWindow` accepts an optional `roles`
+/// array (e.g. `["me"]`) and returns only matching records; the seq cursor
+/// semantics are unchanged (spec 009 T031).
+export const HISTORY_CAPABILITIES = ['history-window', 'session-search', 'history-role-filter']
 
 /// Host-side call ceiling. The connector's inbox is serial, so one slow query
 /// would otherwise hold up every other frame on the tunnel.
@@ -113,11 +116,52 @@ function trimToBytes(records, maxBytes) {
 
 /// Which of the three transcript roles one event belongs to (the phone's own
 /// `TranscriptSearchHit.Role`).
-function roleOf(type) {
-  if (type === 'user/message') return 'me'
+///
+/// `user/message` only counts as **me** when the event really came from the
+/// user: measured on a real session, ~24% of `user/message` events are
+/// plugin/system injections (`data.source.kind` other than `"user"`), and
+/// agent-relayed ones carry a `data.source.rpcId` starting with `agent-`.
+/// Events with no `data.source` at all predate the marker and stay `me`
+/// (old-data compatibility). Non-`me` user messages return `undefined` — they
+/// remain visible to full-text search, they just never enter the
+/// "my questions" set (spec 009 T031).
+function roleOf(event) {
+  const type = event?.type
+  if (type === 'user/message') {
+    const source = event?.data?.source
+    if (source !== undefined && source !== null && typeof source === 'object') {
+      if (source.kind !== undefined && source.kind !== 'user') return undefined
+      if (typeof source.rpcId === 'string' && source.rpcId.startsWith('agent-')) return undefined
+    }
+    return 'me'
+  }
   if (type === 'assistant/message') return 'agent'
   if (type === 'tool/call' || type === 'tool/result') return 'tool'
   return undefined
+}
+
+/// What the search hit is *displayed* as. Injected/relayed user messages are
+/// not "me" for the curated set, but they are still user speech in full-text
+/// search (spec 009: excluded from "我的提问", not from the corpus), so an
+/// unfiltered search shows them under the user bucket.
+function displayRoleOf(event) {
+  return roleOf(event) ?? (event?.type === 'user/message' ? 'me' : undefined)
+}
+
+/// Validate the optional `roles` argument: unknown values would silently match
+/// nothing, so the caller gets a bad-request instead of an empty page.
+const KNOWN_ROLES = new Set(['me', 'agent', 'tool'])
+
+function parseRoles(value) {
+  if (value === undefined) return { roles: undefined }
+  if (!Array.isArray(value) || value.length === 0) return { roles: undefined }
+  const roles = new Set(value)
+  for (const role of roles) {
+    if (!KNOWN_ROLES.has(role)) {
+      return { error: failure('gateway/bad-request', `unknown role "${String(role)}"`) }
+    }
+  }
+  return { roles }
 }
 
 /// A hit snippet with the highlight offsets the phone's list already renders.
@@ -247,10 +291,11 @@ export function createHistoryService({ logger = console } = {}) {
           )
           const indexed = (page.items ?? [])
             .map((item) => {
-              const role = roleOf(item.type)
-              if (role === undefined) return undefined
-              if (roles !== undefined && !roles.has(role)) return undefined
-              return { seq: item.seq, role, ...makeSnippet(item.snippet ?? item.text ?? '', query) }
+              const role = roleOf(item)
+              if (roles !== undefined && (role === undefined || !roles.has(role))) return undefined
+              const display = displayRoleOf(item)
+              if (display === undefined) return undefined
+              return { seq: item.seq, role: display, ...makeSnippet(item.snippet ?? item.text ?? '', query) }
             })
             .filter(Boolean)
           return {
@@ -286,10 +331,11 @@ export function createHistoryService({ logger = console } = {}) {
         // far more often than about something old.
         for (let index = docs.length - 1; index >= 0; index -= 1) {
           const doc = docs[index]
-          const role = roleOf(doc.type)
-          if (role === undefined) continue
-          if (roles !== undefined && !roles.has(role)) continue
-          hits.push({ seq: doc.seq, role, ...(query.length > 0
+          const role = roleOf(doc)
+          if (roles !== undefined && (role === undefined || !roles.has(role))) continue
+          const display = displayRoleOf(doc)
+          if (display === undefined) continue
+          hits.push({ seq: doc.seq, role: display, ...(query.length > 0
             ? makeSnippet(doc.text, query)
             : { snippet: String(doc.text ?? '').slice(0, 72).replace(/\s+/g, ' ').trim(),
                 highlightStart: 0, highlightLength: 0 }) })
@@ -332,6 +378,12 @@ export function createHistoryService({ logger = console } = {}) {
     const maxBytes = Number.isSafeInteger(Number(args.maxBytes)) && Number(args.maxBytes) > 0
       ? Number(args.maxBytes) : DEFAULT_MAX_BYTES
     const through = Number.isSafeInteger(Number(args.through)) ? Number(args.through) : undefined
+    // Optional role filter (spec 009 T031): e.g. `roles: ["me"]` returns only
+    // the caller's own questions. Filtering affects **which records come back,
+    // never the cursor**: the window is still read as contiguous seqs and
+    // `before` still bounds the newest edge exactly.
+    const { roles, error: rolesError } = parseRoles(args.roles)
+    if (rolesError) return rolesError
 
     const key = `window:${sessionId}`
     if (inFlight.has(key)) return failure('link/busy', 'another window read is in flight for this session')
@@ -341,20 +393,28 @@ export function createHistoryService({ logger = console } = {}) {
       const events = []
       let truncatedBy = null
       let clamped = false
+      /// Whether the scan ran into the start of the log (or an empty chunk):
+      /// the role-filtered page needs it to answer "is there more?" — a
+      /// filtered page can be short even when older matching events exist.
+      let exhausted = false
       for (let chunk = 0; chunk < MAX_CHUNKS_PER_CALL && cursor >= 0; chunk += 1) {
         const { window: result, clamped: thisClamped } = await readChunk(sessionId, cursor)
         clamped = clamped || thisClamped
         const batch = Array.isArray(result.events) ? result.events : []
-        if (batch.length === 0) break
-        for (let index = batch.length - 1; index >= 0; index -= 1) events.unshift(batch[index])
+        if (batch.length === 0) { exhausted = true; break }
+        for (let index = batch.length - 1; index >= 0; index -= 1) {
+          const event = batch[index]
+          if (roles !== undefined && !roles.has(roleOf(event))) continue
+          events.unshift(event)
+        }
         if (events.length >= limit || bytesOfRecords(events.map(toRecord)) >= maxBytes) {
           truncatedBy = events.length >= limit ? 'count' : 'bytes'
           break
         }
         const next = (result.startSeq ?? batch[0].seq) - 1
-        if (next >= cursor) break
+        if (next >= cursor) { exhausted = true; break }
         cursor = next
-        if (cursor < 0) break
+        if (cursor < 0) { exhausted = true; break }
       }
       const records = events.map(toRecord)
       // Trim from the oldest end only: the newest edge is the seq the phone's
@@ -366,11 +426,14 @@ export function createHistoryService({ logger = console } = {}) {
       }
       if (trimToBytes(records, maxBytes)) truncatedBy = 'bytes'
       if (records.length === 0) {
-        return { ok: true, value: { records: [], startSeq: null, endSeq: null, hasMore: false, truncatedBy: null, clamped } }
+        return { ok: true, value: { records: [], startSeq: null, endSeq: null, hasMore: roles !== undefined && !exhausted, truncatedBy: null, clamped } }
       }
       const startSeq = records[0].event.seq
       const endSeq = records[records.length - 1].event.seq
-      return { ok: true, value: { records, startSeq, endSeq, hasMore: startSeq > 0, truncatedBy, clamped } }
+      // Filtered pages: "more" means older seqs remain unscanned **and** the
+      // page did not already reach the log's first event.
+      const hasMore = roles === undefined ? startSeq > 0 : (startSeq > 0 && !exhausted)
+      return { ok: true, value: { records, startSeq, endSeq, hasMore, truncatedBy, clamped } }
     } catch (error) {
       logger.warn?.(`mobile-link: sessionWindow failed: ${messageOf(error)}`)
       return hostFailure(error)

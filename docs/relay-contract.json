@@ -11,7 +11,8 @@
     "git",
     "background-transfer",
     "history-window",
-    "session-search"
+    "session-search",
+    "history-role-filter"
   ],
   "deviceToAgent": [
     "req",
