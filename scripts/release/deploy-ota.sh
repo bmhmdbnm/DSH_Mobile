@@ -112,14 +112,14 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   # ibtoold 孤儿进程，看起来就像「停住了」，其实是被自己打断了。
   step "归档（Release / 真机）—— 本步无输出属正常，通常 1~3 分钟，请不要中断"
   rm -rf "$ARCHIVE" "$EXPORT_DIR"
+  # 签名（Manual + Apple Development + 描述文件）不在命令行给：全局覆盖会误伤
+  # SPM 依赖 target（GRDB 不接受手动描述文件，归档报错）。签名在
+  # ios/DSHMobile/Config.local.xcconfig 的 [config=Release] 段，只挂 App target。
   xcodebuild -project "$PROJECT_DIR/DSHMobile.xcodeproj" -scheme DSHMobile \
     -configuration Release -destination 'generic/platform=iOS' \
     -archivePath "$ARCHIVE" \
     CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
     DEVELOPMENT_TEAM="$TEAM_ID" \
-    CODE_SIGN_STYLE=Manual \
-    CODE_SIGN_IDENTITY="Apple Development" \
-    PROVISIONING_PROFILE_SPECIFIER="$OTA_PROFILE_NAME" \
     archive \
     | tail -3
 
