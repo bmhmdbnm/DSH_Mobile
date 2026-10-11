@@ -81,6 +81,7 @@ public actor MessageStore {
         migrator.registerMigration("v2") { db in try createSchemaV2(db) }
         migrator.registerMigration("v3") { db in try migrateToV3(db) }
         migrator.registerMigration("v3-user-inputs-cleanup") { db in try migrateToV3Cleanup(db) }
+        migrator.registerMigration("v3-fts-reindex") { db in try reindexRecordFts(db) }
         return migrator
     }()
 
@@ -192,7 +193,7 @@ public actor MessageStore {
         try db.execute(sql: "DROP TABLE IF EXISTS user_inputs")
         try db.execute(sql: "DROP TABLE IF EXISTS user_input_state")
         // trigram：unicode61 不会切中文（整段当一个词）。索引文本从 payload 里
-        // 就地提取（用户消息的正文在 data.text）；写入侧保证 payload 恒为合法
+        // 就地提取（用户消息的正文在 event.data.text；payload 是 SessionRecord 包了一层 event——当初写成 $.data.text 导致索引全空，测试抓出）；写入侧保证 payload 恒为合法
         // JSON，json_extract 不会失败。
         try db.execute(sql: """
             CREATE VIRTUAL TABLE IF NOT EXISTS record_fts
@@ -202,7 +203,7 @@ public actor MessageStore {
             CREATE TRIGGER IF NOT EXISTS record_fts_ai AFTER INSERT ON record
             WHEN new.role = 'me' BEGIN
               INSERT INTO record_fts(rowid, text) VALUES (
-                new.rowid, COALESCE(json_extract(CAST(new.payload AS TEXT), '$.data.text'), ''));
+                new.rowid, COALESCE(json_extract(CAST(new.payload AS TEXT), '$.event.data.text'), ''));
             END;
             """)
         try db.execute(sql: """
@@ -214,7 +215,18 @@ public actor MessageStore {
         // 存量 me 行回填索引（迁移前写入的 record 不会触发上面的 INSERT 触发器）。
         try db.execute(sql: """
             INSERT INTO record_fts(rowid, text)
-            SELECT rowid, COALESCE(json_extract(CAST(payload AS TEXT), '$.data.text'), '')
+            SELECT rowid, COALESCE(json_extract(CAST(payload AS TEXT), '$.event.data.text'), '')
+            FROM record WHERE role = 'me' AND json_valid(CAST(payload AS TEXT));
+            """)
+    }
+
+    /// v3-fts-reindex：v3-cleanup 首版的 JSON 路径写错（$.data.text，payload 实际
+    /// 是 {"event": {...}}），已迁移过的库里索引全是空串。整表清掉按正确路径重建。
+    static func reindexRecordFts(_ db: Database) throws {
+        try db.execute(sql: "DELETE FROM record_fts")
+        try db.execute(sql: """
+            INSERT INTO record_fts(rowid, text)
+            SELECT rowid, COALESCE(json_extract(CAST(payload AS TEXT), '$.event.data.text'), '')
             FROM record WHERE role = 'me' AND json_valid(CAST(payload AS TEXT));
             """)
     }

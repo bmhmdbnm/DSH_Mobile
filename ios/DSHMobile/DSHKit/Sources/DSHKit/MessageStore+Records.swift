@@ -239,7 +239,7 @@ extension MessageStore {
                 rows = try Row.fetchAll(db, sql: """
                     SELECT session_id, payload FROM record
                     WHERE scope = ? AND \(Self.userInputFilter)
-                      AND COALESCE(json_extract(CAST(payload AS TEXT), '$.data.text'), '')
+                      AND COALESCE(json_extract(CAST(payload AS TEXT), '$.event.data.text'), '')
                           LIKE ? ESCAPE '\\'
                     ORDER BY seq DESC LIMIT 200
                     """, arguments: [scope, pattern])
@@ -262,6 +262,13 @@ extension MessageStore {
     }
 
     // MARK: - 测试出口（internal，仅 DSHKitTests 用；不进产品面）
+
+    /// FTS 行数（诊断用）。
+    func ftsCountForTesting() async throws -> Int {
+        try await pool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM record_fts") ?? -1
+        }
+    }
 
     /// 全库表名清单（T035 迁移断言用）。
     func tableNamesForTesting() async throws -> [String] {
