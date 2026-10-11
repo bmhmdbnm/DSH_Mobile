@@ -239,7 +239,7 @@ extension MessageStore {
                 rows = try Row.fetchAll(db, sql: """
                     SELECT session_id, payload FROM record
                     WHERE scope = ? AND \(Self.userInputFilter)
-                      AND COALESCE(json_extract(CAST(payload AS TEXT), '$.event.data.text'), '')
+                      AND \(Self.ftsTextExpr("payload"))
                           LIKE ? ESCAPE '\\'
                     ORDER BY seq DESC LIMIT 200
                     """, arguments: [scope, pattern])

@@ -122,6 +122,19 @@ final class MessageStoreTests: XCTestCase {
         XCTAssertEqual(hits.map { $0.record.event.seq }, [1])
     }
 
+    /// blocks 形态（真实 user/message：正文在 data.content[0].text，没有 data.text）：
+    /// FTS（≥3 字符）与 LIKE 降级（短词）都要命中——线上库曾因此整索引空串（T036）。
+    func testRecordFtsExtractsBlocksFormContent() async throws {
+        let json = #"{"type":"user/message","seq":9,"time":1789276358732,"data":{"content":[{"type":"text","text":"整理下今天的推特热闻"}],"source":{"kind":"user","rpcId":"r-1"}}}"#
+        let event = try JSONDecoder().decode(SessionEvent.self, from: Data(json.utf8))
+        try await upsert([SessionRecord(event: event)])
+        let hits = try await store.searchUserInputRecords(scope: "mac", query: "推特热")
+        XCTAssertEqual(hits.map { $0.record.event.seq }, [9])
+        let short = try await store.searchUserInputRecords(scope: "mac", query: "推特")
+        XCTAssertEqual(short.map { $0.record.event.seq }, [9])
+        // 直挂 data.text 的旧形态仍可用（fixture 的 record() 就是这条路径，上面已覆盖）。
+    }
+
     // MARK: - T032：source 列
 
     /// 写入路径从 data.source 提取 source_kind/source_id；缺省（老数据形态）留空，
