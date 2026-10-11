@@ -92,11 +92,15 @@ public actor SessionPipeline {
         case gapFailed
         /// 不过滤的翻页拉回 0 条且服务端没说「到头」——异常，按可重试失败处理。
         case emptyPage
+        /// 取页在 `fetchTimeout` 内没有回包：回包丢失/链路挂起的兜底——真机上帧
+        /// 丢了任务就永远挂着，翻页"永久静默无反应"（OTA 实测）的根治。
+        case timeout
 
         public var description: String {
             switch self {
             case .gapFailed: return "gap-failed"
             case .emptyPage: return "empty-page"
+            case .timeout: return "timeout"
             }
         }
     }
@@ -107,6 +111,8 @@ public actor SessionPipeline {
     public let sessionId: String
     let pageSize: Int // internal：+Paging 扩展（页对齐工具）要用
     private let hotLimit: Int
+    /// 单页取页的最长等待（秒）。超时按可重试失败计（`FetchError.timeout`）。
+    let fetchTimeout: TimeInterval
     /// internal：+Hydration 扩展（磁盘水合）要用。
     let store: MessageStore?
     private let fetch: PageFetch
@@ -156,7 +162,8 @@ public actor SessionPipeline {
         pageSize: Int = 50,
         hotLimit: Int = 500,
         initialRanges: RangeIndex = RangeIndex(),
-        flushWrites: @escaping @Sendable ([MessageStore.RecordChange]) -> Void = { _ in }
+        flushWrites: @escaping @Sendable ([MessageStore.RecordChange]) -> Void = { _ in },
+        fetchTimeout: TimeInterval = 45
     ) {
         self.scope = scope
         self.sessionId = sessionId
@@ -167,6 +174,7 @@ public actor SessionPipeline {
         self.pageSize = pageSize
         self.hotLimit = hotLimit
         self.ranges = initialRanges
+        self.fetchTimeout = fetchTimeout
         self.flushWrites = flushWrites
     }
 
@@ -291,7 +299,7 @@ public actor SessionPipeline {
             // 任务本体包含回包合并：搭车者 await 到的一定是「合并后」。
             let task = Task<Void, Error> {
                 let result: FetchPage
-                do { result = try await fetch(page, priority) }
+                do { result = try await self.withTimeout(self.fetchTimeout) { try await fetch(page, priority) } }
                 catch {
                     self.failFetch(error, key: key, generation: generation)
                     throw error
@@ -339,6 +347,26 @@ public actor SessionPipeline {
         guard inFlight.finish(key, generation: generation) else { return }
         failureCounts.removeValue(forKey: key)
         mergeFetchedPage(result, requested: requested)
+    }
+
+    /// 给一次取页加最长等待：超时按 `FetchError.timeout` 抛（走与网络失败
+    /// 同一条 failFetch 计数路径）。在任务**本体内部**做，所以搭车者
+    /// （inFlight.joined）最多也只等 `fetchTimeout`，不会因回包丢失永远挂着。
+    private func withTimeout<T: Sendable>(
+        _ seconds: TimeInterval,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw FetchError.timeout
+            }
+            defer { group.cancelAll() }
+            // 先到先赢：取页回来或超时到了。
+            guard let value = try await group.next() else { throw FetchError.timeout }
+            return value
+        }
     }
 
     /// 失败核销：计数 + 重发 gap 状态；3 次上限由 fetchPage 入口挡。

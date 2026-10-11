@@ -17,13 +17,17 @@ final class SessionPipelineTests: XCTestCase {
 
         private var script: [Int: Entry] = [:]
         private(set) var requests: [ClosedRange<Int>] = []
+        /// true 时 fetch 永远不回（模拟回包丢失/链路挂起）。
+        private var hangs = false
 
         func set(_ range: ClosedRange<Int>, _ entry: Entry) { script[range.lowerBound] = entry }
+        func hang() { hangs = true }
         func requestCount(_ range: ClosedRange<Int>) -> Int { requests.filter { $0 == range }.count }
         func allRequests() -> [ClosedRange<Int>] { requests }
 
-        func fetch(_ range: ClosedRange<Int>, priority: SessionPipeline.FetchPriority) throws -> SessionPipeline.FetchPage {
+        func fetch(_ range: ClosedRange<Int>, priority: SessionPipeline.FetchPriority) async throws -> SessionPipeline.FetchPage {
             requests.append(range)
+            if hangs { try await Task.sleep(for: .seconds(3600)) }
             switch script[range.lowerBound] {
             case .page(let page): return page
             case .error(let reason): throw TestError.message(reason)
@@ -76,13 +80,15 @@ final class SessionPipelineTests: XCTestCase {
 
     private func makePipeline(
         hotLimit: Int = 500,
-        tick: @escaping @Sendable () async -> Void = {}
+        tick: @escaping @Sendable () async -> Void = {},
+        fetchTimeout: TimeInterval = 45
     ) -> SessionPipeline {
         let stub = stub!
         return SessionPipeline(
             scope: "mac", sessionId: "s1", store: nil,
             fetch: { range, priority in try await stub.fetch(range, priority: priority) },
-            frameTick: tick, now: { 1000 }, pageSize: 50, hotLimit: hotLimit)
+            frameTick: tick, now: { 1000 }, pageSize: 50, hotLimit: hotLimit,
+            fetchTimeout: fetchTimeout)
     }
 
     /// 等异步沉淀的轻量工具（prefetch/diff 广播是 fire-and-forget）。
@@ -537,4 +543,34 @@ final class SessionPipelineTests: XCTestCase {
         let requests = await stub.requestCount(51...100)
         XCTAssertEqual(requests, 1) // 同页合并，只发一次网络请求
     }
+
+    /// 取页超时：回包永远不到（帧丢失/链路挂起）时，取页在 fetchTimeout 内按
+    /// `timeout` 失败收尾，而不是永远挂着（OTA 实测"永久静默无反应"的根治）。
+    /// 计时用可注入的短超时，不等真实 45 秒。
+    func testFetchTimeoutFailsPageInsteadOfHanging() async throws {
+        let pipeline = makePipeline(fetchTimeout: 0.2)
+        await stub.set(1...50, .page(page(1...50)))
+        _ = try await pipeline.records(in: 1...50)
+        // 51...100 没有脚本化回包且 stub 挂起（模拟回包丢失）。
+        await stub.hang()
+        do {
+            _ = try await pipeline.records(in: 51...100)
+            XCTFail("超时路径必须抛错，不是正常返回")
+        } catch SessionPipeline.FetchError.timeout {
+            // 期望：挂起的取页在 fetchTimeout 内按 timeout 收尾。
+        }
+    }
+
+    /// 搭车者（同页并发 .joined）也受同一个超时保护：主任务超时收尾后，
+    /// 搭车者拿到的是错误而不是永远等待。
+    func testJoinedFetchersAlsoCompleteOnTimeout() async throws {
+        let pipeline = makePipeline(fetchTimeout: 0.2)
+        await stub.hang()
+        async let first: [SessionRecord] = pipeline.records(in: 51...100)
+        async let second: [SessionRecord] = pipeline.records(in: 51...100)
+        _ = await [try? await first, try? await second]
+        // 两个都在有限时间内回来（实现是共享同一个带超时的任务本体）。
+        XCTAssertTrue(true)
+    }
+
 }

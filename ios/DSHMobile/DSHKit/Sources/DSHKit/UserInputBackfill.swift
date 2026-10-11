@@ -22,6 +22,9 @@ import GRDB
 /// roles 过滤会把整页滤空，按"最老返回记录"推进会在原地卡死；老连接器缺这个
 /// 字段时退回旧口径（最老返回记录的 seq）。
 public struct UserInputBackfiller: Sendable {
+    /// 单页取数的最长等待（秒）。回包丢失/链路挂起时回填不能永远挂着——
+    /// 挂住的会话会永远标不上「灌全」，「我问过的」就一直缺（OTA 实测类）。
+    let pageTimeout: TimeInterval
 
     /// 一页窗口拉取：`before == nil` 表示从最新开始（开区间上界 .max）。
     public typealias PageFetch = @Sendable (_ before: Int?) async throws -> HistoryWindowValue
@@ -39,6 +42,9 @@ public struct UserInputBackfiller: Sendable {
             self.resumeCursor = resumeCursor
         }
     }
+
+    /// 一页取数超时（回包丢失/链路挂起的兜底）。
+    enum BackfillError: Error { case pageTimeout }
 
     public enum Outcome: Sendable, Equatable {
         /// 24h 内灌过且 lastSeq 没变，整会话跳过。
@@ -72,17 +78,19 @@ public struct UserInputBackfiller: Sendable {
 
     public init(store: MessageStore, now: @escaping @Sendable () -> Date = Date.init,
                 roleFilterSupported: Bool = true,
-                freshWindow: TimeInterval = 24 * 3600, maxPages: Int = 100) {
+                freshWindow: TimeInterval = 24 * 3600, maxPages: Int = 100,
+                pageTimeout: TimeInterval = 45) {
         self.store = store
         self.now = now
         self.roleFilterSupported = roleFilterSupported
         self.freshWindow = freshWindow
         self.maxPages = maxPages
+        self.pageTimeout = pageTimeout
     }
 
     /// 灌一个会话。`lastSeq` 是列表已知的最新游标（host asOfSeq 或磁盘 newestSeq）。
     public func backfill(
-        scope: String, sessionId: String, lastSeq: Int, fetch: PageFetch
+        scope: String, sessionId: String, lastSeq: Int, fetch: @escaping PageFetch
     ) async throws -> Outcome {
         // 降级：老连接器给不出归类过的完整记录，浏览模式的摘要写进 record 就是
         // 脏数据（没有 source）。宁可不灌，等连接器升级。
@@ -108,8 +116,26 @@ public struct UserInputBackfiller: Sendable {
     }
 
     /// 一页一页往回拉，直到灌全、页数打满或游标推不动。
+    /// 给一页取数加最长等待：超时抛错，回填器按「失败不记账、下次重试」的
+    /// 既有语义处理（页挂起不再把整会话灌库拖死）。取数本体是外部注入的闭包，
+    /// 这里统一包，调用点不用再各自处理。
+    private func withPageTimeout<T: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(pageTimeout * 1_000_000_000))
+                throw BackfillError.pageTimeout
+            }
+            defer { group.cancelAll() }
+            guard let value = try await group.next() else { throw BackfillError.pageTimeout }
+            return value
+        }
+    }
+
     private func collect(
-        scope: String, sessionId: String, from anchor: Int?, fetch: PageFetch
+        scope: String, sessionId: String, from anchor: Int?, fetch: @escaping PageFetch
     ) async throws -> Pull {
         // 增量锚点：此前灌过的最大 seq（record 表里的 me 子集）。全新会话为 0。
         let knownMax = try await store.maxUserInputSeq(scope: scope, sessionId: sessionId) ?? 0
@@ -120,7 +146,8 @@ public struct UserInputBackfiller: Sendable {
         var pull = Pull(resume: anchor)
         var before = anchor
         while true {
-            let value = try await fetch(before)
+            let cursor = before
+            let value = try await withPageTimeout { try await fetch(cursor) }
             pull.pages += 1
             if !value.records.isEmpty {
                 pull.rows += value.records.count
