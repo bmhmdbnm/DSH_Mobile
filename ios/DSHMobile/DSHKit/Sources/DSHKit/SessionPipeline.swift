@@ -444,12 +444,13 @@ public actor SessionPipeline {
 
     private func prefetch(_ page: ClosedRange<Int>) {
         let key = page.lowerBound
-        // 预取是背景动作：该页只要失败过一次（网络错、或 T038 的空页）就不再
-        // 自动重打，免得瀑布反复撞同一页。用户主动读取不受此限（fetchPage 入口
-        // 只挡 maxRetries），点重试会清零计数，恢复正常后预取也回来。
+        // 预取是背景动作：该页打到失败上限（maxRetries）才不再自动重打，
+        // 免得瀑布反复撞死页；上限之内仍会重试，窗口预热不会因一次网络抖动
+        // 就永久放弃（T038 删 knownEmptyPages 时的收紧过头，已按原语义恢复）。
+        // 用户主动读取不受此限——fetchPage 入口只挡 maxRetries，点重试清零计数。
         guard !inFlight.isInFlight(key),
               inFlightTasks[key] == nil,
-              failureCounts[key, default: 0] == 0
+              failureCounts[key, default: 0] < Self.maxRetries
         else { return }
         switch ranges.coverage(of: page) {
         case .none, .partial:

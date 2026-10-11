@@ -211,10 +211,20 @@ extension MessageStore {
     /// 「子集是否灌全看这个标记，不能从表内容推断」）。
     public func setUserInputsSyncedAt(scope: String, sessionId: String, at date: Date) async throws {
         try await pool.write { db in
+            // upsert 而非裸 UPDATE：零提问、磁盘一条记录都没有的会话没有
+            // session_state 行（2026-10-11 实测：那种会话标记永远写不上，
+            // 面板就一直显示「同步中…」）。新建的行只有标记有值，其余列为
+            // NULL/默认——列表摘要读 last_snippet（NULL 不加行）、预取读
+            // newest_seq（NULL 时回退 host 的 asOfSeq），都不会被这行影响。
             try db.execute(sql: """
-                UPDATE session_state SET user_inputs_synced_at = ?
-                WHERE scope = ? AND session_id = ?
-                """, arguments: [date.timeIntervalSince1970, scope, sessionId])
+                INSERT INTO session_state
+                  (scope, session_id, last_opened, has_more, unread_count,
+                   ranges_json, user_inputs_synced_at)
+                VALUES (?, ?, ?, 1, 0, '[]', ?)
+                ON CONFLICT(scope, session_id) DO UPDATE SET
+                  user_inputs_synced_at = excluded.user_inputs_synced_at
+                """, arguments: [scope, sessionId, date.timeIntervalSince1970,
+                                 date.timeIntervalSince1970])
         }
     }
 

@@ -84,23 +84,6 @@ public enum TranscriptSearch {
         return found
     }
 
-    /// 只看自己问过的：不输入关键词时的默认列表（由近及远）。
-    ///
-    /// 这是「只看我的提问」真正的默认态——读者点这颗胶囊是想**浏览**自己问过什么，
-    /// 而不是先想一个关键词。所以这里不过滤、不取样，把 `items` 里的用户行全部倒序列出。
-    public static func myQuestions(in items: [TimelineItem], limit: Int = 400) -> [TranscriptSearchHit] {
-        var found: [TranscriptSearchHit] = []
-        for item in items.reversed() {
-            if found.count >= limit { break }
-            guard case .userMessage(let text, _, _, _, _) = item.kind else { continue }
-            let snippet = collapsed(text)
-            guard !snippet.isEmpty else { continue }
-            found.append(TranscriptSearchHit(id: item.id, role: .me, snippet: snippet,
-                                             highlightStart: 0, highlightLength: 0, seq: item.seq))
-        }
-        return found
-    }
-
     /// 把消息正文压成一行、留一段够认出来的长度（列表里每行最多显示三行）。
     static func collapsed(_ text: String, limit: Int = 160) -> String {
         var out = ""
