@@ -25,9 +25,23 @@ struct TranscriptSearchSheet: View {
     /// 连接器给的续页游标；`source` 说明这一屏命中覆盖到哪儿（spec 007 P2）。
     @State var searchCursor: String?
     @State var pageHasMore = false
-    /// `localStore` = 本地 record 全量库（T034，零网络）；
-    /// `connector` = 连接器整会话；`local` = 已加载窗口。
-    @State var searchSource = "local"
+    /// 这一屏命中是从哪儿来的。`localStore` = 本地 record 全量库（T034，零网络）；
+    /// `connector` = 连接器整会话；`localWindow` = 已加载的那一段。
+    ///
+    /// T040 起只剩「搜全部内容」会走 `connector`，「我问过的」被 `localStore` 独占
+    ///（删掉了"本地为空/未灌全就退回连接器"的岔路），所以用枚举而不是裸字符串：
+    /// 分支写漏会在编译期现形。
+    enum SearchSource: String {
+        case localWindow = "local"
+        case localStore
+        case connector
+    }
+    @State var searchSource: SearchSource = .localWindow
+    /// 本会话「我问过的」本地库是否已灌全（`session_state.user_inputs_synced_at`）。
+    /// `nil` = 还没问出来（第一次查询前不显示状态行，避免已灌全时闪一下「同步中…」）。
+    @State var isUserInputsSynced: Bool?
+    /// 未灌全时每 1.5s 重查一次完整性标记（一次本地索引读）。
+    static let syncPollMilliseconds = 1500
     @State var isLoadingMore = false
     /// 现在**真的在屏幕上**的结果行（行自己上报，用于算"底下还剩几条"）。
     @State var visibleHitIds: Set<String> = []
@@ -82,11 +96,34 @@ struct TranscriptSearchSheet: View {
         }
     }
 
+    /// 未灌全（`user_inputs_synced_at` 为空）时的一等状态行（T040）：面板照常显示
+    /// 本地已有的命中，同时明说"这份列表还没灌全"。
+    ///
+    /// 放**顶部**而不是 footer：footer 在列表末尾，命中一多就得滑到底才看得见，而这条
+    /// 恰恰是"别以为这就是全部"的提醒，必须一眼可见（与 `upgradeNotice` 同位）。
+    @ViewBuilder
+    private var syncNotice: some View {
+        if onlyMine, isUserInputsSynced == false {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("同步中…")
+                    .font(.caption)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(DSHTheme.labelSecondary)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityIdentifier("search.sync")
+        }
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 field
                 filter
+                syncNotice
                 upgradeNotice
                 Hairline()
                 results
@@ -104,7 +141,12 @@ struct TranscriptSearchSheet: View {
             scheduleSearch(immediate: true)
             // 不抢焦点：面板的默认态是"能一眼看到并点选"，键盘会把列表盖掉一半。
             // 想搜关键词的点一下输入框就行。
-            // 浏览态的第一页交给列表底部的哨兵行去取（它一露面就会触发）。
+            // T040 起浏览态（「只看我的提问」）直接读本地全量库，一次就位，没有"第一页"
+            // 要等；`watchUserInputSyncState()` 负责在灌全时把它变完整。
+        }
+        // 未灌全时盯着完整性标记（切到「只看我的提问」才开始转）。
+        .task(id: onlyMine) {
+            await watchUserInputSyncState()
         }
         // 打字：防抖，只有停下来（或换了关键词）才真正搜一次。
         .onChange(of: query) { _, _ in
@@ -168,10 +210,9 @@ struct TranscriptSearchSheet: View {
                 // 收起键盘，让"我原来问过什么"这份列表整屏可见；想按关键词缩小范围
                 // 再点输入框。
                 isFocused = false
+                // 只排这一次搜索：T040 起「我问过的」直接读本地全量库（瞬时、零网络），
+                // 不再有"先取一页连接器"这一步（原来的 `requestLoad()` 已删）。
                 scheduleSearch(immediate: true)
-                // 只先取一页：读到多少显示多少，剩下的由列表往下滑时一页页接着读。
-                // 读者看不到"等它读完"的阻塞。
-                requestLoad()
             }
             .accessibilityIdentifier("search.scope.mine")
             Spacer()
@@ -208,7 +249,10 @@ struct TranscriptSearchSheet: View {
             if isBrowsing {
                 Section {
                     if hits.isEmpty {
-                        Text(isLoadingMore ? "正在往前读…" : "这段历史里还没有你发过的消息。")
+                        // 空列表必须说清是哪一种空（T040）：还没灌到 ≠ 确实没有。
+                        Text(isUserInputsSynced == false
+                             ? "本机还没同步到你的提问。"
+                             : "这段历史里还没有你发过的消息。")
                             .font(DSHTheme.Typography.caption)
                             .foregroundStyle(DSHTheme.labelTertiary)
                     }
@@ -231,9 +275,9 @@ struct TranscriptSearchSheet: View {
                         .font(DSHTheme.Typography.micro)
                         .foregroundStyle(DSHTheme.labelTertiary)
                 } footer: {
-                    Text(searchSource == "localStore"
-                         ? "由近及远。"
-                         : "由近及远。上面还有更早的时候，可以继续往前翻。")
+                    // 浏览态恒为本地全量库（T040 起没有连接器岔路），所以不再有
+                    // "上面还有更早的可以继续翻"那句。
+                    Text("由近及远。")
                         .font(DSHTheme.Typography.micro)
                         .foregroundStyle(DSHTheme.labelTertiary)
                 }
@@ -245,7 +289,9 @@ struct TranscriptSearchSheet: View {
                 }
             } else if hits.isEmpty {
                 Section {
-                    Text(onlyMine ? "已加载的这段里没有你问过的「\(query)」。"
+                    // 「只看我的提问」命中来自本机全量库（T040 起无连接器岔路），
+                    // 文案不能再说是"已加载的这段"。
+                    Text(onlyMine ? "本机记录里没有你问过的「\(query)」。"
                                   : "已加载的这段里没有「\(query)」。")
                         .font(DSHTheme.Typography.caption)
                         .foregroundStyle(DSHTheme.labelSecondary)
@@ -306,15 +352,18 @@ struct TranscriptSearchSheet: View {
     /// 说清楚，外加一个"点了就再读一页"的兜底——自动预加载万一没触发，读者还有手可用。
     @ViewBuilder
     private var olderSection: some View {
-        if searchSource == "localStore" {
-            // T025：本地全量库没有"更早的一页"，如实说明数据来源（零网络）。
-            Section {
-                Text("提问已同步到本机，列表与搜索不联网。")
-                    .font(DSHTheme.Typography.micro)
-                    .foregroundStyle(DSHTheme.labelTertiary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, DSHTheme.Spacing.tight)
-                    .accessibilityIdentifier("search.older.local")
+        if searchSource == .localStore {
+            // T025：本地全量库没有"更早的一页"。只在**灌全后**才说"已同步到本机"——
+            // 还在灌的时候把它写成已同步，就和顶部「同步中…」自相矛盾（T040）。
+            if isUserInputsSynced == true {
+                Section {
+                    Text("提问已同步到本机，列表与搜索不联网。")
+                        .font(DSHTheme.Typography.micro)
+                        .foregroundStyle(DSHTheme.labelTertiary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, DSHTheme.Spacing.tight)
+                        .accessibilityIdentifier("search.older.local")
+                }
             }
         } else if model.canExtendSearch {
             Section {

@@ -40,46 +40,52 @@ extension TranscriptSearchSheet {
 
     // MARK: - 执行
 
-    /// 真正的匹配。T034 起「只看我的提问」先读本地 record（record_fts，零网络），
-    /// 本地为空才回退连接器/本地缓冲的老路（T033 灌库还没覆盖到的会话不受影响）。
+    /// 真正的匹配。
+    ///
+    /// 三条路，互不含糊（T040）：
+    ///   * 「只看我的提问」→ **只读本地**（`record` / `record_fts`，零网络），未灌全也照读，
+    ///     完整性交给顶部「同步中…」状态行，**没有**连接器岔路；
+    ///   * 关键词 ≥2 字且连接器能搜整个会话 → 连接器（`sessionFind`），覆盖整会话；
+    ///   * 其余 → 本地已加载的那一段（老连接器的降级，FR-015/FR-036）。
     @MainActor
     func performSearch(key: String) async {
         lastSearchKey = key
         let items = model.searchItems
         let query = self.query
         let mine = onlyMine
-        let browsing = isBrowsing
         let started = Date()
         var found: [TranscriptSearchHit] = []
         let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if mine, let local = await model.localUserInputHits(query: query), !local.isEmpty {
-            // 本地全量库：浏览与关键词搜索都是零网络（spec「搜索策略」第 3 条）。
-            found = local
+        if mine {
+            // 来源先落定再 await：否则这段窗口里 `requestLoad()` 可能按上一次的
+            // `.connector` 去要一页「我的提问」（那正是要删掉的那条路）。
+            searchSource = .localStore
             searchCursor = nil
             pageHasMore = false
-            searchSource = "localStore"
-        } else if model.connectorSearchesWholeSession, browsing || keyword.count >= 2 {
-            // 连接器能搜整个会话时：带关键词 ⇒ 搜整个会话；"只看我的提问"的浏览
-            // ⇒ 首页一次要 200 条（本地库为空时的降级路，2026-10-08 真机反馈）。
-            let page = await model.searchPage(query: browsing ? "" : query, onlyMine: mine,
-                                              limit: browsing ? 200 : 50)
+            // 完整性标记与命中同属一次本地读路径：先问标记，灌全时状态行不会闪。
+            await refreshUserInputSyncState(rerunOnSync: false)
+            found = await model.localUserInputHits(query: query)
+        } else if model.connectorSearchesWholeSession, keyword.count >= 2 {
+            // 只有"搜全部内容"才走连接器；`onlyMine` 恒为 false（上面已独占），
+            // 所以这里不再带 roles 过滤。
+            let page = await model.searchPage(query: query, onlyMine: false, limit: 50)
             found = page?.hits ?? []
             searchCursor = page?.cursor
             pageHasMore = page?.hasMore ?? false
-            searchSource = "connector"
+            searchSource = .connector
         } else {
-            // 没有这个能力：还是老办法（本地、只搜已加载的那一段），并且**离开主线程**匹配。
+            // 没有这个能力：老办法（本地、只搜已加载的那一段），并且**离开主线程**匹配。
             found = await Task.detached(priority: .userInitiated) {
-                browsing ? TranscriptSearch.myQuestions(in: items)
-                         : TranscriptSearch.hits(in: items, query: query, onlyMine: mine)
+                TranscriptSearch.hits(in: items, query: query, onlyMine: mine)
             }.value
             searchCursor = nil
             pageHasMore = false
-            searchSource = "local"
+            searchSource = .localWindow
         }
         if Task.isCancelled { return }
         ViewportProbe.note("search.run", [
             "key": key,
+            "source": searchSource.rawValue,
             "items": String(items.count),
             "hits": String(found.count),
             "ms": String(format: "%.0f", Date().timeIntervalSince(started) * 1000),
@@ -97,14 +103,43 @@ extension TranscriptSearchSheet {
         dismiss()
     }
 
+    // MARK: - 「同步中…」状态（T040）
+
+    /// 读一次完整性标记（本地一次 SQLite 索引读，零网络）并落到面板状态。
+    ///
+    /// 由 `performSearch` 的本地路径和 `watchUserInputSyncState()` 共同调用。
+    /// `rerunOnSync` 只在"由未灌全翻到已灌全"时重跑查询：列表无缝变完整，
+    /// 读者不用关掉面板再打开。`performSearch` 自己调时传 false（避免自触发的重复搜）。
+    func refreshUserInputSyncState(rerunOnSync: Bool = true) async {
+        let synced = await model.userInputsSynced()
+        guard synced != isUserInputsSynced else { return }
+        isUserInputsSynced = synced
+        ViewportProbe.note("search.sync", ["synced": synced ? "1" : "0"], force: true)
+        if synced, rerunOnSync { scheduleSearch(immediate: true) }
+    }
+
+    /// 未灌全时每 1.5 秒轻量查一次标记，灌全立刻撤掉「同步中…」。
+    ///
+    /// 为什么是轮询而不是回填完成时的通知：回填跑在列表页的冷启动任务里
+    ///（`SessionListModel+ColdStart`），它拿不到当前这个面板；为一条状态行铺一层
+    /// 通知管线不值当。这里查的是一行索引读，只在「只看我的提问」且未灌全时才转。
+    func watchUserInputSyncState() async {
+        guard onlyMine else { return }
+        while !Task.isCancelled {
+            await refreshUserInputSyncState()
+            guard isUserInputsSynced == false else { return }
+            try? await Task.sleep(for: .milliseconds(Self.syncPollMilliseconds))
+        }
+    }
+
     // MARK: - 翻页预读
 
     /// 往搜索缓冲里再取一页（**不动时间线**，也就不会挪动读者的位置）。
     /// 可见范围之外还剩几条？不够 `prefetchAhead` 就继续往前读——读完再判一次，
     /// 所以"一旦触发就会连着读到够"（页里通常只有几条提问，一次要读好几页才攒够 10 条）。
     func prefetchIfRunningLow(fallbackWhenNothingVisible: Bool = false) {
-        // localStore（本地全量库）没有"更早的一页"可预读。
-        guard searchSource != "localStore",
+        // localStore（「我问过的」本地全量库）没有"更早的一页"可预读。
+        guard searchSource != .localStore,
               !isLoadingMore, model.canExtendSearch, !hits.isEmpty else { return }
         // 打字期间不读：那会一边追加行一边重排列表，和输入抢主线程（也正是"卡"的来源）。
         guard !isSearchPending else { return }
@@ -144,8 +179,11 @@ extension TranscriptSearchSheet {
     }
 
     /// 起一次"往前读一页"。同步占住 `isLoadingMore`，避免同一批行事件里起好几个。
+    ///
+    /// `onlyMine` 直接挡掉：「我问过的」是本地全量库，没有更早的一页，也**没有**网络可退
+    ///（T040）——这里不挡的话，竞态窗口里会按上一次的来源去要连接器分页。
     func requestLoad() {
-        guard !isLoadingMore, model.canExtendSearch else { return }
+        guard !isLoadingMore, model.canExtendSearch, !onlyMine else { return }
         isLoadingMore = true
         Task { await loadMore() }
     }
@@ -155,20 +193,21 @@ extension TranscriptSearchSheet {
         // 必须始终不变——这是"加载无感、列表不跳"的机器判据（`firstBefore == firstAfter`）。
         let firstBefore = hits.first?.id
         let countBefore = hits.count
-        if searchSource == "localStore" {
-            // 本地全量库没有"更早的一页"：重跑一次查询即可（灌库可能刚又进了新行）。
+        switch searchSource {
+        case .localStore:
+            // 正常路径到不了这里（`requestLoad` 已挡掉 onlyMine）：万一别人改了调用点，
+            // 也只是重读一次本地，绝不联网。
             await performSearch(key: searchKey)
-        } else if searchSource == "connector" {
+        case .connector:
             // 连接器分页：直接要下一页命中（它自己扫整个会话），不走本地缓冲。
-            let browsingNow = isBrowsing
-            if let page = await model.searchPage(query: browsingNow ? "" : self.query, onlyMine: onlyMine,
-                                                 cursor: searchCursor, limit: browsingNow ? 200 : 50) {
+            if let page = await model.searchPage(query: self.query, onlyMine: false,
+                                                 cursor: searchCursor, limit: 50) {
                 let existing = Set(hits.map(\.id))
                 hits.append(contentsOf: page.hits.filter { !existing.contains($0.id) })
                 searchCursor = page.cursor
                 pageHasMore = page.hasMore
             }
-        } else {
+        case .localWindow:
             await model.extendSearchHistory()
             await performSearch(key: searchKey)
         }

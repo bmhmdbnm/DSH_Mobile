@@ -1,28 +1,27 @@
 import DSHKit
 import Foundation
 
-/// T034：「我问过的」读本地 MessageStore 的 `record` 表（三表终局）——浏览走
+/// T040：「我问过的」的读侧——**只读本地** `MessageStore` 的 `record` 表。浏览走
 /// `userInputRecords`（role='me' 且来源是用户本人），关键词走 `record_fts`
 ///（trigram，<3 字符由 store 降级 LIKE），全程零网络。
 ///
-/// 数据来自 T033 的冷启动灌库；本地还没有灌过（老库、连接器不支持
-/// `history-role-filter` 被跳过）时返回空数组，由面板回退到原来的网络路径——
-/// 本地路径只是加速与离线可用，不是唯一来源。
+/// 未灌全（`session_state.user_inputs_synced_at` 为空，data-model v3 的完整性标记）
+/// **不是**回退条件：本地已经有几条就先显示几条，由面板显示「同步中…」状态行。
+/// 旧的「本地为空 / 未灌全 → 走连接器 sessionFind」岔路已删除——它只在非存在的
+/// 合理场景里生效（连接器不支持 role filter、回填任务还没跑到），却养出两套结果
+/// 口径与两套文案（spec 009「追加修订：加载状态不许静默」第 5 条）。
 extension ChatModel {
 
     /// 本会话的「我问过的」本地命中（按 seq 由近及远）。`query` 为空是浏览模式
-    /// （全量列表），非空走 FTS5。返回 nil 表示本地层不可用（磁盘层缺位 /
-    /// 会话未挂），调用方应直接走网络路径。
-    func localUserInputHits(query: String) async -> [TranscriptSearchHit]? {
+    ///（全量列表），非空走 FTS5。
+    ///
+    /// 返回空数组有两种含义——本地库还没灌到（看 `userInputsSynced()`）、或确实没有
+    /// 匹配——两者都由面板如实呈现，调用方**没有**第二条路可退。
+    func localUserInputHits(query: String) async -> [TranscriptSearchHit] {
         guard let store = messageLayer?.store,
               let scope = sessionScope,
               let sessionId = session?.sessionId
-        else { return nil }
-        // 完整性闸门（data-model v3）：灌库串行进行期间本地只有最新窗口的几条，
-        // 拿它当全量会显示不全还谎报「已经读到最开头」（T036 慢闸抓出）。
-        // 未灌全回退连接器路径（能翻页拿全量），灌全后才走本地零网络。
-        guard (try? await store.userInputsSyncedAt(scope: scope, sessionId: sessionId)) != nil
-        else { return nil }
+        else { return [] }
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let entries: [MessageStore.UserInputEntry]
         do {
@@ -30,7 +29,7 @@ extension ChatModel {
                 ? try await store.userInputRecords(scope: scope)
                 : try await store.searchUserInputRecords(scope: scope, query: needle)
         } catch {
-            return nil
+            return []
         }
         return entries.filter { $0.sessionId == sessionId }
             .sorted { $0.record.event.seq > $1.record.event.seq }
@@ -45,6 +44,19 @@ extension ChatModel {
                     highlightStart: range?.0 ?? 0, highlightLength: range?.1 ?? 0,
                     seq: record.event.seq)
             }
+    }
+
+    /// 本会话的用户输入子集是否已灌全（`session_state.user_inputs_synced_at` 有值）。
+    ///
+    /// `false` 是一等状态，不是错误：面板照常显示本地已有的命中，并在顶部挂一行
+    /// 「同步中…」。磁盘层缺位、会话未挂、从没灌过都是 `false`（此时本来也没有
+    /// 可展示的本地数据），语义只有一个——"这份列表还不完整"。
+    func userInputsSynced() async -> Bool {
+        guard let store = messageLayer?.store,
+              let scope = sessionScope,
+              let sessionId = session?.sessionId
+        else { return false }
+        return (try? await store.userInputsSyncedAt(scope: scope, sessionId: sessionId)) != nil
     }
 
     /// 记录正文：data.text 优先，blocks 拼接兜底（与 MessageStore.snippet 同一约定）。
