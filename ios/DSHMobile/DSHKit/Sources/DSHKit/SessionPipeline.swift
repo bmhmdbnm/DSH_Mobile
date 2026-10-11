@@ -43,6 +43,11 @@ public actor SessionPipeline {
 
     public typealias PageFetch = @Sendable (ClosedRange<Int>, FetchPriority) async throws -> FetchPage
 
+    /// 尾部（更新方向）探空一次后不再立刻重探：live 更新走 follow 流，
+    /// 每次滚窗都重打同一页纯属浪费；任何一条新记录落地即复位。
+    /// 注意只覆盖「更新方向」——更早方向拉空是异常，按 T038 计失败。
+    private var tailProbeEmpty = false
+
     /// 拉取优先级（沿用 InFlightPageTable：prefetch < userVisible < jump）。
     public typealias FetchPriority = InFlightPageTable<Int>.Priority
 
@@ -302,7 +307,10 @@ public actor SessionPipeline {
                 // `UserInputBackfiller` 自己的 fetch（不经 SessionPipeline），而本管道
                 // 的取页闭包不带 roles（产品侧 MessageLayer 用 through: nil、无 roles
                 // 的 _link/sessionWindow），所以「0 条即异常」在本路径上成立。
-                guard !result.records.isEmpty || Self.reachedEnd(result, requested: page) else {
+                guard !result.records.isEmpty
+                        || Self.reachedEnd(result, requested: page)
+                        || self.isNewerDirectionProbe(page)
+                else {
                     self.failFetch(FetchError.emptyPage, key: key, generation: generation)
                     throw FetchError.emptyPage
                 }
@@ -311,6 +319,14 @@ public actor SessionPipeline {
             inFlightTasks[key] = task
             try await task.value
         }
+    }
+
+    /// 空回包发生在「往更新方向探」时是正常形态：窗口尾部之上还没有新内容，
+    /// 不是缺历史。只有往更早方向拉空才是异常（T038）。
+    /// 判据：请求区间整体在当前热窗口最新 seq 之上。
+    private func isNewerDirectionProbe(_ page: ClosedRange<Int>) -> Bool {
+        guard let newest = hotWindow.keys.max() else { return false }
+        return page.lowerBound > newest
     }
 
     /// 回包核销 + 合并（代数不符 = 已被取消，丢弃）。
@@ -338,9 +354,12 @@ public actor SessionPipeline {
         let pageRecords = page.records.sorted { $0.event.seq < $1.event.seq }
         if pageRecords.isEmpty {
             // T038：非「明确到头」的空回包在 fetchPage 上游已按失败抛掉，能落到
-            // 这里的空回包就是正常终态（最底页 + hasMore=false / clamped）。
+            // 这里的空回包只有两种正常形态：①最底页 + hasMore=false/clamped
+            // （真到头）；②更新方向探空（尾部之上暂时没有新内容）。
             if Self.reachedEnd(page, requested: requested) { topExhausted = true }
+            if isNewerDirectionProbe(requested) { tailProbeEmpty = true }
         } else {
+            tailProbeEmpty = false
             for record in pageRecords {
                 if hotWindow[record.event.seq] == nil { diff.inserted.append(record) } else { diff.updated.append(record) }
                 mergeIntoHotWindow(record)
@@ -448,6 +467,7 @@ public actor SessionPipeline {
         // 免得瀑布反复撞死页；上限之内仍会重试，窗口预热不会因一次网络抖动
         // 就永久放弃（T038 删 knownEmptyPages 时的收紧过头，已按原语义恢复）。
         // 用户主动读取不受此限——fetchPage 入口只挡 maxRetries，点重试清零计数。
+        if tailProbeEmpty, isNewerDirectionProbe(page) { return }
         guard !inFlight.isInFlight(key),
               inFlightTasks[key] == nil,
               failureCounts[key, default: 0] < Self.maxRetries
