@@ -74,6 +74,52 @@ final class HistorySearchTests: XCTestCase {
         XCTAssertEqual(TranscriptHitLocator.row(exactlyForSeq: 150, in: rows)?.seq, 100)
     }
 
+    /// 缺口行永远不是"落地"判定（007 用例 49 链路回归）：命中落在缺口里
+    ///（数据还没到）返回 nil，梯子/rebase waiter 继续等真行出现；
+    /// 旧实现会解析到缺口占位行本身，先把视口滚到加载占位条上。
+    func testExactMembershipNeverLandsOnGapRows() {
+        var timeline = ChatTimeline()
+        timeline.reset(with: [userMessage(seq: 100), userMessage(seq: 200)])
+        var rows = timeline.items
+        rows.insert(ChatTimeline.gapItem(start: 150, end: 160, status: .loading), at: 1)
+        XCTAssertNil(TranscriptHitLocator.row(exactlyForSeq: 155, in: rows),
+                     "落在缺口里：数据还没到，不算命中（旧实现给缺口行）")
+        XCTAssertNil(TranscriptHitLocator.row(exactlyForSeq: 150, in: rows),
+                     "缺口行自己的 seq（gap.start）也不算命中")
+        XCTAssertEqual(TranscriptHitLocator.row(exactlyForSeq: 200, in: rows)?.seq, 200,
+                       "缺口之外的真行照常解析")
+    }
+
+    /// 同一 seq 同时存在缺口行与数据行（撞键）：解析到数据行，不是缺口占位行。
+    func testExactMembershipPrefersDataRowOverGapRowAtSameSeq() {
+        var timeline = ChatTimeline()
+        timeline.reset(with: [userMessage(seq: 100), userMessage(seq: 200)])
+        var rows = timeline.items
+        rows.append(ChatTimeline.gapItem(start: 200, end: 250, status: .loading)) // seq=200 撞键
+        let landed = TranscriptHitLocator.row(exactlyForSeq: 200, in: rows)
+        XCTAssertEqual(landed?.seq, 200)
+        XCTAssertEqual(landed?.kind.isContentRow, true, "同 seq 撞键归数据行")
+    }
+
+    /// 只有缺口行（数据完全没到）：返回 nil。
+    func testExactMembershipReturnsNilWhenOnlyGapRowsExist() {
+        let rows = [ChatTimeline.gapItem(start: 150, end: 160, status: .loading)]
+        XCTAssertNil(TranscriptHitLocator.row(exactlyForSeq: 155, in: rows))
+    }
+
+    /// 命中落在缺口里：不填缺口占位行的 id，退到合成身份（点它按 seq 换窗口再跳）。
+    func testAttachFallsBackToSyntheticIdWhenHitLandsInAGap() {
+        var timeline = ChatTimeline()
+        timeline.reset(with: [userMessage(seq: 100), userMessage(seq: 200)])
+        var rows = timeline.items
+        rows.insert(ChatTimeline.gapItem(start: 150, end: 160, status: .loading), at: 1)
+        let hits = [
+            HistorySearchHit(seq: 155, role: "me", snippet: "needle", highlightStart: 0, highlightLength: 6),
+        ]
+        let mapped = TranscriptHitLocator.attach(hits: hits, to: rows)
+        XCTAssertEqual(mapped.map(\.id), ["seq-155"])
+    }
+
     func testAttachFillsRowIDsAndDropsHitsWithNoRow() {
         var timeline = ChatTimeline()
         timeline.reset(with: [userMessage(seq: 100), userMessage(seq: 200)])

@@ -38,6 +38,13 @@ public struct TimelineItem: Identifiable, Sendable {
             if case .gap = self { return false }
             return true
         }
+
+        /// 该缺口是否覆盖 `seq`（数据行恒 false）。命中归属判定用它识别
+        /// 「数据还没到」：落在缺口覆盖区间里的 seq 不能解析成落地行。
+        public func covers(seq: Int) -> Bool {
+            if case .gap(let start, let end, _) = self { return seq >= start && seq <= end }
+            return false
+        }
     }
 
     /// 缺口行的三态（与 SessionPipeline.GapRow.Status 一一对应）。

@@ -89,7 +89,23 @@ public enum TranscriptHitLocator {
         let dataRows = items.filter { $0.kind.isContentRow }
         guard let first = dataRows.first, let last = dataRows.last,
               seq >= first.seq, seq <= last.seq else { return nil }
-        return row(forSeq: seq, in: items)
+        // 归属同样只认数据行：旧实现在全量行上解析，缺口行的排序键（gap.start）
+        // ≤ 命中 seq，命中落在缺口里时会解析到缺口占位行本身——跳转梯子先把
+        // 视口滚到加载占位条，等真数据折叠进来再纠正，中间晃到错误位置
+        //（007 用例 49 链路回归）。缺口里返回 nil，调用方（梯子 / rebase
+        // waiter）按既有重试继续等，真行出现才落地。
+        var candidate: TimelineItem?
+        for row in dataRows {
+            if row.seq <= seq { candidate = row } else { break }
+        }
+        guard let candidate else { return nil }
+        // 同一 seq 上既有数据行又有缺口行时归数据行（数据行的拥有权优先）；
+        // 否则命中落在缺口覆盖区间里 = 数据还没到，不算命中。
+        if candidate.seq != seq,
+           items.contains(where: { $0.kind.covers(seq: seq) }) {
+            return nil
+        }
+        return candidate
     }
 
     /// Fills the phone-side row id on each hit, dropping the ones that have no row
@@ -98,25 +114,25 @@ public enum TranscriptHitLocator {
         // 同一条记录可能落进同一行（命中映射是按 seq → 行），去重后每行只留一条：
         // 列表用行 id 当身份，重复 id 会让 SwiftUI 的 `ForEach` 出现未定义渲染（少行/错行）。
         var seen = Set<String>()
-        let windowOldest = items.first?.seq ?? Int.max
         return hits.compactMap { hit in
             let role: TranscriptSearchHit.Role = switch hit.role {
             case "me": .me
             case "tool": .tool
             default: .agent
             }
-            // 命中在**已加载窗口之外**（浏览"我的提问"时几乎全是这样）：`row(forSeq:)` 会退化成
-            // "窗口第一行"，全都会被去重成一条——那正是"列表里只剩几条"的原因。
-            // 这类命中用合成身份（`seq-<n>`）：列表直接显示连接器给的 snippet，
-            // 点它时由 `ChatView.jumpToHit` 按 seq 换窗口再跳（那条路已经验过）。
-            if hit.seq < windowOldest {
+            // 没有可落地的**数据行**（命中在窗口之外——浏览"我的提问"时几乎全是这样，
+            // 或落在缺口里、数据还没到）：钳制版 `row(forSeq:)` 会退化成"窗口第一行"，
+            // 全都会被去重成一条——那正是"列表里只剩几条"的原因；旧实现还可能把缺口
+            // 占位行的 id 填给命中，点它就跳到加载占位条上。这类命中用合成身份
+            //（`seq-<n>`）：列表直接显示连接器给的 snippet，点它时由
+            // `ChatView.jumpToHit` 按 seq 换窗口再跳（那条路已经验过）。
+            guard let row = row(exactlyForSeq: hit.seq, in: items) else {
                 let synthetic = "seq-\(hit.seq)"
                 guard seen.insert(synthetic).inserted else { return nil }
                 return TranscriptSearchHit(id: synthetic, role: role, snippet: hit.snippet,
                                            highlightStart: hit.highlightStart,
                                            highlightLength: hit.highlightLength, seq: hit.seq)
             }
-            guard let row = row(forSeq: hit.seq, in: items) else { return nil }
             guard seen.insert(row.id).inserted else { return nil }
             return TranscriptSearchHit(id: row.id, role: role, snippet: hit.snippet,
                                        highlightStart: hit.highlightStart,
