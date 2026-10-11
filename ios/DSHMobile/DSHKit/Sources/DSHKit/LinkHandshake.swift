@@ -52,6 +52,9 @@ public struct LinkHandshake: Decodable, Sendable {
         public static let sessionStreams = "session-streams"
         public static let pairCode = "pair-code"
         public static let git = "git"
+        /// `_link/sessionWindow` 支持 roles 过滤、roleOf 按 data.source 严格归类
+        /// （连接器 7fac79f 起；无此能力的旧连接器，用户输入回填整体跳过）。
+        public static let historyRoleFilter = "history-role-filter"
     }
 }
 

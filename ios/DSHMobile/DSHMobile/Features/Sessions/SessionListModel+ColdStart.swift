@@ -45,7 +45,7 @@ extension SessionListModel {
         layer.registerAddresses(ordered)
         // 连接器能力在 Task 外面取（Task 里 store 被 MessageStore 遮蔽）：
         // 没有 history-role-filter 时回填整体跳过（摘要不入新库，等升级）。
-        let roleFilter = self.store?.supports("history-role-filter") ?? false
+        let roleFilter = self.store?.supports(LinkHandshake.Capability.historyRoleFilter) ?? false
         Task(priority: .utility) {
             let states = (try? await store.sessionStates(scope: scope)) ?? []
             var persistedRanges: [MessagePipeline.SessionRef: RangeIndex] = [:]
