@@ -70,4 +70,20 @@ final class HistoryWindowWireTests: XCTestCase {
         XCTAssertEqual(value.page().startSeq, 5)
         XCTAssertEqual(value.page().endSeq, 5)
     }
+
+    /// T039：`scanBoundary` 是可选字段——新连接器给（空页也前进的扫描边界），
+    /// 老连接器不给就解码成 nil，回填退回旧口径（最老返回记录）。
+    func testScanBoundaryIsOptionalOnTheWire() throws {
+        let withBoundary = """
+        {"records":[],"startSeq":null,"endSeq":null,"hasMore":true,"scanBoundary":388}
+        """
+        let value = try JSONDecoder().decode(HistoryWindowValue.self, from: Data(withBoundary.utf8))
+        XCTAssertEqual(value.scanBoundary, 388)
+        XCTAssertTrue(value.records.isEmpty)
+        let withoutBoundary = """
+        {"records":[],"startSeq":null,"endSeq":null,"hasMore":true}
+        """
+        let old = try JSONDecoder().decode(HistoryWindowValue.self, from: Data(withoutBoundary.utf8))
+        XCTAssertNil(old.scanBoundary, "老连接器没有这个字段，读出来必须是 nil 而不是 0")
+    }
 }

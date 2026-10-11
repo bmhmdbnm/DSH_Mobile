@@ -415,3 +415,84 @@ test('sessionWindow 带 roles 但整页无匹配时返回空页且 hasMore 如�
   assert.equal(result.value.records.length, 0)
   assert.equal(result.value.hasMore, false, '已扫到日志开头，没有更多')
 })
+
+// ---------------------------------------------------------------------------
+// spec 009 T039：扫描边界 scanBoundary（回填游标按"扫到哪"推进，空页不卡）
+// ---------------------------------------------------------------------------
+
+/// 1000 条里只有 seq 0 是 me：一次调用能把 12 个 chunk（612 个 seq）扫完，
+/// 一个匹配都没有，但扫描确实往前走了一大截。
+function sparseLog() {
+  const log = makeLog(1000).map((event) => ({ ...event, type: 'assistant/message' }))
+  log[0] = { ...log[0], type: 'user/message' }
+  return log
+}
+
+test('sessionWindow 整页被过滤为空时 scanBoundary 仍然前进（T039）', async () => {
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeQuery(sparseLog()))
+  const page = await service.handle(WINDOW_METHOD, { address: ADDRESS, before: 1000, limit: 10, roles: ['me'] })
+  assert.equal(page.ok, true)
+  assert.deepEqual(page.value.records, [], '整页被滤空')
+  assert.equal(page.value.startSeq, null, '空页给不出返回记录的边界（老口径不变）')
+  assert.equal(page.value.hasMore, true, '没扫到日志开头，更早还有匹配')
+  assert.equal(page.value.scanBoundary, 388, '扫描边界 = 这次真正扫到的最老 seq')
+  assert.ok(page.value.scanBoundary < 999, '空页也必须前进，否则回填原地卡住')
+})
+
+test('sessionWindow 有返回时 scanBoundary 与页对齐，下一页不重不漏（T039）', async () => {
+  // seq%5===0 是 me：一个 chunk（51 个 seq）里正好 10 条匹配，页满即停。
+  const log = makeLog(300).map((event, seq) => ({ ...event, type: seq % 5 === 0 ? 'user/message' : 'assistant/message' }))
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeQuery(log))
+  const first = await service.handle(WINDOW_METHOD, { address: ADDRESS, before: 300, limit: 10, roles: ['me'] })
+  assert.equal(first.ok, true)
+  assert.equal(first.value.records.length, 10)
+  assert.equal(first.value.startSeq, 250, '最老的一条返回记录')
+  assert.equal(first.value.scanBoundary, 249, '扫描边界在返回记录之下一个 seq（chunk 头，被滤掉的那条）')
+  const second = await service.handle(WINDOW_METHOD, {
+    address: ADDRESS, before: first.value.scanBoundary, limit: 10, roles: ['me'],
+  })
+  assert.equal(second.ok, true)
+  const firstSeqs = first.value.records.map((record) => record.event.seq)
+  const secondSeqs = second.value.records.map((record) => record.event.seq)
+  assert.ok(Math.max(...secondSeqs) < Math.min(...firstSeqs), '第二页严格更旧')
+  assert.deepEqual(
+    [...secondSeqs, ...firstSeqs],
+    Array.from({ length: 20 }, (_, index) => 200 + index * 5),
+    '两页接起来正好是 200..295 的全部 me，不重不漏')
+})
+
+test('sessionWindow 因 limit 截断丢记录时 scanBoundary 退回最老返回记录（不跳条）', async () => {
+  // 全是 me：一个 chunk 51 条匹配 > limit 10，最老端被裁掉，那些被裁的记录
+  // 没有回给手机，下一页必须重新扫到它们。
+  const log = makeLog(1000).map((event) => ({ ...event, type: 'user/message' }))
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeQuery(log))
+  const first = await service.handle(WINDOW_METHOD, { address: ADDRESS, before: 1000, limit: 10, roles: ['me'] })
+  assert.equal(first.ok, true)
+  assert.equal(first.value.truncatedBy, 'count')
+  assert.equal(first.value.startSeq, 990)
+  assert.equal(first.value.scanBoundary, first.value.startSeq, '被裁掉的记录要留给下一页，边界不能越过它们')
+  const second = await service.handle(WINDOW_METHOD, {
+    address: ADDRESS, before: first.value.scanBoundary, limit: 10, roles: ['me'],
+  })
+  assert.equal(second.value.records[second.value.records.length - 1].event.seq, 989, '紧接着上一页最老记录往下')
+})
+
+test('sessionWindow 不带 roles 时旧字段与老口径逐字不变（T039 兼容）', async () => {
+  const log = makeLog(500)
+  const service = bound(createHistoryService({ logger: { warn() {}, info() {} } }), fakeQuery(log))
+  const page = await service.handle(WINDOW_METHOD, { address: ADDRESS, before: 300, limit: 60 })
+  assert.equal(page.ok, true)
+  const { records, startSeq, endSeq, hasMore, clamped } = page.value
+  assert.equal(endSeq, 299)
+  assert.equal(startSeq, 240)
+  assert.equal(records.length, 60)
+  assert.equal(hasMore, true)
+  assert.equal(clamped, false)
+  assert.equal(page.value.scanBoundary, startSeq, '不带过滤时 scanBoundary 与 startSeq 同值（老客户端读的字段一字不改）')
+  // 整页无匹配也不带 roles：老口径照旧（空页 + hasMore=false）。
+  const empty = await service.handle(WINDOW_METHOD, { address: ADDRESS, before: 0, limit: 10 })
+  assert.equal(empty.value.records.length, 0)
+  assert.equal(empty.value.hasMore, false)
+  assert.equal(empty.value.startSeq, null)
+  assert.equal(empty.value.scanBoundary, null)
+})

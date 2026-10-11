@@ -16,12 +16,15 @@ private func makeRecord(_ seq: Int, text: String? = nil, source: String? = nil) 
 }
 
 /// 造一页窗口结果：records 升序（与连接器一致），startSeq 取页内最老。
-private func window(_ records: [SessionRecord], hasMore: Bool) -> HistoryWindowValue {
+/// `scanBoundary` 默认 nil = 老连接器（没有 T039 的扫描边界字段）。
+private func window(_ records: [SessionRecord], hasMore: Bool,
+                    scanBoundary: Int? = nil) -> HistoryWindowValue {
     HistoryWindowValue(
         records: records,
         startSeq: records.first?.event.seq,
         endSeq: records.last?.event.seq,
-        hasMore: hasMore)
+        hasMore: hasMore,
+        scanBoundary: scanBoundary)
 }
 
 /// T033 用户输入灌库（三表终局，spec 009 data-model v3）：
@@ -179,5 +182,92 @@ final class UserInputBackfillTests: XCTestCase {
         try await store.setUserInputsSyncedAt(scope: "mac", sessionId: "s1", at: Date())
         marker = try await store.userInputsSyncedAt(scope: "mac", sessionId: "s1")
         XCTAssertNotNil(marker)
+    }
+
+    // MARK: - T039 扫描边界（scanBoundary）
+
+    private func syncedAt() async throws -> Date? {
+        try await store.userInputsSyncedAt(scope: "mac", sessionId: "s1")
+    }
+
+    /// T039：整页被 roles 滤空时游标按扫描边界前进，不再原地重拉同一段。
+    func testEmptyFilteredPageAdvancesCursor() async throws {
+        let outcome = try await backfiller.backfill(scope: "mac", sessionId: "s1", lastSeq: 1000) { before in
+            if before == nil {
+                return window([], hasMore: true, scanBoundary: 500)
+            }
+            XCTAssertEqual(before, 500, "空页也要把 before 推到扫描边界（扫到 500 以下才算没扫过）")
+            return window([makeRecord(40), makeRecord(50)], hasMore: false, scanBoundary: 0)
+        }
+        XCTAssertEqual(outcome, .pulled(pages: 2, rows: 2))
+        let state = try await store.userInputSyncState(scope: "mac", sessionId: "s1")
+        XCTAssertNil(state?.resumeCursor, "第二页 hasMore=false：灌全，不留续拉锚点")
+        let synced = try await syncedAt()
+        XCTAssertNotNil(synced, "扫到日志开头才置完整性标记")
+    }
+
+    /// T039：连接器缺 `scanBoundary`（老连接器）时退回旧口径——最老返回记录续拉。
+    func testFallsBackToOldestReturnedSeqWithoutScanBoundary() async throws {
+        let outcome = try await backfiller.backfill(scope: "mac", sessionId: "s1", lastSeq: 100) { before in
+            if before == nil {
+                return window([makeRecord(90), makeRecord(100)], hasMore: true)
+            }
+            XCTAssertEqual(before, 90, "没有扫描边界就退回最老返回记录的 seq")
+            return window([makeRecord(10)], hasMore: false)
+        }
+        XCTAssertEqual(outcome, .pulled(pages: 2, rows: 3))
+    }
+
+    /// T039：完整性标记只在真的扫到日志开头时置。浏览路径先写下的半截记录
+    /// （有数据、无标记）不许让灌库"碰到已知 seq 就宣布完整"。
+    func testMarkerOnlyWhenScanReachedLogStart() async throws {
+        // 浏览路径留下一族 me 记录，但从没灌全过（无标记）。
+        try await store.applyWrites([
+            .upsertRecords(scope: "mac", sessionId: "s1", records: [makeRecord(100)]),
+        ])
+        let markerBefore = try await syncedAt()
+        XCTAssertNil(markerBefore)
+        let clockRef = clock!
+        let limited = UserInputBackfiller(store: store, now: { clockRef.date }, maxPages: 1)
+        let first = try await limited.backfill(scope: "mac", sessionId: "s1", lastSeq: 100) { before in
+            XCTAssertNil(before)
+            // 页里就有已入库的 100：没灌全时不许停；页数打满，本轮到此为止。
+            return window([makeRecord(100), makeRecord(50)], hasMore: true, scanBoundary: 50)
+        }
+        XCTAssertEqual(first, .pulled(pages: 1, rows: 2))
+        let markerAfterFirst = try await syncedAt()
+        XCTAssertNil(markerAfterFirst, "碰到已入库的 seq 不等于扫到开头，不许置完整性标记")
+        let state = try await store.userInputSyncState(scope: "mac", sessionId: "s1")
+        XCTAssertEqual(state?.resumeCursor, 50, "续拉锚点按扫描边界推进（原地不动就永远灌不完）")
+
+        clock.date = clock.date.addingTimeInterval(25 * 3600)
+        let second = try await limited.backfill(scope: "mac", sessionId: "s1", lastSeq: 100) { before in
+            XCTAssertEqual(before, 50, "从扫描边界续拉")
+            return window([makeRecord(10)], hasMore: false, scanBoundary: 0)
+        }
+        XCTAssertEqual(second, .pulled(pages: 1, rows: 1))
+        let markerAfterSecond = try await syncedAt()
+        XCTAssertNotNil(markerAfterSecond, "真的扫到日志开头才置标记")
+    }
+
+    /// T039：已灌全过的会话仍走增量捷径（碰到已入库 seq 即停），标记保持、
+    /// 续拉锚点清空（下次冷启动还是从最新开始补，而不是从头重扫）。
+    func testIncrementalStopKeepsMarkerAndClearsCursor() async throws {
+        _ = try await backfiller.backfill(scope: "mac", sessionId: "s1", lastSeq: 100) { _ in
+            window([makeRecord(80), makeRecord(100)], hasMore: false)
+        }
+        let marker = try await syncedAt()
+        XCTAssertNotNil(marker)
+        clock.date = clock.date.addingTimeInterval(25 * 3600)
+        let outcome = try await backfiller.backfill(scope: "mac", sessionId: "s1", lastSeq: 130) { before in
+            XCTAssertNil(before, "已灌全的会话从最新开始增量补拉")
+            return window([makeRecord(100), makeRecord(120), makeRecord(130)], hasMore: true)
+        }
+        XCTAssertEqual(outcome, .pulled(pages: 1, rows: 3))
+        let state = try await store.userInputSyncState(scope: "mac", sessionId: "s1")
+        XCTAssertEqual(state?.lastSeq, 130)
+        XCTAssertNil(state?.resumeCursor, "本轮没有更多要拉，不留续拉锚点")
+        let markerAfter = try await syncedAt()
+        XCTAssertNotNil(markerAfter, "增量补拉不清掉已有的完整性标记")
     }
 }

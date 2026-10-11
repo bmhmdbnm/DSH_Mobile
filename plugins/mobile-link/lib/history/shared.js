@@ -1,9 +1,13 @@
 /**
- * `_link/sessionWindow` / `_link/sessionFind` 共用的小工具：超时与错误文案。
+ * `_link/sessionWindow` / `_link/sessionFind` 共用的小工具：调用上限、超时与错误文案。
  *
  * 抽出来的理由：这两个助手原先在 `history.js` 里，而窗口、检索、探针三块都要用；
  * 放在这里可以让三块各自成文件（spec 007 T065）。
  */
+
+/// Host-side call ceiling. The connector's inbox is serial, so one slow query
+/// would otherwise hold up every other frame on the tunnel.
+export const HOST_CALL_TIMEOUT_MS = 8000
 
 /// 包一层超时：连接器的入站链是**串行**的，一次不返回的宿主调用会卡住整条链。
 export function withTimeout(promise, ms, label) {

@@ -24,7 +24,8 @@ public struct HistoryWindowRequest: Sendable, Codable {
     public let maxBytes: Int?
     /// Optional role filter (`["me"]`…), connector capability `history-role-filter`
     /// (spec 009 T031/T033). Filtering affects only which records come back;
-    /// the `before` cursor semantics are unchanged.
+    /// the `before` cursor semantics are unchanged. Since T039 such a page also
+    /// carries `scanBoundary` — the boundary a filtered pull advances by.
     public let roles: [String]?
 
     /// 「从最新开始」的线上安全值。连接器用 JS `Number.isSafeInteger` 校验
@@ -57,15 +58,26 @@ public struct HistoryWindowValue: Sendable, Codable {
     /// page starts from the log's newest event. The phone must treat a page that
     /// does not abut its window as "the log got shorter" rather than as a hole.
     public let clamped: Bool?
+    /// How far the scan actually got: the oldest seq the connector examined for
+    /// this page, usable directly as the next request's `before` (exclusive).
+    ///
+    /// Added by spec 009 T039 (`history-scan-boundary`). Why it is needed: a
+    /// `roles`-filtered page can be returned empty while the scan moved hundreds
+    /// of seqs, and the old cursor rule (the oldest **returned** record) then
+    /// stands still — the backfill re-reads the same stretch on every cold start.
+    /// `nil` means the connector predates the field; readers fall back to
+    /// `startSeq` (the old rule) and behave exactly as before.
+    public let scanBoundary: Int?
 
     public init(records: [SessionRecord], startSeq: Int?, endSeq: Int?, hasMore: Bool,
-                truncatedBy: String? = nil, clamped: Bool? = nil) {
+                truncatedBy: String? = nil, clamped: Bool? = nil, scanBoundary: Int? = nil) {
         self.records = records
         self.startSeq = startSeq
         self.endSeq = endSeq
         self.hasMore = hasMore
         self.truncatedBy = truncatedBy
         self.clamped = clamped
+        self.scanBoundary = scanBoundary
     }
 
     /// The page as the pager wants it.

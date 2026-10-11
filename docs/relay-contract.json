@@ -12,7 +12,8 @@
     "background-transfer",
     "history-window",
     "session-search",
-    "history-role-filter"
+    "history-role-filter",
+    "history-scan-boundary"
   ],
   "deviceToAgent": [
     "req",

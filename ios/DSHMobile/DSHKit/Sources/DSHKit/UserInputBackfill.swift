@@ -17,6 +17,10 @@ import GRDB
 /// - lastSeq 变大了 → 增量补拉：从最新一页开始，页里出现已入库的 seq 即停；
 /// - 拉到 `hasMore=false`（日志最老）才算灌全，置
 ///   `session_state.user_inputs_synced_at` 完整性标记（data-model v3）。
+///
+/// 游标推进（T039）：优先用连接器的 `scanBoundary`（这次扫到哪就推到哪）——
+/// roles 过滤会把整页滤空，按"最老返回记录"推进会在原地卡死；老连接器缺这个
+/// 字段时退回旧口径（最老返回记录的 seq）。
 public struct UserInputBackfiller: Sendable {
 
     /// 一页窗口拉取：`before == nil` 表示从最新开始（开区间上界 .max）。
@@ -43,6 +47,18 @@ public struct UserInputBackfiller: Sendable {
         case unsupported
         /// 拉了 `pages` 页，入库 `rows` 条（含幂等 replace）。
         case pulled(pages: Int, rows: Int)
+    }
+
+    /// 一次灌库扫描的收束状态（`pull` 的返回值）。
+    private struct Pull: Sendable {
+        var pages = 0
+        var rows = 0
+        /// 没灌全时的续拉锚点（下一页的 before）。
+        var resume: Int?
+        /// 本轮没有更多要拉（增量已接上上次的地盘）。
+        var done = false
+        /// 真的扫到日志开头（`hasMore == false`）。
+        var reachedStart = false
     }
 
     let store: MessageStore
@@ -77,47 +93,62 @@ public struct UserInputBackfiller: Sendable {
            previous.lastSeq >= lastSeq {
             return .skippedFresh
         }
-        // 增量锚点：此前灌过的最大 seq（record 表里的 me 子集）。全新会话为 0。
-        let knownMax = try await store.maxUserInputSeq(scope: scope, sessionId: sessionId) ?? 0
-        var before: Int? = previous?.resumeCursor
-        var pages = 0
-        var rows = 0
-        var completed = false
-        // 没灌全时的续拉锚点：下一页的 before（取当前页最老返回记录的 seq；
-        // 空页给不出新锚点，停在原锚点重拉，不劣化）。
-        var resume: Int? = before
-        while true {
-            let value = try await fetch(before)
-            pages += 1
-            if !value.records.isEmpty {
-                rows += value.records.count
-                try await store.applyWrites([
-                    .upsertRecords(scope: scope, sessionId: sessionId, records: value.records),
-                ])
-                // 增量停止：窗口按 seq 从新到旧扫，页里出现已入库的 seq 说明
-                // 已扫到上次灌过的地盘（upsert 幂等，重叠这几条 replace 无妨）。
-                if value.records.contains(where: { $0.event.seq <= knownMax }) {
-                    completed = true
-                    break
-                }
-            }
-            resume = value.startSeq ?? before
-            guard value.hasMore, let oldest = value.startSeq, pages < maxPages else {
-                // hasMore=false 才算到日志最老；空页（本窗口全是被过滤行）给不出
-                // 续拉游标，停在未灌全状态，下次冷启动从 resumeCursor 再试。
-                completed = !value.hasMore
-                break
-            }
-            before = oldest
-        }
+        let pull = try await collect(scope: scope, sessionId: sessionId,
+                                     from: previous?.resumeCursor, fetch: fetch)
         try await store.saveUserInputSyncState(
             scope: scope, sessionId: sessionId,
             state: State(pulledAt: now(), lastSeq: max(lastSeq, previous?.lastSeq ?? 0),
-                         resumeCursor: completed ? nil : resume))
-        if completed {
+                         resumeCursor: pull.done ? nil : pull.resume))
+        // 完整性标记只在真的扫到日志开头时置（T039）：碰到已入库 seq 只是「接上了
+        // 上次的地盘」，没灌全的会话（浏览路径可能先写过半截记录）不许就此宣布完整。
+        if pull.reachedStart {
             try await store.setUserInputsSyncedAt(scope: scope, sessionId: sessionId, at: now())
         }
-        return .pulled(pages: pages, rows: rows)
+        return .pulled(pages: pull.pages, rows: pull.rows)
+    }
+
+    /// 一页一页往回拉，直到灌全、页数打满或游标推不动。
+    private func collect(
+        scope: String, sessionId: String, from anchor: Int?, fetch: PageFetch
+    ) async throws -> Pull {
+        // 增量锚点：此前灌过的最大 seq（record 表里的 me 子集）。全新会话为 0。
+        let knownMax = try await store.maxUserInputSeq(scope: scope, sessionId: sessionId) ?? 0
+        // 「碰到已入库的 seq 即停」只对**已灌全过**的会话成立；没灌全时 record 表里
+        // 可能只有浏览路径顺手写下的半截记录，碰到它们就收工等于把不完整的子集
+        // 当成完整的（T039），所以那种情况继续往下扫到日志开头。
+        let alreadySynced = try await store.userInputsSyncedAt(scope: scope, sessionId: sessionId) != nil
+        var pull = Pull(resume: anchor)
+        var before = anchor
+        while true {
+            let value = try await fetch(before)
+            pull.pages += 1
+            if !value.records.isEmpty {
+                pull.rows += value.records.count
+                try await store.applyWrites([
+                    .upsertRecords(scope: scope, sessionId: sessionId, records: value.records),
+                ])
+                if alreadySynced, value.records.contains(where: { $0.event.seq <= knownMax }) {
+                    pull.done = true
+                    break
+                }
+            }
+            // 下一页的 before：连接器的扫描边界优先（整页被滤空也照样前进），
+            // 缺字段时退回「最老返回记录的 seq」；两者都没有就停在原锚点重拉。
+            let next = value.scanBoundary ?? value.startSeq ?? before
+            if !value.hasMore {
+                pull.resume = next
+                pull.done = true
+                pull.reachedStart = true
+                break
+            }
+            guard pull.pages < maxPages, let advanced = next, advanced < (before ?? Int.max) else {
+                pull.resume = next
+                break
+            }
+            pull.resume = advanced
+            before = advanced
+        }
+        return pull
     }
 }
 

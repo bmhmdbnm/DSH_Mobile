@@ -1,5 +1,15 @@
-import { withTimeout, messageOf } from './history/shared.js'
+import { HOST_CALL_TIMEOUT_MS, withTimeout, messageOf } from './history/shared.js'
 import { createProbeRunner } from './history/probe.js'
+import {
+  DEFAULT_LIMIT, DEFAULT_MAX_BYTES, WINDOW_CHUNK,
+  bytesOfRecords, displayRoleOf, roleOf, toRecord,
+} from './history/records.js'
+import { pageFrom, scanOlder } from './history/window.js'
+
+// Re-exported for the caller/tests that read them off this module (single source
+// is `history/records.js`; the call ceiling lives in `history/shared.js`).
+export { DEFAULT_MAX_BYTES, DEFAULT_LIMIT, WINDOW_CHUNK } from './history/records.js'
+export { HOST_CALL_TIMEOUT_MS } from './history/shared.js'
 
 /**
  * History window reads and in-session search, answered **locally** by the connector.
@@ -33,49 +43,17 @@ export const FIND_METHOD = '_link/sessionFind'
 /// `history-role-filter`: `_link/sessionWindow` accepts an optional `roles`
 /// array (e.g. `["me"]`) and returns only matching records; the seq cursor
 /// semantics are unchanged (spec 009 T031).
-export const HISTORY_CAPABILITIES = ['history-window', 'session-search', 'history-role-filter']
-
-/// Host-side call ceiling. The connector's inbox is serial, so one slow query
-/// would otherwise hold up every other frame on the tunnel.
-export const HOST_CALL_TIMEOUT_MS = 8000
+/// `history-scan-boundary`: a `roles`-filtered page also carries `scanBoundary`,
+/// the seq the scan really reached, so a caller can advance its cursor when a
+/// whole page is filtered empty (spec 009 T039). Purely additive: a client that
+/// does not read the field keeps the old cursor rule.
+export const HISTORY_CAPABILITIES = [
+  'history-window', 'session-search', 'history-role-filter', 'history-scan-boundary',
+]
 
 export function isHistoryMethod(method) {
   return method === WINDOW_METHOD || method === FIND_METHOD
 }
-
-function bytesOf(value) {
-  try {
-    return Buffer.byteLength(JSON.stringify(value), 'utf8')
-  } catch {
-    return -1
-  }
-}
-
-function summarizeEvents(events) {
-  if (!Array.isArray(events) || events.length === 0) {
-    return { count: 0, firstSeq: null, lastSeq: null, types: [] }
-  }
-  const types = [...new Set(events.map((event) => event?.type).filter(Boolean))].slice(0, 8)
-  return {
-    count: events.length,
-    firstSeq: events[0]?.seq ?? null,
-    lastSeq: events[events.length - 1]?.seq ?? null,
-    types,
-  }
-}
-
-/// Host hard cap: `readEvent` rejects `before > 50` (`before must be an integer
-/// between 0 and 50`). One chunk therefore yields at most 51 raw events.
-export const WINDOW_CHUNK = 50
-
-/// Defaults for one page. The phone may override both; the byte budget wins when
-/// they disagree (measured: 51 raw events can already be 253KB on a long session).
-export const DEFAULT_LIMIT = 60
-export const DEFAULT_MAX_BYTES = 256 * 1024
-
-/// Ceiling on how much one call reads, so a page request can never pin the
-/// connector's serial inbox (measured: ~30ms per chunk on a 2.3k session).
-export const MAX_CHUNKS_PER_CALL = 12
 
 /// One search chunk, and how many of them one call may scan. Measured on a
 /// 12968-event session: ~320ms per 2000-event chunk, so four chunks keep a call
@@ -93,59 +71,6 @@ function idOfAddress(address) {
     return typeof address.childSessionId === 'string' ? address.childSessionId : undefined
   }
   return undefined
-}
-
-function toRecord(event) {
-  return { type: 'event', event }
-}
-
-function bytesOfRecords(records) {
-  return bytesOf(records)
-}
-
-/// Drop the **oldest** end until the page fits. The newest edge must stay exact
-/// (it is the seq the phone's window abuts), so trimming only ever happens here.
-function trimToBytes(records, maxBytes) {
-  let truncated = false
-  while (records.length > 1 && bytesOfRecords(records) > maxBytes) {
-    records.shift()
-    truncated = true
-  }
-  return truncated
-}
-
-/// Which of the three transcript roles one event belongs to (the phone's own
-/// `TranscriptSearchHit.Role`).
-///
-/// `user/message` only counts as **me** when the event really came from the
-/// user: measured on a real session, ~24% of `user/message` events are
-/// plugin/system injections (`data.source.kind` other than `"user"`), and
-/// agent-relayed ones carry a `data.source.rpcId` starting with `agent-`.
-/// Events with no `data.source` at all predate the marker and stay `me`
-/// (old-data compatibility). Non-`me` user messages return `undefined` — they
-/// remain visible to full-text search, they just never enter the
-/// "my questions" set (spec 009 T031).
-function roleOf(event) {
-  const type = event?.type
-  if (type === 'user/message') {
-    const source = event?.data?.source
-    if (source !== undefined && source !== null && typeof source === 'object') {
-      if (source.kind !== undefined && source.kind !== 'user') return undefined
-      if (typeof source.rpcId === 'string' && source.rpcId.startsWith('agent-')) return undefined
-    }
-    return 'me'
-  }
-  if (type === 'assistant/message') return 'agent'
-  if (type === 'tool/call' || type === 'tool/result') return 'tool'
-  return undefined
-}
-
-/// What the search hit is *displayed* as. Injected/relayed user messages are
-/// not "me" for the curated set, but they are still user speech in full-text
-/// search (spec 009: excluded from "我的提问", not from the corpus), so an
-/// unfiltered search shows them under the user bucket.
-function displayRoleOf(event) {
-  return roleOf(event) ?? (event?.type === 'user/message' ? 'me' : undefined)
 }
 
 /// Validate the optional `roles` argument: unknown values would silently match
@@ -381,7 +306,9 @@ export function createHistoryService({ logger = console } = {}) {
     // Optional role filter (spec 009 T031): e.g. `roles: ["me"]` returns only
     // the caller's own questions. Filtering affects **which records come back,
     // never the cursor**: the window is still read as contiguous seqs and
-    // `before` still bounds the newest edge exactly.
+    // `before` still bounds the newest edge exactly. Since T039 a filtered page
+    // also carries `scanBoundary` (see history/window.js) so a caller can keep
+    // moving when a whole page is filtered empty.
     const { roles, error: rolesError } = parseRoles(args.roles)
     if (rolesError) return rolesError
 
@@ -389,51 +316,8 @@ export function createHistoryService({ logger = console } = {}) {
     if (inFlight.has(key)) return failure('link/busy', 'another window read is in flight for this session')
     inFlight.add(key)
     try {
-      let cursor = Math.min(before - 1, through ?? Number.MAX_SAFE_INTEGER)
-      const events = []
-      let truncatedBy = null
-      let clamped = false
-      /// Whether the scan ran into the start of the log (or an empty chunk):
-      /// the role-filtered page needs it to answer "is there more?" — a
-      /// filtered page can be short even when older matching events exist.
-      let exhausted = false
-      for (let chunk = 0; chunk < MAX_CHUNKS_PER_CALL && cursor >= 0; chunk += 1) {
-        const { window: result, clamped: thisClamped } = await readChunk(sessionId, cursor)
-        clamped = clamped || thisClamped
-        const batch = Array.isArray(result.events) ? result.events : []
-        if (batch.length === 0) { exhausted = true; break }
-        for (let index = batch.length - 1; index >= 0; index -= 1) {
-          const event = batch[index]
-          if (roles !== undefined && !roles.has(roleOf(event))) continue
-          events.unshift(event)
-        }
-        if (events.length >= limit || bytesOfRecords(events.map(toRecord)) >= maxBytes) {
-          truncatedBy = events.length >= limit ? 'count' : 'bytes'
-          break
-        }
-        const next = (result.startSeq ?? batch[0].seq) - 1
-        if (next >= cursor) { exhausted = true; break }
-        cursor = next
-        if (cursor < 0) { exhausted = true; break }
-      }
-      const records = events.map(toRecord)
-      // Trim from the oldest end only: the newest edge is the seq the phone's
-      // window abuts, so it must stay exact. A chunk is 51 events, so without
-      // this the page would overshoot `limit` by up to one chunk.
-      if (records.length > limit) {
-        records.splice(0, records.length - limit)
-        truncatedBy = 'count'
-      }
-      if (trimToBytes(records, maxBytes)) truncatedBy = 'bytes'
-      if (records.length === 0) {
-        return { ok: true, value: { records: [], startSeq: null, endSeq: null, hasMore: roles !== undefined && !exhausted, truncatedBy: null, clamped } }
-      }
-      const startSeq = records[0].event.seq
-      const endSeq = records[records.length - 1].event.seq
-      // Filtered pages: "more" means older seqs remain unscanned **and** the
-      // page did not already reach the log's first event.
-      const hasMore = roles === undefined ? startSeq > 0 : (startSeq > 0 && !exhausted)
-      return { ok: true, value: { records, startSeq, endSeq, hasMore, truncatedBy, clamped } }
+      const scan = await scanOlder({ readChunk, sessionId, before, through, limit, maxBytes, roles })
+      return { ok: true, value: pageFrom(scan, { limit, maxBytes, roles }) }
     } catch (error) {
       logger.warn?.(`mobile-link: sessionWindow failed: ${messageOf(error)}`)
       return hostFailure(error)
