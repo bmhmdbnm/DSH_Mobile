@@ -109,12 +109,12 @@ final class MessageLayer {
                 return nil
             },
             // T022 重发去重：崩溃前可能确认了没落库。重发前按 clientId 对服务端
-            // 最新页查一次（before=.max 即最新），已有则只替换不重发。
+            // 最新页查一次（safeMaxBefore 即最新；Int.max 过不了连接器的 JS 安全整数校验，T036），已有则只替换不重发。
             confirmationLookup: { ref, clientId in
                 guard let client = client(),
                       let address = addresses.address(for: ref.sessionId) else { return nil }
                 let value = try? await client.historyWindow(HistoryWindowRequest(
-                    address: address, before: .max, limit: 50, maxBytes: 256 * 1024))
+                    address: address, before: HistoryWindowRequest.safeMaxBefore, limit: 50, maxBytes: 256 * 1024))
                 return value?.records.first { record in
                     guard case .userMessage(let message) = ChatEventDecoder.decode(record.event)
                     else { return false }
@@ -154,7 +154,7 @@ final class MessageLayer {
                 let outcome = try await backfiller.backfill(
                     scope: scope, sessionId: summary.sessionId, lastSeq: lastSeq) { before in
                         try await client.historyWindow(HistoryWindowRequest(
-                            address: address, before: before ?? .max,
+                            address: address, before: before ?? HistoryWindowRequest.safeMaxBefore,
                             limit: 200, maxBytes: 256 * 1024, roles: ["me"]))
                     }
                 if case .pulled(let pages, let rows) = outcome {
@@ -164,7 +164,12 @@ final class MessageLayer {
                     ], force: true)
                 }
             } catch {
-                // 失败不记账（backfiller 语义），下次冷启动重试；静默，不刷错误。
+                // 失败不记账（backfiller 语义），下次冷启动重试；不刷错误，
+                // 但留探针——「灌库静默全挂」曾经只有加临时埋点才看得见（T036）。
+                ViewportProbe.note("userinputs.backfill.error", [
+                    "session": summary.sessionId,
+                    "error": String(describing: error),
+                ], force: true)
                 continue
             }
         }
