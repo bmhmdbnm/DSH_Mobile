@@ -76,7 +76,10 @@ final class MessageLayer {
                 { range, priority in
                     // 只对用户驱动的取页注入失败：预取/冷启动吃配额会让慢闸
                     // 场景③永远等不到可见失败（007 的 PageFailureInjector 头注）。
-                    if priority == .userVisible, pageFailures.shouldFail() {
+                    // failPageArmed：带 -DSHProbeFailPageOnDrive 时再等驱动开始，
+                    // 打开阶段的可见取页按竞争拿优先级，会随机吃掉配额（用例 48）。
+                    if priority == .userVisible, ProbeVariants.failPageArmed,
+                       pageFailures.shouldFail() {
                         throw PageFailureInjected()
                     }
                     guard let client = client() else { throw FetchFailure.notConnected }

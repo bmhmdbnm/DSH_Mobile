@@ -550,6 +550,21 @@ enum ProbeVariants {
         return Int(arguments[index + 1]) ?? 0
     }
 
+    /// `-DSHProbeFailPageOnDrive`：故障注入只在翻页驱动开始之后生效（用例 48）。
+    ///
+    /// 打开会话时的可见取页按竞争拿到 `.userVisible` / `.prefetch` 不一，会提前吃掉
+    /// 注入配额——用例 48 四次复跑里打开阶段消耗 0–2 次不等，配额在点重试那一刻
+    /// 可能还没用光，恢复结果因此不确定。驱动开始后才武装，注入次数就是确定的：
+    /// 驱动送顶 1 次 + 一次性自动补试 1 次。
+    static var failPageOnDrive: Bool {
+        ProcessInfo.processInfo.arguments.contains("-DSHProbeFailPageOnDrive")
+    }
+    nonisolated(unsafe) private static var _driveBegan = false
+    /// 驱动开始（`-DSHProbeOlderScroll` 第一轮）时由 TranscriptListHost 报到。
+    static func noteDriveBegan() { _driveBegan = true }
+    /// 注入器此刻是否该生效：没带 OnDrive 旗标时维持旧语义（恒生效）。
+    static var failPageArmed: Bool { !failPageOnDrive || _driveBegan }
+
     /// 复现用：失败后那次自动补试的等待时长（毫秒）。默认 3 秒——对人是"自己就好了"，
     /// 但要让用例稳定看到重试条，就得把这段窗口拉长（`-DSHProbeAutoRetryMs 20000`）。
     static var autoRetryMs: Int {
@@ -750,6 +765,9 @@ enum ProbeVariants {
     static var reclaimScreens: Int { 5 }
     static var rehydrateScreens: Int { 2 }
     static var failPageAttempts: Int { 0 }
+    static var failPageOnDrive: Bool { false }
+    static func noteDriveBegan() {}
+    static var failPageArmed: Bool { false }
     static var lazyStack: Bool { false }
     static var noRowProbe: Bool { false }
     static var noPixelProbe: Bool { false }

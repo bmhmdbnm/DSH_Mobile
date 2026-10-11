@@ -96,7 +96,20 @@ private struct GapRowView: View {
             .frame(maxWidth: .infinity)
             .frame(height: Self.height)
             .contentShape(Rectangle())
-            .accessibilityIdentifier("row.gap.\(accessibilityState)")
+            // 标识要放在各自元素上：容器上的 accessibilityIdentifier 会下传覆盖子元素
+            // 自己的 id（仓库测试约定）。失败态的容器标识会让按钮上的 chat.gap.retry
+            // 被覆盖成 row.gap.failed，XCUITest 因此找不到重试条（用例 48，
+            // 2026-10-11 复跑实测：屏幕上看得见、查询返回不存在）。
+            .accessibilityIdentifier(containerIdentifier)
+    }
+
+    /// 失败态的对外标识就是重试按钮自己的 `chat.gap.retry`（行即是按钮）；
+    /// loading/exhausted 是纯文本行，标识留在容器上。
+    private var containerIdentifier: String {
+        switch status {
+        case .failed: return "chat.gap.retry"
+        case .loading, .exhausted: return "row.gap.\(accessibilityState)"
+        }
     }
 
     @ViewBuilder

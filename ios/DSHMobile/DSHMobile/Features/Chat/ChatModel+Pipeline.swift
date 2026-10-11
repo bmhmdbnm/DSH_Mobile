@@ -417,12 +417,23 @@ final class ChatPipelineBridge {
     func retryGap(start: Int, end: Int) async {
         guard let session else { return }
         if start == 0 {
+            // 顶部合成行也要走「清计数再拉」：原来直接 loadOlder，对齐页失败计数
+            // 到 maxRetries 上限后 fetchPage 直接抛 gapFailed，顶部重试条从此
+            // 永远点不动（用例 48 run 20261011-103217 实测：点击后只见 gapFailed，
+            // 行不消失）。与中间缺口同一个 retry 契约（SessionPipeline.retry）。
             olderFailure = nil
             didAutoRetry = false
-            await loadOlder()
+            guard let oldest = records.keys.min(), oldest > 1 else { return }
+            let lower = max(1, oldest - Self.pageSize)
+            try? await session.retry(range: lower...(oldest - 1))
+            // 顶部行的恢复不走 loadOlder，pager.page 打不到；恢复动作要可观测（用例 48）。
+            ViewportProbe.note("pager.retry", ["start": String(lower), "end": String(oldest - 1)],
+                               force: true)
             return
         }
         try? await session.retry(range: start...end)
+        ViewportProbe.note("pager.retry", ["start": String(start), "end": String(end)],
+                           force: true)
     }
 
     /// 预算裁剪同步（008 FR-002）：模型丢到哪条，桥里的记录也丢到哪条，

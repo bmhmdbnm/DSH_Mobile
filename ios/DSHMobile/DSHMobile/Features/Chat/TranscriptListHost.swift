@@ -219,6 +219,7 @@ struct TranscriptListRepresentable: UIViewRepresentable {
             driveStarted = true
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(6))   // 与 007 的驱动一致：等首屏钉底
+                ProbeVariants.noteDriveBegan()  // -DSHProbeFailPageOnDrive 的武装点（用例 48）
                 self?.onDriveBegin?()
                 for round in 1...rounds {
                     guard let self, let host = self.host else { return }
@@ -234,6 +235,12 @@ struct TranscriptListRepresentable: UIViewRepresentable {
                     ])
                     host.scrollToTop()
                     try? await Task.sleep(for: .seconds(3))
+                    // 失败落锚的一次性 rebase 会把视口从绝对顶往下挪约一行：缺口行恰好被
+                    // 推到视口上方（用例 48 的 run 20261011-100805：distance=56、视口第一行
+                    // 已是缺口后的内容行，重试条在屏幕外 44pt）。真实手指滑到顶会停在绝对顶，
+                    // 所以驱动在等取页结束之后补送一次，落在与读者一致的落点。
+                    host.scrollToTop()
+                    try? await Task.sleep(for: .milliseconds(600))
                     // 驱动还要能"滑回被回收的那一段"：只在两端跳的话，被回收的往往在中间，
                     // `near` 永远是 0，水合这条路在仿真器里就永远验不到（2026-10-08 实测）。
                     // 胶囊类用例用 -DSHProbeOlderNoReclaim 关掉这段绕行（它会把视口带回底部）。
