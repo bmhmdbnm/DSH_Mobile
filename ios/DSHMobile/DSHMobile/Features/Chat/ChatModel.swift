@@ -656,6 +656,20 @@ final class ChatModel {
         return dropped
     }
 
+    /// 水合的**同步内存层**：只查 `timeline.items`，不碰磁盘。
+    ///
+    /// 回收只是宿主侧换了载荷，正本仍在时间线里（只有预算裁剪 `dropOldestRows`
+    /// 才会真的移除，而裁剪会把宿主行一起拿走），所以水合请求绝大多数在内存里
+    /// 就有。调用方（ChatView 的 `onNeedRehydrate`）先走这条路**同帧**还回，
+    /// 再为未命中的 seq 走 `items(forSeqs:)` 的异步磁盘兜底——否则「透明占位 +
+    /// 异步水合」会让快速甩动的视口比水合先到，出现单帧白段
+    /// （用例 55，run 20261011-111236 的 probe-01…08-gap）。
+    func cachedItems(forSeqs seqs: [Int]) -> [TimelineItem] {
+        guard !seqs.isEmpty else { return [] }
+        let wanted = Set(seqs)
+        return timeline.items.filter { wanted.contains($0.seq) }
+    }
+
     /// 按 seq 把行内容取回来（spec 008 的 US3 / SC-004：水合 1 秒内、0 网络）。
     ///
     /// **内存优先**：被回收的行只是宿主侧换了载荷，`timeline.items` 里的行还在，

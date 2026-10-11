@@ -493,8 +493,22 @@ struct ChatView: View {
                     listHostRef?.apply(.reclaim(ids))
                 },
                 onNeedRehydrate: { seqs in
+                    // **内存命中同帧还回**（owner 定调：回收/水合不许有任何过渡性视觉
+                    // 变化，0.2s 闪白也算缺陷）：宿主从主线程的滚动防抖任务里调进来，
+                    // 正本又还在 `timeline.items` 里，先同步水合，不让视口看到
+                    // 「透明占位 + 异步水合」之间那一帧白（用例 55，run 20261011-111236）。
+                    let cached = MainActor.assumeIsolated { model.cachedItems(forSeqs: seqs) }
+                    if !cached.isEmpty {
+                        listHostRef?.rehydrate(items: cached)
+                        listHostRef?.scheduleReclaimCheck()
+                    }
+                    // 内存未命中（预算裁剪已把它从时间线里丢掉）才走异步磁盘兜底：
+                    // 甩得再快也最多看到磁盘水合的延迟，而内存命中是绝大多数。
+                    let hitSeqs = Set(cached.map(\.seq))
+                    let missing = seqs.filter { !hitSeqs.contains($0) }
+                    guard !missing.isEmpty else { return }
                     Task { @MainActor in
-                        let items = await model.items(forSeqs: seqs)
+                        let items = await model.items(forSeqs: missing)
                         guard !items.isEmpty else { return }
                         listHostRef?.rehydrate(items: items)
                         // 水合完立刻再查一轮：附近还有回收行（上一轮没取全、或新滚进来

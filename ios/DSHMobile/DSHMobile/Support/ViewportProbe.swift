@@ -597,7 +597,12 @@ enum ProbeVariants {
     }
 
     static var reclaimScreens: Int { screensArg("-DSHProbeReclaimScreens") ?? 5 }
-    static var rehydrateScreens: Int { screensArg("-DSHProbeRehydrateScreens") ?? 2 }
+    // 水合带 2 → 4 屏（owner 2026-10-11 定调：回收/水合不得出现任何过渡性视觉变化，
+    // 0.2s 闪白也算缺陷）。量化：回收/水合判定是滚动里 400ms 防抖触发的，仿真器甩动
+    // 峰值 ~4000–6000pt/s 时一个防抖窗能走 1600–2400pt（≈2.4–3.6 屏，vp_h≈671），
+    // 2 屏（1342pt）兜不住；4 屏（2684pt）可覆盖 ≤6700pt/s 的甩动。仍严格小于
+    // 回收保护带 5 屏，乒乓在构造上不可能（ViewportBandPlanner 的口径不变）。
+    static var rehydrateScreens: Int { screensArg("-DSHProbeRehydrateScreens") ?? 4 }
 
     /// 复现用：强制走一次"回收 → 再水合"的真实代码路径（spec 008 的 US3 / SC-004）。
     /// 仿真器里**造不出**"滑回被回收的那一段"（未渲染的行 `scrollTo` 落不下去），
@@ -763,7 +768,7 @@ enum ProbeVariants {
     static var payloadBudgetKB: Int? { nil }
     static var forceRehydrate: Bool { false }
     static var reclaimScreens: Int { 5 }
-    static var rehydrateScreens: Int { 2 }
+    static var rehydrateScreens: Int { 4 }
     static var failPageAttempts: Int { 0 }
     static var failPageOnDrive: Bool { false }
     static func noteDriveBegan() {}
