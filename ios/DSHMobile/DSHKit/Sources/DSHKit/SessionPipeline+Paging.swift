@@ -30,6 +30,15 @@ extension SessionPipeline {
         (range.lowerBound + range.upperBound) / 2
     }
 
+    /// 服务端是否**明确说**这页到头了（spec 可见性兜底 / T038「空页即异常」）：
+    /// 只有拉的是最底页（对齐起点 1）且 `hasMore == false` 或被日志裁剪（clamped）
+    /// 才算「已到最早」。空回包 + 这个判定 = 正常终态（置 topExhausted）；
+    /// 空回包 + 判定不成立 = 可重试失败（见 SessionPipeline.fetchPage）。
+    /// 网络失败永远不得当作到底。
+    static func reachedEnd(_ page: FetchPage, requested: ClosedRange<Int>) -> Bool {
+        requested.lowerBound == 1 && (page.hasMore == false || page.clamped)
+    }
+
     // MARK: - gap 行派生（从主文件拆出，同一 500 行上限）
 
     /// 缺口行由区间集派生（spec「缺口行的生命周期」）：窗口 = 最老…最新。

@@ -54,17 +54,22 @@ extension ChatModel {
 }
 
 /// 每会话一份的 009 接线状态：快照里的有序记录、缺口行、折叠代数。
+///
+/// 拆文件：用户驱动的取页与追平（向上翻页 / 顶部缺口行 / 尾部追平）在
+/// `ChatModel+PipelineFetch.swift`；这里留订阅、折叠落地、跳转与上行。
+/// 被那个扩展用到的成员因此是 internal 而不是 private（沿用 DSHKit 里
+/// `SessionPipeline+Paging` 的同一做法）。
 @MainActor
 final class ChatPipelineBridge {
 
-    private weak var model: ChatModel?
+    weak var model: ChatModel? // internal：+PipelineFetch（取页半边）要用
     private let pipeline: MessagePipeline
     private let ref: MessagePipeline.SessionRef
     /// 会话级管道（拿一次存下来：取页/重试/读 topExhausted 都走它）。
-    private var session: SessionPipeline?
+    var session: SessionPipeline? // internal：+PipelineFetch 要用
 
     /// 快照数据行的唯一事实来源（seq → 记录；与 MessagePipeline 的广播保持一致）。
-    private var records: [Int: SessionRecord] = [:]
+    var records: [Int: SessionRecord] = [:] // internal：+PipelineFetch 要用
     /// 行 id → seq（.remove 按行 id 核销用）。
     private var rowSeqs: [String: Int] = [:]
     /// T022 上行状态（seq → pending/failed/sent）：折叠后回标到时间线行
@@ -83,14 +88,20 @@ final class ChatPipelineBridge {
     private var rebaseWaiters: [UUID: (seq: Int, continuation: CheckedContinuation<String?, Never>)] = [:]
     private var rebaseTimeouts: [UUID: Task<Void, Never>] = [:]
     /// 「向上翻页」进行中（顶部缺口行 spinner 由它驱动，镜像进 model.isLoadingOlder）。
-    private var isLoadingOlder = false
+    var isLoadingOlder = false // internal：+PipelineFetch 要用
     /// 最近一次取页失败原因（顶部缺口行据此转「点击重试」）。
-    private var olderFailure: String?
+    var olderFailure: String? // internal：+PipelineFetch 要用
     /// 失败后的一次自动补试（沿用 007 FR-004 语义：只补一次，不循环）。
-    private var didAutoRetry = false
+    var didAutoRetry = false // internal：+PipelineFetch 要用
+    /// T037：锚点不可知时挂起的「向上翻页」——首个数据落地后自动补一次
+    /// （没有它，读者会在管道还没数据时拉了却什么都没发生）。置位/清位都在
+    /// `ChatModel+PipelineFetch.swift` 与 `apply`。
+    var pendingOlderRequest = false // internal：+PipelineFetch 要用
 
     /// 一次「向上翻页」拉多少条（与管道页大小一致）。
-    private static let pageSize = 50
+    static let pageSize = 50 // internal：+PipelineFetch / 尾部追平预算要用
+    /// 点胶囊直跳最新的降级阈值（页）：超过就丢中间段（spec 场景 7）。
+    static let catchUpPageBudget = 5 // internal：+PipelineFetch 要用
 
     init(model: ChatModel, pipeline: MessagePipeline, ref: MessagePipeline.SessionRef) {
         self.model = model
@@ -102,6 +113,12 @@ final class ChatPipelineBridge {
     func stop() {
         subscription?.cancel()
         subscription = nil
+        // T037：挂起的「向上翻页」（加载中 / 已到最早）不能跨会话留着——桥本身随
+        // 会话丢弃，但 `model.isLoadingOlder` 是共享的，留着会挡住新会话的自动补页。
+        pendingOlderRequest = false
+        isLoadingOlder = false
+        model?.notePipelineLoadingOlder(false)
+        model?.notePipelineOlderFailure(nil)
         // 关会话时唤醒还挂着的跳转 waiter，不让 continuation 泄漏。
         let waiters = rebaseWaiters
         rebaseWaiters.removeAll()
@@ -191,6 +208,15 @@ final class ChatPipelineBridge {
             }
         }
         if tailArrivals > 0 { model?.noteTailArrivals(tailArrivals) }
+        // T037：锚点还不可知时挂起的「向上翻页」（管道刚就绪、首帧数据刚到）——
+        // 数据一落地就补一次，不让读者停在「加载中」。清位后置 false 再进
+        // loadOlder（它自己要求不在飞）。
+        if pendingOlderRequest, !records.isEmpty {
+            pendingOlderRequest = false
+            isLoadingOlder = false
+            model?.notePipelineLoadingOlder(false)
+            Task { @MainActor [weak self] in await self?.loadOlder() }
+        }
         // 快进路：全部增量都是"流式行文本变长"且缺口/删除都没动 → 单行更新。
         // 提交由 reconcile 走 008 统一锚一次修正（T021），不单独触发布局。
         if onlyStreamingUpdates, !hasRemove, !gapsChanged, !streamUpdates.isEmpty,
@@ -223,7 +249,7 @@ final class ChatPipelineBridge {
 
     /// 重建：读 topExhausted → 折叠（离主线程）→ 代数校验 → 落回 model。
     /// 只有缺口变化时跳过整树折叠（spinner → 点击重试不碰数据行）。
-    private func refold(messagesChanged: Bool, gapsChanged: Bool) {
+    func refold(messagesChanged: Bool, gapsChanged: Bool) { // internal：+PipelineFetch 要用
         guard messagesChanged || gapsChanged else { return }
         foldGeneration += 1
         let generation = foldGeneration
@@ -275,19 +301,7 @@ final class ChatPipelineBridge {
     }
 
     /// 顶部合成行：已到最早（仅 topExhausted）> 失败可重试 > 加载中。
-    /// start=0 是合成身份（`gap:0-0`），排序恒在最前，不与任何真实缺口撞键。
-    private func topGapItem(topExhausted: Bool) -> TimelineItem? {
-        if topExhausted {
-            return ChatTimeline.gapItem(start: 0, end: 0, status: .exhausted)
-        }
-        if olderFailure != nil {
-            return ChatTimeline.gapItem(start: 0, end: 0, status: .failed(retryable: true))
-        }
-        if isLoadingOlder {
-            return ChatTimeline.gapItem(start: 0, end: 0, status: .loading)
-        }
-        return nil
-    }
+    /// 实现在 `ChatModel+PipelineFetch.swift`（取页半边）。
 
     private static func map(_ status: SessionPipeline.GapRow.Status) -> TimelineItem.GapStatus {
         switch status {
@@ -298,42 +312,6 @@ final class ChatPipelineBridge {
     }
 
     // MARK: - 用户动作（转发管道）
-
-    /// 向上翻页（.userVisible）：向管道请求窗口之上的对齐范围；缺口由管道拉取回填。
-    func loadOlder() async {
-        guard let model, let session, !isLoadingOlder else { return }
-        guard let oldest = records.keys.min(), oldest > 1 else { return }
-        isLoadingOlder = true
-        olderFailure = nil
-        model.notePipelineLoadingOlder(true)
-        model.notePipelineOlderFailure(nil)
-        refold(messagesChanged: false, gapsChanged: true) // 顶部 spinner 立即出现
-        defer {
-            isLoadingOlder = false
-            model.notePipelineLoadingOlder(false)
-            refold(messagesChanged: false, gapsChanged: true)
-        }
-        let lower = max(1, oldest - Self.pageSize)
-        do {
-            _ = try await session.records(in: lower...(oldest - 1), priority: .userVisible)
-            didAutoRetry = false
-            // 009 取页链路原来没有任何探针事件（pager.page 只在旧 pager 路径上），
-            // 失败语义不可观测。按同一名字补回（用例按「逐页落地、首尾相接」验收）。
-            ViewportProbe.note("pager.page", [
-                "start": String(lower), "end": String(oldest - 1),
-                "oldest": String(records.keys.min() ?? -1),
-            ], force: true)
-        } catch {
-            // 失败绝不写成「没有更多」（T016）：顶部行转「点击重试」，并补试一次。
-            olderFailure = String(localized: "读取更早的记录失败，点按重试")
-            model.notePipelineOlderFailure(olderFailure)
-            ViewportProbe.note("pager.failed", [
-                "start": String(lower), "end": String(oldest - 1),
-                "reason": String(describing: error),
-            ], force: true)
-            scheduleAutoRetry()
-        }
-    }
 
     /// 跳转（.jump）：抢占在途低优预取，只拉目标附近一段；返回命中行的 id。
     ///
@@ -413,29 +391,6 @@ final class ChatPipelineBridge {
         }
     }
 
-    /// 缺口行「点击重试」（T016）：清掉失败计数再拉；顶部行等价于重试向上翻页。
-    func retryGap(start: Int, end: Int) async {
-        guard let session else { return }
-        if start == 0 {
-            // 顶部合成行也要走「清计数再拉」：原来直接 loadOlder，对齐页失败计数
-            // 到 maxRetries 上限后 fetchPage 直接抛 gapFailed，顶部重试条从此
-            // 永远点不动（用例 48 run 20261011-103217 实测：点击后只见 gapFailed，
-            // 行不消失）。与中间缺口同一个 retry 契约（SessionPipeline.retry）。
-            olderFailure = nil
-            didAutoRetry = false
-            guard let oldest = records.keys.min(), oldest > 1 else { return }
-            let lower = max(1, oldest - Self.pageSize)
-            try? await session.retry(range: lower...(oldest - 1))
-            // 顶部行的恢复不走 loadOlder，pager.page 打不到；恢复动作要可观测（用例 48）。
-            ViewportProbe.note("pager.retry", ["start": String(lower), "end": String(oldest - 1)],
-                               force: true)
-            return
-        }
-        try? await session.retry(range: start...end)
-        ViewportProbe.note("pager.retry", ["start": String(start), "end": String(end)],
-                           force: true)
-    }
-
     /// 预算裁剪同步（008 FR-002）：模型丢到哪条，桥里的记录也丢到哪条，
     /// 否则下一次 diff 重建会把刚丢的行补回来。
     func dropRecords(below seq: Int) {
@@ -448,45 +403,6 @@ final class ChatPipelineBridge {
     func resend(clientId: UUID) async throws {
         try await pipeline.resend(clientId: clientId, for: ref)
     }
-
-    // MARK: - 尾部追平（T018 点胶囊 / T019 可见性兜底）
-
-    /// 桥已收到的最大 seq。
-    func localNewestSeq() -> Int { records.keys.max() ?? 0 }
-
-    /// 尾部追平展示态变了：底部合成缺口行生灭。
-    func noteCatchUpPresentationChanged() {
-        refold(messagesChanged: false, gapsChanged: true)
-    }
-
-    /// 把尾部对到 host 的 lastSeq（spec 009 场景 7 /「可见性兜底」）。
-    ///
-    /// - 差值 ≤ 5 页：`records(in:, .userVisible)` 逐段补齐，diff 正常回填，
-    ///   底部 spinner 由 `isCatchingUpTail` 期间的合成缺口行表达；
-    /// - 差值 > 5 页：降级为直接跳最新页（.jump），中间段丢弃——与跳转同语义，
-    ///   留下的洞是普通的中间缺口行（点它可按既有重试路径补齐）。
-    /// 幂等由管道的 in-flight 页表保证（同页合并）。
-    func catchUp(toHost lastSeq: Int) async {
-        guard let session, lastSeq > 0 else { return }
-        let localNewest = records.keys.max() ?? 0
-        let missing = lastSeq - localNewest
-        guard missing > 0 else { return }
-        if missing > Self.pageSize * Self.catchUpPageBudget {
-            let lower = max(1, lastSeq - Self.pageSize + 1)
-            _ = try? await session.records(in: lower...lastSeq, priority: .jump)
-            // T026 修复 US3 遗留：降级丢弃的中间段不在任何在飞拉取里，
-            // 停在 .loading 永远转圈。置为可重试失败——用户点它才拉，
-            // 符合「丢弃中间段」的省流量语义（spec 场景 7）。
-            if localNewest + 1 <= lower - 1 {
-                await session.abandonGap((localNewest + 1)...(lower - 1))
-            }
-        } else {
-            _ = try? await session.records(in: (localNewest + 1)...lastSeq, priority: .userVisible)
-        }
-    }
-
-    /// 点胶囊直跳最新的降级阈值（页）：超过就丢中间段（spec 场景 7）。
-    private static let catchUpPageBudget = 5
 
     /// 下行数据进管道（follow 快照 / WSS 事件）：合并进热窗口并经 diff 重建。
     func applyDownstream(records page: [SessionRecord]) {
@@ -510,17 +426,6 @@ final class ChatPipelineBridge {
         // 批量入口：一份快照合并成一次 diff，避免按条数触发重建。
         Task { @MainActor [weak self] in
             await self?.session?.apply(events: events)
-        }
-    }
-
-    /// 失败后的一次自动补试（读者停在顶部时没有任何几何变化可触发重试）。
-    private func scheduleAutoRetry() {
-        guard !didAutoRetry else { return }
-        didAutoRetry = true
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(3000))
-            guard !Task.isCancelled, let self, self.olderFailure != nil else { return }
-            await self.loadOlder()
         }
     }
 }

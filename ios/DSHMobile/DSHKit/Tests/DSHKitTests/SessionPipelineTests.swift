@@ -389,6 +389,89 @@ final class SessionPipelineTests: XCTestCase {
         XCTAssertEqual(requests, [51...100])
     }
 
+    // MARK: - T038：空页即失败（到头与失败两种语义不能混）
+
+    /// 不过滤的翻页拉回 0 条且服务端**没说**到头（hasMore=true / clamped=false）：
+    /// 这是异常，按可重试失败计——与网络失败同一条计数路径，3 次后 gap 转
+    /// failed(retryable)，且永远不得置 topExhausted。原来这里记 knownEmptyPages
+    /// 静默跳过，读者拉到空白什么都没有。
+    func testEmptyPageWithoutEndMarkerCountsAsRetryableFailure() async throws {
+        let pipeline = makePipeline()
+        for seq in 1...50 { await pipeline.apply(event: record(seq).event) }
+        for seq in 101...150 { await pipeline.apply(event: record(seq).event) }
+        // 51...100 不登记脚本 → 空回包 hasMore=true（默认），即"没说得到头"。
+
+        for round in 1...3 {
+            do {
+                _ = try await pipeline.records(in: 55...60)
+                XCTFail("第 \(round) 次空页应抛错")
+            } catch {
+                XCTAssertEqual(error as? SessionPipeline.FetchError, .emptyPage)
+            }
+        }
+        let snapshot = await pipeline.snapshot()
+        XCTAssertEqual(snapshot.gaps.map(\.id), ["gap:51-100"])
+        XCTAssertEqual(snapshot.gaps.first?.status, .failed(retryable: true))
+        let failureCount = await pipeline.failureCounts[51]
+        XCTAssertEqual(failureCount, 3)
+        let exhausted = await pipeline.topExhausted
+        XCTAssertFalse(exhausted) // 空页失败永远不得当作「已到最早」
+
+        // 第 4 次不再打网络（与网络失败同一上限）。
+        _ = try? await pipeline.records(in: 55...60)
+        let requests = await stub.requestCount(51...100)
+        XCTAssertEqual(requests, 3)
+    }
+
+    /// 空页 + 最底页（对齐起点 1）+ hasMore=false = 服务端**明确**说到头：
+    /// 正常终态——置 topExhausted，且**不计**失败（两种语义不能混）。
+    func testEmptyBottomPageWithNoMoreMarksTopExhausted() async throws {
+        let pipeline = makePipeline()
+        await stub.set(1...50, .page(SessionPipeline.FetchPage(records: [], hasMore: false)))
+
+        let records = try await pipeline.records(in: 1...20)
+        XCTAssertTrue(records.isEmpty)
+        let exhausted = await pipeline.topExhausted
+        XCTAssertTrue(exhausted)
+        // 到头不是失败：没有失败计数（预取也不因此被压住）。
+        let failureCount = await pipeline.failureCounts[1]
+        XCTAssertNil(failureCount)
+    }
+
+    /// 边界：最底页的空回包但 hasMore=true —— 仍是失败，不置 topExhausted。
+    func testEmptyBottomPageWithMoreIsFailureNotExhausted() async throws {
+        let pipeline = makePipeline()
+        await stub.set(1...50, .page(SessionPipeline.FetchPage(records: [], hasMore: true)))
+
+        do {
+            _ = try await pipeline.records(in: 1...20)
+            XCTFail("最底页空回包 + hasMore=true 应抛错")
+        } catch {
+            XCTAssertEqual(error as? SessionPipeline.FetchError, .emptyPage)
+        }
+        let exhausted = await pipeline.topExhausted
+        XCTAssertFalse(exhausted)
+        let failureCount = await pipeline.failureCounts[1]
+        XCTAssertEqual(failureCount, 1)
+    }
+
+    /// T037：本地窗口最老序号到 1 时由桥置「已到最早」（`markEarliestReached`），
+    /// 语义与 hasMore=false 的到头等同，只置位不撤销。
+    func testMarkEarliestReachedSetsTopExhausted() async throws {
+        let pipeline = makePipeline()
+        for seq in 1...10 { await pipeline.apply(event: record(seq).event) }
+        var exhausted = await pipeline.topExhausted
+        XCTAssertFalse(exhausted)
+
+        await pipeline.markEarliestReached()
+        exhausted = await pipeline.topExhausted
+        XCTAssertTrue(exhausted)
+        // 已到最早之后再读旧段不该触发上一页预取（顶端没有更早的页）。
+        await settle()
+        let requests = await stub.allRequests()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
     // MARK: - 预取瀑布
 
     func testPrefetchTriggersWithinOnePageOfCoverageEdge() async throws {

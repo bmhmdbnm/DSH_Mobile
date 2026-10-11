@@ -79,9 +79,21 @@ public actor SessionPipeline {
         public var isEmpty: Bool { inserted.isEmpty && updated.isEmpty && removed.isEmpty }
     }
 
-    public enum FetchError: Error, Equatable {
+    /// 取页失败（T038 起「空页但没说到头」也算失败）。
+    /// `description` 就是 App 侧探针 `pager.failed` 的 reason 口径
+    /// （桥的 catch 打 `String(describing: error)`）。
+    public enum FetchError: Error, Equatable, CustomStringConvertible {
         /// 该缺口已连续失败 3 次，转 retryable，不再自动拉（等用户点击重试）。
         case gapFailed
+        /// 不过滤的翻页拉回 0 条且服务端没说「到头」——异常，按可重试失败处理。
+        case emptyPage
+
+        public var description: String {
+            switch self {
+            case .gapFailed: return "gap-failed"
+            case .emptyPage: return "empty-page"
+            }
+        }
     }
 
     // MARK: - 状态
@@ -90,7 +102,8 @@ public actor SessionPipeline {
     public let sessionId: String
     let pageSize: Int // internal：+Paging 扩展（页对齐工具）要用
     private let hotLimit: Int
-    private let store: MessageStore?
+    /// internal：+Hydration 扩展（磁盘水合）要用。
+    let store: MessageStore?
     private let fetch: PageFetch
     let frameTick: @Sendable () async -> Void
     private let now: @Sendable () -> TimeInterval
@@ -111,9 +124,8 @@ public actor SessionPipeline {
     /// 每页连续失败次数；≥ maxRetries 的缺口转 retryable。
     /// internal：gap 派生（+Paging 扩展）要读。
     var failureCounts: [Int: Int] = [:]
-    /// 拉空（服务端尚无新数据）的页：避免预取瀑布反复打同一页。
-    private var knownEmptyPages: Set<Int> = []
-    /// 已到顶：只有 hasMore=false 或 clamped 才置位（spec 可见性兜底）。
+    /// 已到顶：只有 hasMore=false 或 clamped（服务端明确到头），或本地窗口最老
+    /// 序号已经到 1（`markEarliestReached`，T037）才置位。网络失败永不置位。
     public private(set) var topExhausted = false
 
     /// 落库回调：队列 drain 的批次交给 MessageStore（盘写由上层异步消费）。
@@ -239,47 +251,7 @@ public actor SessionPipeline {
     }
 
     /// 区间集声称覆盖、但热窗口已淘汰的段：读盘补回热窗口。
-    /// 返回本次水合的记录（调用方据此发 diff）；磁盘短收的连续空洞
-    /// 并入 `missing`，走同一条网络补齐路径（磁盘只是缓存，崩丢由
-    /// 「取用失败即拉取」兜底，区间集不回删）。
-    private func hydrateCoveredSpans(
-        of range: ClosedRange<Int>, missing: inout [RangeIndex.Span]
-    ) async -> [SessionRecord] {
-        guard let store, !ranges.isEmpty else { return [] }
-        var hydrated: [SessionRecord] = []
-        let coveredSpans = ranges.spans.filter {
-            $0.end >= range.lowerBound && $0.start <= range.upperBound
-        }
-        for span in coveredSpans {
-            let from = max(span.start, range.lowerBound)
-            let to = min(span.end, range.upperBound)
-            let absent = (from...to).filter { hotWindow[$0] == nil }.sorted()
-            guard !absent.isEmpty else { continue }
-            let diskRecords = (try? await store.records(
-                scope: scope, sessionId: sessionId, in: from...to)) ?? []
-            var found = Set<Int>()
-            for record in diskRecords where record.event.seq >= from && record.event.seq <= to {
-                mergeIntoHotWindow(record)
-                found.insert(record.event.seq)
-                hydrated.append(record)
-            }
-            // 磁盘短收：把连续的空洞段并入 missing。
-            var runStart: Int?
-            var previous = Int.min
-            for seq in absent where !found.contains(seq) {
-                if runStart == nil { runStart = seq }
-                if seq != previous + 1, let start = runStart, start < seq {
-                    missing.append(RangeIndex.Span(start, previous))
-                    runStart = seq
-                }
-                previous = seq
-            }
-            if let start = runStart {
-                missing.append(RangeIndex.Span(start, previous))
-            }
-        }
-        return hydrated
-    }
+    /// 实现在 SessionPipeline+Hydration.swift（主文件 500 行上限）。
 
     /// 缺口 → 对齐页集合，逐页拉取并合并。某页失败不阻塞其它页。
     private func fetchMissing(_ missing: [RangeIndex.Span], priority: FetchPriority) async throws {
@@ -303,8 +275,6 @@ public actor SessionPipeline {
             emit(Diff(gaps: currentGaps()))
             throw FetchError.gapFailed
         }
-        // 已知为空的页：预取不重复打网络；用户主动读取不受此限（点回来了就要真拉）。
-        if priority == .prefetch, knownEmptyPages.contains(key) { return }
 
         switch inFlight.begin(key, priority: priority) {
         case .joined:
@@ -315,13 +285,28 @@ public actor SessionPipeline {
             let fetch = self.fetch
             // 任务本体包含回包合并：搭车者 await 到的一定是「合并后」。
             let task = Task<Void, Error> {
-                do {
-                    let result = try await fetch(page, priority)
-                    self.completeFetch(result, key: key, generation: generation, requested: page)
-                } catch {
+                let result: FetchPage
+                do { result = try await fetch(page, priority) }
+                catch {
                     self.failFetch(error, key: key, generation: generation)
                     throw error
                 }
+                // T038（spec 追加修订 2「空页即异常」）：不过滤的翻页拉回 0 条且
+                // 服务端没说到头 = 可重试失败，走与网络失败**同一条**计数路径
+                // （failFetch）——3 次后缺口转 failed(retryable)，探针口径
+                // reason=empty-page（App 侧 catch 打 String(describing: error)）。
+                // 原来这里记进 knownEmptyPages 静默跳过，预取假装没事。
+                //
+                // 关键分界：带回填过滤（roles）的空页是**正常形态**——整页被过滤掉
+                // 而已，由 T039 的 scanBoundary 处理，不走本失败路径。过滤分页用的是
+                // `UserInputBackfiller` 自己的 fetch（不经 SessionPipeline），而本管道
+                // 的取页闭包不带 roles（产品侧 MessageLayer 用 through: nil、无 roles
+                // 的 _link/sessionWindow），所以「0 条即异常」在本路径上成立。
+                guard !result.records.isEmpty || Self.reachedEnd(result, requested: page) else {
+                    self.failFetch(FetchError.emptyPage, key: key, generation: generation)
+                    throw FetchError.emptyPage
+                }
+                self.completeFetch(result, key: key, generation: generation, requested: page)
             }
             inFlightTasks[key] = task
             try await task.value
@@ -335,10 +320,11 @@ public actor SessionPipeline {
         inFlightTasks.removeValue(forKey: key)
         guard inFlight.finish(key, generation: generation) else { return }
         failureCounts.removeValue(forKey: key)
-        mergeFetchedPage(result, pageKey: key, requested: requested)
+        mergeFetchedPage(result, requested: requested)
     }
 
     /// 失败核销：计数 + 重发 gap 状态；3 次上限由 fetchPage 入口挡。
+    /// 网络失败与 T038 的空页失败共用这一条路径（计数口径一致）。
     private func failFetch(_ error: Error, key: Int, generation: Int) {
         inFlightTasks.removeValue(forKey: key)
         _ = inFlight.finish(key, generation: generation)
@@ -347,15 +333,13 @@ public actor SessionPipeline {
     }
 
     /// 回包合并：热窗口 + 区间集 + 落库队列三路，一次 diff 产出（spec §2 下行）。
-    private func mergeFetchedPage(_ page: FetchPage, pageKey: Int, requested: ClosedRange<Int>) {
+    private func mergeFetchedPage(_ page: FetchPage, requested: ClosedRange<Int>) {
         var diff = Diff()
         let pageRecords = page.records.sorted { $0.event.seq < $1.event.seq }
-        // 「到头」只在拉最底页（对齐起点 1）且服务端说 hasMore=false 或被裁剪时成立
-        // （spec 可见性兜底：网络失败永远不得当作到底）。
-        let isBottomPage = requested.lowerBound == 1
         if pageRecords.isEmpty {
-            knownEmptyPages.insert(pageKey)
-            if isBottomPage, page.hasMore == false || page.clamped { topExhausted = true }
+            // T038：非「明确到头」的空回包在 fetchPage 上游已按失败抛掉，能落到
+            // 这里的空回包就是正常终态（最底页 + hasMore=false / clamped）。
+            if Self.reachedEnd(page, requested: requested) { topExhausted = true }
         } else {
             for record in pageRecords {
                 if hotWindow[record.event.seq] == nil { diff.inserted.append(record) } else { diff.updated.append(record) }
@@ -364,8 +348,7 @@ public actor SessionPipeline {
             ranges.insert(pageRecords.first!.event.seq...pageRecords.last!.event.seq)
             enqueueWrite(.upsertRecords(scope: scope, sessionId: sessionId, records: pageRecords),
                          key: pageRecords.last!.event.seq)
-            knownEmptyPages.removeAll()
-            if isBottomPage, page.hasMore == false || page.clamped { topExhausted = true }
+            if Self.reachedEnd(page, requested: requested) { topExhausted = true }
             _ = evictIfNeeded(anchor: Self.anchor(of: requested))
         }
         diff.gaps = currentGaps()
@@ -410,10 +393,20 @@ public actor SessionPipeline {
         enqueueWrite(.upsertRecords(
             scope: scope, sessionId: sessionId,
             records: events.map(SessionRecord.init)), key: latestKey)
-        knownEmptyPages.removeAll()
         _ = evictIfNeeded()
         diff.gaps = currentGaps()
         emit(diff)
+    }
+
+    /// 本地窗口最老序号已经到 1（T037 / spec 追加修订 1、3）：seq 从 1 编号，
+    /// 没有更早的记录可拉，直接置「已到最早」——语义与 `hasMore=false` 的到头
+    /// 等同（预取停手、gap 行渲染「没有更多」），只是判定来源是本地事实而不是
+    /// 服务端回包。桥在 `loadOlder` 看到窗口最老 ≤ 1 时调这里，替代原来的静默
+    /// return；只置位不撤销（记录只往新处增长）。
+    public func markEarliestReached() {
+        guard !topExhausted else { return }
+        topExhausted = true
+        emit(Diff(gaps: currentGaps()))
     }
 
     /// 流式增量在 SessionPipeline+Streaming.swift（文件按职责拆分，见该文件头注）。
@@ -451,10 +444,12 @@ public actor SessionPipeline {
 
     private func prefetch(_ page: ClosedRange<Int>) {
         let key = page.lowerBound
+        // 预取是背景动作：该页只要失败过一次（网络错、或 T038 的空页）就不再
+        // 自动重打，免得瀑布反复撞同一页。用户主动读取不受此限（fetchPage 入口
+        // 只挡 maxRetries），点重试会清零计数，恢复正常后预取也回来。
         guard !inFlight.isInFlight(key),
               inFlightTasks[key] == nil,
-              failureCounts[key, default: 0] < Self.maxRetries,
-              !knownEmptyPages.contains(key)
+              failureCounts[key, default: 0] == 0
         else { return }
         switch ranges.coverage(of: page) {
         case .none, .partial:
