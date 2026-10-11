@@ -97,8 +97,9 @@ struct MarkdownText: View {
 /// Inline Markdown: bold, italic, inline code, links.
 ///
 /// Falls back to the raw string when the markup does not parse, so a partial
-/// stream never renders as an error.
-private struct InlineMarkdown: View {
+/// stream never renders as an error. Internal (not private) so the search
+/// panel can reuse `styled(_:)` for hit snippets.
+struct InlineMarkdown: View {
     let text: String
 
     var body: some View {

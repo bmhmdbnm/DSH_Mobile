@@ -344,15 +344,22 @@ struct TranscriptSearchSheet: View {
         onlyMine && query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// 统计行按来源分开说：连接器是远端全量（"已搜 N"写成本机窗口大小会误导成
+    /// 只搜了本地），本地全量库与窗口无关；只有降级窗口路径才报窗口大小。
+    /// 量词统一为「条」（2026-10 用户反馈："行"与"条"并用像一个东西，分不清）。
     private var summary: String {
         if isBrowsing {
             return String(format: String(localized: "我的提问 %lld 条"), hits.count)
         }
-        let searched = model.searchItems.count
-        if onlyMine {
-            return String(format: String(localized: "已搜 %lld 行 · 我的提问 %lld 条"), searched, hits.count)
+        switch searchSource {
+        case .connector:
+            return String(format: String(localized: "命中 %lld 条（已搜全部历史）"), hits.count)
+        case .localStore:
+            return String(format: String(localized: "命中 %lld 条（本机记录）"), hits.count)
+        case .localWindow:
+            return String(format: String(localized: "已搜 %lld 条 · 命中 %lld 条"),
+                          model.searchItems.count, hits.count)
         }
-        return String(format: String(localized: "已搜 %lld 行 · 命中 %lld 条"), searched, hits.count)
     }
 
     /// 列表底部：备货不够时显示转圈，读完了显示"到头了"，中间态给一颗可点的兜底。
@@ -429,19 +436,8 @@ struct TranscriptSearchSheet: View {
         .padding(.vertical, 2)
     }
 
-    /// 片段 + 命中处加粗上色。用字符偏移切，避免把 `AttributedString` 的
-    /// 索引和 `String` 的索引混在一起（片段是压过空白的，索引体系不同）。
-    private func highlighted(_ hit: TranscriptSearchHit) -> Text {
-        let characters = Array(hit.snippet)
-        let start = min(max(0, hit.highlightStart), characters.count)
-        let end = min(characters.count, start + max(0, hit.highlightLength))
-        let head = String(characters[0..<start])
-        let match = String(characters[start..<end])
-        let tail = String(characters[end...])
-        return Text(head)
-            + Text(match).bold().foregroundColor(DSHTheme.brand)
-            + Text(tail)
-    }
+    // 命中片段的 markdown 渲染（`highlighted`/`inlineMarkdown`）在
+    // TranscriptSearchSheet+HitRow.swift（500 行上限拆分）。
 
     private func icon(_ role: TranscriptSearchHit.Role) -> String {
         switch role {
