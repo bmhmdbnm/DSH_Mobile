@@ -125,16 +125,26 @@ final class MessageLayer {
         )
     }
 
-    // MARK: - T024 用户输入灌库（spec 009「用户输入全量入库」）
+    // MARK: - T033 用户输入灌库（三表终局，spec 009 data-model v3）
 
-    /// 冷启动预取瀑布之后的低优先级任务：逐会话走 `_link/sessionFind` 浏览模式
-    /// （roles=['me']、无关键词）把全量用户输入灌进 `user_inputs` 表。
+    /// 冷启动预取瀑布之后的低优先级任务：逐会话走 `_link/sessionWindow` 的
+    /// `roles:['me']` 过滤分页，把**完整记录**灌进 `record` 表（与浏览落库同一
+    /// 幂等路径，不再写独立摘要表）。
     ///
-    /// 刻意**串行**：灌库是缓存行为，不许和读者正在用的拉取抢隧道（连接器对同会话
-    /// 并发 find 也直接回 `link/busy`）。未连接、磁盘层缺位、地址未注册都静默跳过；
-    /// 去重与增量判定全在 `UserInputBackfiller`（24h 新鲜窗口 + lastSeq 锚点）。
-    func backfillUserInputs(scope: String, summaries: [SessionSummary]) async {
+    /// 连接器没有 `history-role-filter` 能力时整体跳过（降级回浏览模式会拿到
+    /// 没有 source 的摘要，写进 record 就是脏数据——宁可不灌，等连接器升级）。
+    /// 刻意**串行**：灌库是缓存行为，不许和读者正在用的拉取抢隧道（连接器对
+    /// 同会话并发窗口读也直接回 `link/busy`）。未连接、磁盘层缺位、地址未注册
+    /// 都静默跳过；去重与增量判定全在 `UserInputBackfiller`。
+    func backfillUserInputs(scope: String, summaries: [SessionSummary],
+                            roleFilterSupported: Bool) async {
         guard let store, let client = clientProvider?() else { return }
+        guard roleFilterSupported else {
+            ViewportProbe.note("userinputs.backfill.degraded", [
+                "reason": "connector-missing-history-role-filter",
+            ], force: true)
+            return
+        }
         let backfiller = UserInputBackfiller(store: store)
         for summary in summaries {
             guard let address = addresses.address(for: summary.sessionId) else { continue }
@@ -142,10 +152,10 @@ final class MessageLayer {
             guard lastSeq > 0 else { continue }
             do {
                 let outcome = try await backfiller.backfill(
-                    scope: scope, sessionId: summary.sessionId, lastSeq: lastSeq) { cursor in
-                        try await client.sessionFind(HistorySearchRequest(
-                            address: address, query: "", roles: ["me"],
-                            limit: 200, cursor: cursor))
+                    scope: scope, sessionId: summary.sessionId, lastSeq: lastSeq) { before in
+                        try await client.historyWindow(HistoryWindowRequest(
+                            address: address, before: before ?? .max,
+                            limit: 200, maxBytes: 256 * 1024, roles: ["me"]))
                     }
                 if case .pulled(let pages, let rows) = outcome {
                     ViewportProbe.note("userinputs.backfill", [

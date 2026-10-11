@@ -43,6 +43,9 @@ extension SessionListModel {
         guard !ordered.isEmpty else { return }
         lastPrefetchScope = scope
         layer.registerAddresses(ordered)
+        // 连接器能力在 Task 外面取（Task 里 store 被 MessageStore 遮蔽）：
+        // 没有 history-role-filter 时回填整体跳过（摘要不入新库，等升级）。
+        let roleFilter = self.store?.supports("history-role-filter") ?? false
         Task(priority: .utility) {
             let states = (try? await store.sessionStates(scope: scope)) ?? []
             var persistedRanges: [MessagePipeline.SessionRef: RangeIndex] = [:]
@@ -64,10 +67,11 @@ extension SessionListModel {
                 await pipeline.prefetchLatestPages(
                     targets, persistedRanges: persistedRanges, limit: 10, concurrency: 3)
             }
-            // T024：预取瀑布之后灌「我问过的」全量库（优先级天然低于最新页预取——
+            // T033：预取瀑布之后灌「我问过的」全量库（优先级天然低于最新页预取——
             // 串行排在它后面；任务本身是 .utility）。逐会话串行，内部有 24h
             // 去重与 lastSeq 增量判定，重复触发是廉价的。
-            await layer.backfillUserInputs(scope: scope, summaries: ordered)
+            await layer.backfillUserInputs(
+                scope: scope, summaries: ordered, roleFilterSupported: roleFilter)
         }
     }
 }

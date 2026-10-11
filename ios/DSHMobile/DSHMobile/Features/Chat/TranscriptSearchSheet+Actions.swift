@@ -40,8 +40,8 @@ extension TranscriptSearchSheet {
 
     // MARK: - 执行
 
-    /// 真正的匹配。T025 起「只看我的提问」先读本地 user_inputs（FTS5，零网络），
-    /// 本地为空才回退连接器/本地缓冲的老路（T024 灌库还没覆盖到的会话不受影响）。
+    /// 真正的匹配。T034 起「只看我的提问」先读本地 record（record_fts，零网络），
+    /// 本地为空才回退连接器/本地缓冲的老路（T033 灌库还没覆盖到的会话不受影响）。
     @MainActor
     func performSearch(key: String) async {
         lastSearchKey = key

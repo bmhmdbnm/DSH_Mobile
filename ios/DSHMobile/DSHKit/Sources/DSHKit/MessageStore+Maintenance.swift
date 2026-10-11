@@ -51,20 +51,17 @@ extension MessageStore {
 
     // MARK: - 清除
 
-    /// 删掉一个会话在本库里的全部痕迹（记录、聚合行、用户输入、kv）。
+    /// 删掉一个会话在本库里的全部痕迹（记录、聚合行、kv）。
     public func clear(scope: String, sessionId: String) async throws {
         try await pool.write { db in
             try db.execute(sql: "DELETE FROM record WHERE scope = ? AND session_id = ?",
                            arguments: [scope, sessionId])
             try db.execute(sql: "DELETE FROM session_state WHERE scope = ? AND session_id = ?",
                            arguments: [scope, sessionId])
-            try db.execute(sql: "DELETE FROM user_inputs WHERE scope = ? AND session_id = ?",
-                           arguments: [scope, sessionId])
-            try db.execute(sql: "DELETE FROM user_input_state WHERE scope = ? AND session_id = ?",
-                           arguments: [scope, sessionId])
-            // 会话级 kv（目前只有搜索缓冲覆盖范围）同会话一起清。
-            try db.execute(sql: "DELETE FROM meta WHERE key = ?",
-                           arguments: [Self.scoped("search.range.\(sessionId)", scope: scope)])
+            // 会话级 kv（搜索缓冲覆盖范围、用户输入灌库账本）同会话一起清。
+            try db.execute(sql: "DELETE FROM meta WHERE key IN (?, ?)",
+                           arguments: [Self.scoped("search.range.\(sessionId)", scope: scope),
+                                       Self.syncKey(scope: scope, sessionId: sessionId)])
         }
     }
 
@@ -73,8 +70,6 @@ extension MessageStore {
         try await pool.write { db in
             try db.execute(sql: "DELETE FROM record")
             try db.execute(sql: "DELETE FROM session_state")
-            try db.execute(sql: "DELETE FROM user_inputs")
-            try db.execute(sql: "DELETE FROM user_input_state")
             try db.execute(sql: "DELETE FROM meta")
         }
     }

@@ -92,17 +92,34 @@ final class MessageStoreTests: XCTestCase {
         XCTAssertEqual(states.first?.ranges.spans, [.init(100, 200), .init(400, 450)])
     }
 
-    func testUserInputsInsertAndSearch() async throws {
-        try await store.upsertUserInputs([
-            .init(scope: "mac", sessionId: "s1", seq: 10, snippet: "怎么部署到服务器"),
-            .init(scope: "mac", sessionId: "s1", seq: 20, snippet: "写个单元测试"),
-            .init(scope: "mac", sessionId: "s2", seq: 5, snippet: "部署文档在哪"),
+    /// T034：「我问过的」读 record 本体——浏览全量、FTS（≥3 字符）与 LIKE（短词）搜索。
+    func testUserInputRecordsBrowseAndSearch() async throws {
+        try await upsert([
+            record(10, type: "user/message", text: "怎么部署到服务器"),
+            record(20, type: "user/message", text: "写个单元测试"),
+        ], session: "s1")
+        try await upsert([
+            record(5, type: "user/message", text: "部署文档在哪"),
+        ], session: "s2")
+        let all = try await store.userInputRecords(scope: "mac")
+        XCTAssertEqual(all.map { $0.record.event.seq }, [10, 20, 5])
+        XCTAssertEqual(all.map(\.sessionId), ["s1", "s1", "s2"])
+        // trigram（≥3 字符走 FTS5，子串命中）。
+        let hits = try await store.searchUserInputRecords(scope: "mac", query: "部署到")
+        XCTAssertEqual(hits.map { $0.record.event.seq }, [10])
+        // 短查询（<3 字符）降级 LIKE。
+        let short = try await store.searchUserInputRecords(scope: "mac", query: "测试")
+        XCTAssertEqual(short.map { $0.record.event.seq }, [20])
+    }
+
+    /// record_fts 只索引 role='me' 的行：助手消息不进索引（data-model v3）。
+    func testRecordFtsIndexesOnlyMe() async throws {
+        try await upsert([
+            record(1, type: "user/message", text: "共同关键词甲乙丙"),
+            record(2, type: "assistant/message", text: "共同关键词甲乙丙的回答"),
         ])
-        let all = try await store.userInputs(scope: "mac")
-        XCTAssertEqual(all.count, 3)
-        let hits = try await store.searchUserInputs(scope: "mac", query: "部署")
-        XCTAssertEqual(hits.count, 2)
-        XCTAssertEqual(hits.map(\.seq), [10, 5])
+        let hits = try await store.searchUserInputRecords(scope: "mac", query: "甲乙丙")
+        XCTAssertEqual(hits.map { $0.record.event.seq }, [1])
     }
 
     // MARK: - T032：source 列
@@ -120,7 +137,9 @@ final class MessageStoreTests: XCTestCase {
         XCTAssertEqual(sources.map(\.1), ["rpc-9", "rpc-1", nil])
     }
 
-    /// 「我问过的」候选（T034 先用于测试）：只要用户本人发的，排除 plugin 与 agent- 代发。
+    /// 「我问过的」归类边界（T035）：只要用户本人发的；plugin/system 注入、
+    /// agent- 前缀的代理代发都排除；source 缺省（老数据）按 'user' 兼容——
+    /// 与连接器 `roleOf()` 同一口径。
     func testUserInputRecordsExcludePluginAndAgentRelay() async throws {
         try await upsert([
             record(1, type: "user/message", source: #"{"kind":"plugin","rpcId":"rpc-9"}"#),
@@ -128,9 +147,14 @@ final class MessageStoreTests: XCTestCase {
             record(3, type: "user/message", source: #"{"kind":"user","rpcId":"rpc-1"}"#),
             record(4, type: "user/message"),  // 缺省按 'user'
             record(5, type: "assistant/message"),
+            record(6, type: "user/message", source: #"{"kind":"system"}"#),
+            record(7, type: "user/message", source: #"{"kind":"user"}"#),  // 无 rpcId 也算本人
         ])
         let records = try await store.userInputRecords(scope: "mac")
-        XCTAssertEqual(records.map(\.event.seq), [3, 4])
+        XCTAssertEqual(records.map { $0.record.event.seq }, [3, 4, 7])
+        // FTS 搜索同口径：注入行即使被索引也不在结果里。
+        let hits = try await store.searchUserInputRecords(scope: "mac", query: "hello")
+        XCTAssertEqual(hits.map { $0.record.event.seq }, [7, 4, 3])
     }
 
     /// v2→v3 迁移：老行按 payload 回填，解析不出/缺 source 的按 'user'。
@@ -170,5 +194,56 @@ final class MessageStoreTests: XCTestCase {
         let sources = try await migrated.sourcesForTesting(scope: "mac", sessionId: "s1")
         XCTAssertEqual(sources.map(\.0), ["plugin", "user", "user"])
         XCTAssertEqual(sources.map(\.1), ["rpc-7", nil, nil])
+    }
+
+    // MARK: - T035：v2→v3 终局清理
+
+    /// 旧 `user_inputs` 摘要数据**不并入** record（没有 source 的摘要行是脏数据来源，
+    /// 纯缓存弃置删表，回填会按新模型重拉）；三表删除；synced 列补上。
+    func testMigrationDropsUserInputTablesWithoutMerging() async throws {
+        let url = directory.appendingPathComponent("legacy.sqlite3")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let oldPool = try DatabasePool(path: url.path)
+        try await oldPool.write { db in
+            // v2 形态的脏数据：一条 plugin 注入的摘要（混进「我问过的」的来源）。
+            try db.execute(sql: """
+                CREATE TABLE user_inputs (
+                  scope TEXT NOT NULL, session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                  snippet TEXT NOT NULL, pulled_at REAL NOT NULL,
+                  PRIMARY KEY (scope, session_id, seq));
+                """)
+            try db.execute(sql: """
+                INSERT INTO user_inputs VALUES ('mac', 's1', 7, '插件注入的假提问', 0)
+                """)
+            try db.execute(sql: """
+                CREATE TABLE user_input_state (
+                  scope TEXT NOT NULL, session_id TEXT NOT NULL,
+                  pulled_at REAL NOT NULL, last_seq INTEGER NOT NULL,
+                  PRIMARY KEY (scope, session_id));
+                """)
+            try db.execute(sql: """
+                INSERT INTO user_input_state VALUES ('mac', 's1', 0, 7)
+                """)
+        }
+        try await oldPool.close()
+
+        let migrated = try MessageStore(path: url)
+        // 三表已删。
+        let tables = try await migrated.tableNamesForTesting()
+        XCTAssertFalse(tables.contains("user_inputs"), "user_inputs 必须删表")
+        XCTAssertFalse(tables.contains("user_inputs_fts"))
+        XCTAssertFalse(tables.contains("user_input_state"))
+        // 脏摘要没有混进 record。
+        let records = try await migrated.records(scope: "mac", sessionId: "s1", in: 1...100)
+        XCTAssertTrue(records.isEmpty, "旧 user_inputs 数据不得并入 record")
+        // synced 列存在（能读 nil 而不是报错）。
+        let synced = try await migrated.userInputsSyncedAt(scope: "mac", sessionId: "s1")
+        XCTAssertNil(synced)
+        // 新账本在 meta 键值表里能读写。
+        try await migrated.saveUserInputSyncState(
+            scope: "mac", sessionId: "s1",
+            state: .init(pulledAt: Date(timeIntervalSince1970: 1_800_000_000), lastSeq: 42))
+        let state = try await migrated.userInputSyncState(scope: "mac", sessionId: "s1")
+        XCTAssertEqual(state?.lastSeq, 42)
     }
 }

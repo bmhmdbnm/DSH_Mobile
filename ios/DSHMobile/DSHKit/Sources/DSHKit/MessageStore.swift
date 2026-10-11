@@ -34,21 +34,6 @@ public actor MessageStore {
         public let ranges: RangeIndex
     }
 
-    /// 「我问过的」一行（user_inputs 的投影）。
-    public struct UserInputRow: Sendable, Equatable {
-        public let scope: String
-        public let sessionId: String
-        public let seq: Int
-        public let snippet: String
-
-        public init(scope: String, sessionId: String, seq: Int, snippet: String) {
-            self.scope = scope
-            self.sessionId = sessionId
-            self.seq = seq
-            self.snippet = snippet
-        }
-    }
-
     /// 传输类型 → 三角色（映射沿用连接器 `roleOf()`，spec「用户输入全量入库」）。
     public enum Role: String, Sendable {
         case me, agent, tool, other
@@ -89,12 +74,13 @@ public actor MessageStore {
         try MessageStore.migrator.migrate(pool)
     }
 
-    // MARK: - Schema（GRDB DatabaseMigrator：v2 建表，v3 加 source 列）
+    // MARK: - Schema（GRDB DatabaseMigrator：v2 建表，v3 加 source 列，v3-cleanup 三表终局）
 
     static let migrator: DatabaseMigrator = {
         var migrator = DatabaseMigrator()
         migrator.registerMigration("v2") { db in try createSchemaV2(db) }
         migrator.registerMigration("v3") { db in try migrateToV3(db) }
+        migrator.registerMigration("v3-user-inputs-cleanup") { db in try migrateToV3Cleanup(db) }
         return migrator
     }()
 
@@ -191,5 +177,45 @@ public actor MessageStore {
                 arguments: [source?["kind"]?.stringValue, source?["rpcId"]?.stringValue, row["rowid"]])
         }
         try db.execute(sql: "UPDATE record SET source_kind = 'user' WHERE source_kind IS NULL")
+    }
+
+    /// v3 终局清理（data-model.md v3 / tasks T034/T035）：
+    /// 1. `session_state` 加 `user_inputs_synced_at`（用户输入子集灌全的完整性标记）；
+    /// 2. 旧 `user_inputs` / `user_inputs_fts` / `user_input_state` 三表**直接弃置删表**
+    ///    ——摘要行没有 source，是纯缓存，并入 record 就是脏数据（owner 2026-10-11 定稿），
+    ///    回填任务会按新模型重拉；
+    /// 3. `record_fts`（FTS5 trigram）挂 `record`，触发器只索引 `role='me'` 的行
+    ///    （用户输入的本地搜索；助手/工具内容不进索引，控制体积），存量行同步回填。
+    static func migrateToV3Cleanup(_ db: Database) throws {
+        try db.execute(sql: "ALTER TABLE session_state ADD COLUMN user_inputs_synced_at REAL")
+        try db.execute(sql: "DROP TABLE IF EXISTS user_inputs_fts")
+        try db.execute(sql: "DROP TABLE IF EXISTS user_inputs")
+        try db.execute(sql: "DROP TABLE IF EXISTS user_input_state")
+        // trigram：unicode61 不会切中文（整段当一个词）。索引文本从 payload 里
+        // 就地提取（用户消息的正文在 data.text）；写入侧保证 payload 恒为合法
+        // JSON，json_extract 不会失败。
+        try db.execute(sql: """
+            CREATE VIRTUAL TABLE IF NOT EXISTS record_fts
+            USING fts5(text, tokenize='trigram');
+            """)
+        try db.execute(sql: """
+            CREATE TRIGGER IF NOT EXISTS record_fts_ai AFTER INSERT ON record
+            WHEN new.role = 'me' BEGIN
+              INSERT INTO record_fts(rowid, text) VALUES (
+                new.rowid, COALESCE(json_extract(CAST(new.payload AS TEXT), '$.data.text'), ''));
+            END;
+            """)
+        try db.execute(sql: """
+            CREATE TRIGGER IF NOT EXISTS record_fts_ad AFTER DELETE ON record
+            WHEN old.role = 'me' BEGIN
+              DELETE FROM record_fts WHERE rowid = old.rowid;
+            END;
+            """)
+        // 存量 me 行回填索引（迁移前写入的 record 不会触发上面的 INSERT 触发器）。
+        try db.execute(sql: """
+            INSERT INTO record_fts(rowid, text)
+            SELECT rowid, COALESCE(json_extract(CAST(payload AS TEXT), '$.data.text'), '')
+            FROM record WHERE role = 'me' AND json_valid(CAST(payload AS TEXT));
+            """)
     }
 }

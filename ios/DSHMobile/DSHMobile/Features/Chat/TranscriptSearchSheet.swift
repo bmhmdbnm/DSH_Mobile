@@ -25,7 +25,7 @@ struct TranscriptSearchSheet: View {
     /// 连接器给的续页游标；`source` 说明这一屏命中覆盖到哪儿（spec 007 P2）。
     @State var searchCursor: String?
     @State var pageHasMore = false
-    /// `localStore` = 本地 user_inputs 全量库（T025，零网络）；
+    /// `localStore` = 本地 record 全量库（T034，零网络）；
     /// `connector` = 连接器整会话；`local` = 已加载窗口。
     @State var searchSource = "local"
     @State var isLoadingMore = false

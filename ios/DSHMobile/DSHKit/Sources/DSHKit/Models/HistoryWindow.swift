@@ -22,14 +22,19 @@ public struct HistoryWindowRequest: Sendable, Codable {
     public let limit: Int?
     /// Byte budget for the page; the connector trims the oldest end to fit.
     public let maxBytes: Int?
+    /// Optional role filter (`["me"]`…), connector capability `history-role-filter`
+    /// (spec 009 T031/T033). Filtering affects only which records come back;
+    /// the `before` cursor semantics are unchanged.
+    public let roles: [String]?
 
     public init(address: SessionAddress, before: Int, through: Int? = nil,
-                limit: Int? = nil, maxBytes: Int? = nil) {
+                limit: Int? = nil, maxBytes: Int? = nil, roles: [String]? = nil) {
         self.address = address
         self.before = before
         self.through = through
         self.limit = limit
         self.maxBytes = maxBytes
+        self.roles = roles
     }
 }
 

@@ -191,49 +191,45 @@ extension MessageStore {
         }
     }
 
-    // MARK: - 用户输入（全量入库，spec「用户输入全量入库」）
+    // MARK: - 用户输入记录（T034：「我问过的」读侧，role='me' + 来源排除）
 
-    public func upsertUserInputs(_ inputs: [UserInputRow]) async throws {
-        try await pool.write { db in
-            for input in inputs {
-                try db.execute(sql: """
-                    INSERT OR REPLACE INTO user_inputs (scope, session_id, seq, snippet, pulled_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """, arguments: [
-                        input.scope, input.sessionId, input.seq, input.snippet,
-                        now().timeIntervalSince1970,
-                    ])
-            }
+    /// 「我问过的」归类条件（data-model.md v3）：来源不是用户本人（plugin/system）
+    /// 或代理代发（source_id 带 `agent-` 前缀）都不算；source_kind 缺省（老数据）
+    /// 按 'user' 兼容。与连接器 `roleOf()` 同一口径。
+    static let userInputFilter = """
+        role = 'me'
+          AND COALESCE(source_kind, 'user') = 'user'
+          AND (source_id IS NULL OR source_id NOT LIKE 'agent-%')
+        """
+
+    /// 「我问过的」一行：SessionRecord 本体不带 sessionId，列表/搜索按会话
+    /// 过滤要用，查询时一并投影出来。
+    public struct UserInputEntry: Sendable {
+        public let sessionId: String
+        public let record: SessionRecord
+
+        public init(sessionId: String, record: SessionRecord) {
+            self.sessionId = sessionId
+            self.record = record
         }
     }
 
-    /// 全部用户输入（浏览模式），按会话、seq 升序。
-    public func userInputs(scope: String) async throws -> [UserInputRow] {
-        try await pool.read { db in
-            let rows = try Row.fetchAll(db, sql: """
-                SELECT scope, session_id, seq, snippet FROM user_inputs
-                WHERE scope = ? ORDER BY session_id ASC, seq ASC
-                """, arguments: [scope])
-            return rows.map { UserInputRow(
-                scope: $0["scope"], sessionId: $0["session_id"],
-                seq: $0["seq"], snippet: $0["snippet"]) }
-        }
-    }
-
-    /// 用户输入全文搜索（FTS5 trigram，本地唯一使用 FTS 的地方，spec「搜索策略」）。
+    /// 用户输入全文搜索（record_fts，FTS5 trigram，本地唯一使用 FTS 的地方）。
     /// trigram 索引需要 ≥3 字符，短查询降级 LIKE 子串（用户输入量小，代价可忽略）。
-    public func searchUserInputs(scope: String, query: String) async throws -> [UserInputRow] {
+    /// 返回按 seq 降序（由近及远），最多 200 条。
+    public func searchUserInputRecords(scope: String, query: String) async throws -> [UserInputEntry] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
         return try await pool.read { db in
             let rows: [Row]
             if trimmed.count >= 3 {
                 rows = try Row.fetchAll(db, sql: """
-                    SELECT u.scope, u.session_id, u.seq, u.snippet
-                    FROM user_inputs_fts f
-                    JOIN user_inputs u ON u.rowid = f.rowid
-                    WHERE user_inputs_fts MATCH ? AND u.scope = ?
-                    ORDER BY u.seq DESC LIMIT 200
+                    SELECT r.session_id, r.payload FROM record_fts f
+                    JOIN record r ON r.rowid = f.rowid
+                    WHERE record_fts MATCH ? AND r.scope = ?
+                      AND COALESCE(r.source_kind, 'user') = 'user'
+                      AND (r.source_id IS NULL OR r.source_id NOT LIKE 'agent-%')
+                    ORDER BY r.seq DESC LIMIT 200
                     """, arguments: [trimmed, scope])
             } else {
                 let pattern = "%" + trimmed
@@ -241,36 +237,38 @@ extension MessageStore {
                     .replacingOccurrences(of: "%", with: "\\%")
                     .replacingOccurrences(of: "_", with: "\\_") + "%"
                 rows = try Row.fetchAll(db, sql: """
-                    SELECT scope, session_id, seq, snippet FROM user_inputs
-                    WHERE snippet LIKE ? ESCAPE '\\' AND scope = ?
+                    SELECT session_id, payload FROM record
+                    WHERE scope = ? AND \(Self.userInputFilter)
+                      AND COALESCE(json_extract(CAST(payload AS TEXT), '$.data.text'), '')
+                          LIKE ? ESCAPE '\\'
                     ORDER BY seq DESC LIMIT 200
-                    """, arguments: [pattern, scope])
+                    """, arguments: [scope, pattern])
             }
-            return rows.map { UserInputRow(
-                scope: $0["scope"], sessionId: $0["session_id"],
-                seq: $0["seq"], snippet: $0["snippet"]) }
+            return Self.decodeEntries(rows)
         }
     }
 
-    // MARK: - 用户输入记录（T032 给 T034 先用：role='me' + 来源排除）
 
     /// 「我问过的」候选记录（完整 SessionRecord），按会话、seq 升序。
-    /// 排除条件（data-model.md v3）：来源不是用户本人（plugin/system）或代理代发
-    /// （source_id 带 `agent-` 前缀）；source_kind 缺省（老数据/新写入未带）按 'user' 兼容。
-    public func userInputRecords(scope: String) async throws -> [SessionRecord] {
+    public func userInputRecords(scope: String) async throws -> [UserInputEntry] {
         try await pool.read { db in
             let rows = try Row.fetchAll(db, sql: """
-                SELECT payload FROM record
-                WHERE scope = ? AND role = 'me'
-                  AND COALESCE(source_kind, 'user') = 'user'
-                  AND (source_id IS NULL OR source_id NOT LIKE 'agent-%')
+                SELECT session_id, payload FROM record
+                WHERE scope = ? AND \(Self.userInputFilter)
                 ORDER BY session_id ASC, seq ASC
                 """, arguments: [scope])
-            return try Self.decode(rows)
+            return Self.decodeEntries(rows)
         }
     }
 
     // MARK: - 测试出口（internal，仅 DSHKitTests 用；不进产品面）
+
+    /// 全库表名清单（T035 迁移断言用）。
+    func tableNamesForTesting() async throws -> [String] {
+        try await pool.read { db in
+            try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    }
 
     func rolesForTesting(scope: String, sessionId: String) async throws -> [String] {
         try await pool.read { db in
@@ -296,6 +294,17 @@ extension MessageStore {
     }
 
     // MARK: - 内部工具
+
+    private static func decodeEntries(_ rows: [Row]) -> [UserInputEntry] {
+        let decoder = JSONDecoder()
+        return rows.compactMap { row -> UserInputEntry? in
+            guard let sessionId: String = row["session_id"],
+                  let payload: Data = row["payload"],
+                  let record = try? decoder.decode(SessionRecord.self, from: payload)
+            else { return nil }
+            return UserInputEntry(sessionId: sessionId, record: record)
+        }
+    }
 
     private static func decode(_ rows: [Row]) throws -> [SessionRecord] {
         let decoder = JSONDecoder()
