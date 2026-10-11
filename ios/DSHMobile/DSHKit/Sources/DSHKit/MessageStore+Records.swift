@@ -37,14 +37,18 @@ extension MessageStore {
         let encoder = JSONEncoder()
         for record in records {
             let payload = try encoder.encode(record)
+            // data-model v3：来源细分从事件内提取（kind 缺省 nil，由查询侧按 'user' 兼容）。
+            let source = record.event.data["source"]
             try db.execute(sql: """
                 INSERT OR REPLACE INTO record
-                  (scope, session_id, seq, kind, role, payload, byte_size, client_id, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (scope, session_id, seq, kind, role, payload, byte_size, client_id, status,
+                   source_kind, source_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, arguments: [
                     scope, sessionId, record.event.seq, record.event.type,
                     Role(eventType: record.event.type).rawValue,
                     payload, payload.count, clientId, status,
+                    source?["kind"]?.stringValue, source?["rpcId"]?.stringValue,
                 ])
         }
     }
@@ -248,6 +252,24 @@ extension MessageStore {
         }
     }
 
+    // MARK: - 用户输入记录（T032 给 T034 先用：role='me' + 来源排除）
+
+    /// 「我问过的」候选记录（完整 SessionRecord），按会话、seq 升序。
+    /// 排除条件（data-model.md v3）：来源不是用户本人（plugin/system）或代理代发
+    /// （source_id 带 `agent-` 前缀）；source_kind 缺省（老数据/新写入未带）按 'user' 兼容。
+    public func userInputRecords(scope: String) async throws -> [SessionRecord] {
+        try await pool.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT payload FROM record
+                WHERE scope = ? AND role = 'me'
+                  AND COALESCE(source_kind, 'user') = 'user'
+                  AND (source_id IS NULL OR source_id NOT LIKE 'agent-%')
+                ORDER BY session_id ASC, seq ASC
+                """, arguments: [scope])
+            return try Self.decode(rows)
+        }
+    }
+
     // MARK: - 测试出口（internal，仅 DSHKitTests 用；不进产品面）
 
     func rolesForTesting(scope: String, sessionId: String) async throws -> [String] {
@@ -256,6 +278,20 @@ extension MessageStore {
                 SELECT role FROM record
                 WHERE scope = ? AND session_id = ? ORDER BY seq ASC
                 """, arguments: [scope, sessionId])
+        }
+    }
+
+    /// source 列直查（T032 单测用）：(source_kind, source_id) 按 seq 升序。
+    func sourcesForTesting(scope: String, sessionId: String) async throws -> [(String?, String?)] {
+        try await pool.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT source_kind, source_id FROM record
+                WHERE scope = ? AND session_id = ? ORDER BY seq ASC
+                """, arguments: [scope, sessionId]).map { row -> (String?, String?) in
+                    let kind: String? = row["source_kind"]
+                    let sourceId: String? = row["source_id"]
+                    return (kind, sourceId)
+                }
         }
     }
 

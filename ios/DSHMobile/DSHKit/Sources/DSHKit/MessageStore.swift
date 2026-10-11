@@ -86,12 +86,19 @@ public actor MessageStore {
         }
         pool = try DatabasePool(path: url.path, configuration: configuration)
         self.now = now
-        try pool.write { db in try MessageStore.migrate(db) }
+        try MessageStore.migrator.migrate(pool)
     }
 
-    // MARK: - Schema（v2，GRDB migration 从空库建）
+    // MARK: - Schema（GRDB DatabaseMigrator：v2 建表，v3 加 source 列）
 
-    static func migrate(_ db: Database) throws {
+    static let migrator: DatabaseMigrator = {
+        var migrator = DatabaseMigrator()
+        migrator.registerMigration("v2") { db in try createSchemaV2(db) }
+        migrator.registerMigration("v3") { db in try migrateToV3(db) }
+        return migrator
+    }()
+
+    static func createSchemaV2(_ db: Database) throws {
         try db.execute(sql: """
             CREATE TABLE IF NOT EXISTS meta (
               key   TEXT PRIMARY KEY,
@@ -164,5 +171,25 @@ public actor MessageStore {
               VALUES ('delete', old.rowid, old.snippet);
             END;
             """)
+    }
+
+    /// v3（data-model.md v3 / tasks T032）：`record` 加 `source_kind`/`source_id`。
+    /// 老行回填：payload 里 `data.source.kind` 能解析按解析值，解析不出或缺省按 `'user'`
+    ///（与连接器侧同一兼容口径）；`source_id` 取 `data.source.rpcId`，缺省留空。
+    static func migrateToV3(_ db: Database) throws {
+        try db.execute(sql: "ALTER TABLE record ADD COLUMN source_kind TEXT")
+        try db.execute(sql: "ALTER TABLE record ADD COLUMN source_id TEXT")
+        let rows = try Row.fetchAll(db, sql: "SELECT rowid, payload FROM record")
+        let decoder = JSONDecoder()
+        for row in rows {
+            guard let payload: Data = row["payload"],
+                  let record = try? decoder.decode(SessionRecord.self, from: payload)
+            else { continue }  // 解析不出的行留给下面的兜底 UPDATE 置 'user'
+            let source = record.event.data["source"]
+            try db.execute(
+                sql: "UPDATE record SET source_kind = ?, source_id = ? WHERE rowid = ?",
+                arguments: [source?["kind"]?.stringValue, source?["rpcId"]?.stringValue, row["rowid"]])
+        }
+        try db.execute(sql: "UPDATE record SET source_kind = 'user' WHERE source_kind IS NULL")
     }
 }
