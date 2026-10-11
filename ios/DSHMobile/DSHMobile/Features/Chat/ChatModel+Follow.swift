@@ -27,9 +27,13 @@ extension ChatModel {
             if followState != .atBottom {
                 followState = .atBottom
                 unreadWhileReading = 0
+                ViewportProbe.note("follow.state", ["to": "atBottom",
+                                                    "distance": String(Int(distance))], force: true)
             }
         } else if followState != .reading {
             followState = .reading
+            ViewportProbe.note("follow.state", ["to": "reading",
+                                                "distance": String(Int(distance))], force: true)
         }
     }
 
@@ -52,7 +56,11 @@ extension ChatModel {
 
     /// 桥报"尾部来了 n 条新消息"：reading 期间计未读（atBottom 时读者看得见，不计）。
     func noteTailArrivals(_ count: Int) {
-        guard count > 0, followState == .reading else { return }
+        guard count > 0 else { return }
+        ViewportProbe.note("follow.tail", ["count": String(count),
+                                           "state": followState.rawValue,
+                                           "unread": String(unreadWhileReading)], force: true)
+        guard followState == .reading else { return }
         unreadWhileReading += count
     }
 

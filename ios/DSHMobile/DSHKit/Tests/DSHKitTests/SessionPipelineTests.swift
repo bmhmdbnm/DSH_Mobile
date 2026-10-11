@@ -22,7 +22,7 @@ final class SessionPipelineTests: XCTestCase {
         func requestCount(_ range: ClosedRange<Int>) -> Int { requests.filter { $0 == range }.count }
         func allRequests() -> [ClosedRange<Int>] { requests }
 
-        func fetch(_ range: ClosedRange<Int>) throws -> SessionPipeline.FetchPage {
+        func fetch(_ range: ClosedRange<Int>, priority: SessionPipeline.FetchPriority) throws -> SessionPipeline.FetchPage {
             requests.append(range)
             switch script[range.lowerBound] {
             case .page(let page): return page
@@ -81,7 +81,7 @@ final class SessionPipelineTests: XCTestCase {
         let stub = stub!
         return SessionPipeline(
             scope: "mac", sessionId: "s1", store: nil,
-            fetch: { range in try await stub.fetch(range) },
+            fetch: { range, priority in try await stub.fetch(range, priority: priority) },
             frameTick: tick, now: { 1000 }, pageSize: 50, hotLimit: hotLimit)
     }
 
@@ -311,7 +311,7 @@ final class SessionPipelineTests: XCTestCase {
         let stub = stub!
         let pipeline = SessionPipeline(
             scope: "mac", sessionId: "s1", store: store,
-            fetch: { range in try await stub.fetch(range) },
+            fetch: { range, priority in try await stub.fetch(range, priority: priority) },
             now: { 1000 }, pageSize: 50, hotLimit: 60,
             initialRanges: RangeIndex(spans: [RangeIndex.Span(1, 100)]))
         // 热窗口只持有最新 60（模拟淘汰后的稳态）。

@@ -656,24 +656,31 @@ final class ChatModel {
         return dropped
     }
 
-    /// 按 seq 把行内容从**本地库**取回来（spec 008 的 US3 / SC-004：水合 1 秒内、0 网络）。
+    /// 按 seq 把行内容取回来（spec 008 的 US3 / SC-004：水合 1 秒内、0 网络）。
     ///
-    /// 只读磁盘层（T027 起为 `MessageStore`），绝不碰 `TranscriptPageFetcher`——
-    /// 水合不该产生任何请求。
+    /// **内存优先**：被回收的行只是宿主侧换了载荷，`timeline.items` 里的行还在，
+    /// 按身份原样交回——不用等落库队列，也不会因「只折 wanted 子集」折错身份
+    /// （用例 57：新到的页还没落盘时磁盘只能还回 7/28，可见带多白 ~1s）。
+    /// 内存里没有的（窗口裁剪已丢）才落到磁盘层（T027 起为 `MessageStore`）；
+    /// 绝不碰 `TranscriptPageFetcher`——水合不该产生任何请求。
     func items(forSeqs seqs: [Int]) async -> [TimelineItem] {
+        guard !seqs.isEmpty else { return [] }
+        let wanted = Set(seqs)
+        let inMemory = timeline.items.filter { wanted.contains($0.seq) }
+        let missing = wanted.subtracting(inMemory.map(\.seq))
+        guard !missing.isEmpty else { return inMemory }
         guard let sessionId = session?.sessionId, let scope = sessionScope,
-              let store = messageStore, !seqs.isEmpty else { return [] }
-        let newest = (seqs.max() ?? 0) + 1
-        let oldest = seqs.min() ?? 0
+              let store = messageStore else { return inMemory }
+        let newest = (missing.max() ?? 0) + 1
+        let oldest = missing.min() ?? 0
         let records = (try? await store.windowBefore(
             scope: scope, sessionId: sessionId, seq: newest,
             limit: max(Self.hitContextLimit, newest - oldest + 1))) ?? []
-        let wanted = Set(seqs)
-        var timeline = ChatTimeline()
-        for record in records.sorted(by: { $0.event.seq < $1.event.seq }) where wanted.contains(record.event.seq) {
-            timeline.apply(record.event)
+        var folded = ChatTimeline()
+        for record in records.sorted(by: { $0.event.seq < $1.event.seq }) where missing.contains(record.event.seq) {
+            folded.apply(record.event)
         }
-        return timeline.items
+        return inMemory + folded.items
     }
 
     /// 把命中所在的那一段从本地库读回时间线（0 网络），这样命中才有行可指。
@@ -682,7 +689,7 @@ final class ChatModel {
               let store = messageStore,
               let lowest = hits.map(\.seq).min() else { return }
         let before = max(0, lowest + 1)
-        guard (timeline.firstSeq ?? Int.max) > lowest else { return }
+        guard (timeline.firstContentSeq ?? Int.max) > lowest else { return }
         let records = (try? await store.windowBefore(
             scope: scope, sessionId: sessionId, seq: before,
             limit: Self.hitContextLimit)) ?? []

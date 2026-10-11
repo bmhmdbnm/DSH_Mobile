@@ -15,7 +15,7 @@ final class PipelineRetryAndGapTests: XCTestCase {
         func fail(_ times: Int) { failures = times }
         func reset() { failures = 0; requests = 0 }
 
-        func fetch(_ range: ClosedRange<Int>) throws -> SessionPipeline.FetchPage {
+        func fetch(_ range: ClosedRange<Int>, priority: SessionPipeline.FetchPriority) throws -> SessionPipeline.FetchPage {
             requests += 1
             if failures > 0 { failures -= 1; throw TestError.boom }
             return SessionPipeline.FetchPage(
@@ -36,7 +36,7 @@ final class PipelineRetryAndGapTests: XCTestCase {
     private func makePipeline(_ stub: FetchStub) -> SessionPipeline {
         SessionPipeline(
             scope: "mac", sessionId: "s1", store: nil,
-            fetch: { range in try await stub.fetch(range) },
+            fetch: { range, priority in try await stub.fetch(range, priority: priority) },
             pageSize: 50, hotLimit: 500)
     }
 

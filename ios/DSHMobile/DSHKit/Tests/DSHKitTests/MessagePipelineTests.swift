@@ -40,7 +40,7 @@ final class MessagePipelineTests: XCTestCase {
     ) -> MessagePipeline {
         MessagePipeline(
             store: store,
-            fetchFactory: { _ in { _ in
+            fetchFactory: { _ in { _, _ in
                 SessionPipeline.FetchPage(records: [], hasMore: false, clamped: false)
             } },
             sender: sender,
@@ -118,7 +118,7 @@ final class MessagePipelineTests: XCTestCase {
         let stub = FetchScript()
         let pipeline = MessagePipeline(
             store: store,
-            fetchFactory: { _ in { range in try await stub.fetch(range) } },
+            fetchFactory: { _ in { range, priority in try await stub.fetch(range, priority: priority) } },
             sender: { _, _, _, _ in throw TestError.sendFailed },
             now: { 1000 })
         let sessionPipeline = await pipeline.pipeline(for: session)
@@ -404,7 +404,7 @@ final class MessagePipelineTests: XCTestCase {
             pages[range.lowerBound] = SessionPipeline.FetchPage(records: records, hasMore: hasMore)
         }
 
-        func fetch(_ range: ClosedRange<Int>) throws -> SessionPipeline.FetchPage {
+        func fetch(_ range: ClosedRange<Int>, priority: SessionPipeline.FetchPriority) throws -> SessionPipeline.FetchPage {
             pages[range.lowerBound] ?? SessionPipeline.FetchPage(records: [], hasMore: true)
         }
     }

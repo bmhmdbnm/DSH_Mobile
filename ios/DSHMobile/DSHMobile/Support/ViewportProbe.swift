@@ -305,19 +305,28 @@ enum ViewportProbe {
 
     // MARK: - 提问夹具（"让某个会话进入待答"这件事只能由 App 自己发起）
 
-    /// `-DSHProbeAsk <sessionId>`：连上之后由**这个 App** 给指定会话发一条
+    /// `-DSHProbeAsk <sessionId>[@<延迟秒>]`：连上之后由**这个 App** 给指定会话发一条
     /// "立刻调用提问工具"的提示词，让它进入待答状态。
+    ///
+    /// 可选的 `@<秒>`：提问在连接建立后第 N 秒才发出。新消息胶囊场景（TC-009-US3）
+    /// 需要"上滑进入 reading 之后才有新行到达"：提问若随连接立即发出，回复脉冲会
+    /// 抢在上滑驱动（~6–11s）之前落完，胶囊永远没有前提。
     ///
     /// 为什么非要从 App 发：2026-09-22 实测，从 host 侧用 RPC（`session/prompt`）发起时，
     /// 会话日志里 `tool/call` 有提问、turn 也没结束，但提问**不会送到手机**，
     /// 列表里就永远看不到待答行。从 App 自己发则走产品那条路（waterfall 回到本设备），
     /// 几秒内就能看到——这也是用户真实遇到的路径。
-    static var askProbeSession: String? {
+    static var askProbeSession: String? { askProbe?.sessionId }
+
+    static var askProbe: (sessionId: String, delay: Double)? {
         let arguments = ProcessInfo.processInfo.arguments
         guard let index = arguments.firstIndex(of: "-DSHProbeAsk"),
               index + 1 < arguments.count
         else { return nil }
-        return arguments[index + 1]
+        let parts = arguments[index + 1].split(separator: "@")
+        guard let sessionId = parts.first, !sessionId.isEmpty else { return nil }
+        let delay = parts.count > 1 ? Double(parts[1]) ?? 0 : 0
+        return (String(sessionId), delay)
     }
 
     /// `-DSHProbeNotifyTap <sid>@<秒>`：模拟「App 在后台时用户点了通知」。
@@ -374,10 +383,20 @@ enum ViewportProbe {
         return Int(arguments[index + 1])
     }
 
+    /// `-DSHProbeOlderNoReclaim`：驱动的"滑回被回收行"绕行关掉。
+    ///
+    /// 那个绕行是给翻页水合用例（用例 57）造的；新消息胶囊（TC-009-US3）只需要
+    /// "离开底部并停住"，绕行会把视口带到回收行（往往又贴回底部），reading 前提
+    /// 就没了（2026-10-11 复跑实测：distance=6676 → 绕行 → distance=0）。
+    static var olderDriveSkipsReclaimed: Bool {
+        ProcessInfo.processInfo.arguments.contains("-DSHProbeOlderNoReclaim")
+    }
+
     @MainActor
     static func runAskProbe(provider: @MainActor () -> DSHClient?) async {
-        guard let sessionId = askProbeSession else { return }
-        note("askprobe.begin", ["session": sessionId], force: true)
+        guard let probe = askProbe else { return }
+        let sessionId = probe.sessionId
+        note("askprobe.begin", ["session": sessionId, "delay": String(probe.delay)], force: true)
         // 冷启动时 client 还没有：等它出现（连接建立后 store 才装上）。
         var client: DSHClient?
         for _ in 0..<120 {
@@ -388,6 +407,10 @@ enum ViewportProbe {
         guard let client else {
             note("askprobe.failed", ["error": "no client after 60s"], force: true)
             return
+        }
+        // 可选延迟：让回复脉冲落在"上滑驱动完成之后"（见 askProbe 头注）。
+        if probe.delay > 0 {
+            try? await Task.sleep(for: .seconds(probe.delay))
         }
         do {
             try await client.prompt(SessionPromptRequest(
@@ -694,7 +717,9 @@ enum ViewportProbe {
     static var typingProbe: (text: String, seconds: Double, oscillate: Bool, immediately: Bool,
                              keyboardCycles: Bool)? { nil }
     static var askProbeSession: String? { nil }
+    static var askProbe: (sessionId: String, delay: Double)? { nil }
     static var olderScrollRounds: Int? { nil }
+    static var olderDriveSkipsReclaimed: Bool { false }
     static var notifyTapProbe: (sid: String, seconds: Double)? { nil }
     static func runNotifyTapProbe(delegate: SessionAlerts) async {}
     static var scrollFacts: (offset: CGFloat, content: CGFloat)? { nil }

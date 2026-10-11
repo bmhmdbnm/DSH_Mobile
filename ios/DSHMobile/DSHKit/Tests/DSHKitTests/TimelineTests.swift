@@ -20,7 +20,7 @@ final class TimelineTests: XCTestCase {
         try event("""
         {"type":"user/message","seq":\(seq),"time":1789276358732,
          "data":{"content":[{"type":"text","text":"\(text)"}],
-                 "source":{"kind":"user","rpcId":"r1"},
+                 "source":{"kind":"user","rpcId":"\(id)"},
                  "role":"user","id":"\(id)"}}
         """)
     }
@@ -685,4 +685,18 @@ final class TimelineTests: XCTestCase {
         XCTAssertEqual(timeline.items.count, 2, "an older page must not be dropped as a duplicate of the tail")
         XCTAssertEqual(timeline.items.first?.seq, 12, "older history belongs above the tail")
     }
+
+    /// 009 场景⑥回归：firstContentSeq 跳过顶部合成缺口行（gap:0-0 的 seq=0），
+    /// 拿它当窗口下界会让"命中在窗口外"的判定永远为假。
+    func testFirstContentSeqSkipsGapRows() throws {
+        var timeline = ChatTimeline()
+        timeline.reset(with: [
+            SessionRecord(event: try userMessage(seq: 100, text: "a", id: "m100")),
+            SessionRecord(event: try userMessage(seq: 101, text: "b", id: "m101")),
+        ])
+        timeline.setGaps([ChatTimeline.gapItem(start: 0, end: 0, status: .exhausted)])
+        XCTAssertEqual(timeline.items.first?.kind.isContentRow, false)
+        XCTAssertEqual(timeline.firstContentSeq, 100)
+    }
+
 }

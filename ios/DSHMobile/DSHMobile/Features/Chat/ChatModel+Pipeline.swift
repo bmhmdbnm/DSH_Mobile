@@ -358,7 +358,22 @@ final class ChatPipelineBridge {
         let windowOldest = records.keys.min()
         let windowNewest = records.keys.max()
         async let landed = waitForRebaseRow(seq: seq)
-        _ = try? await session.records(in: lower...upper, priority: .jump)
+        do {
+            let fetched = try await session.records(in: lower...upper, priority: .jump)
+            ViewportProbe.note("search.rebase.fetched", [
+                "seq": String(seq), "range": "\(lower)-\(upper)",
+                "count": String(fetched.count),
+                "first": String(fetched.first?.event.seq ?? -1),
+                "last": String(fetched.last?.event.seq ?? -1),
+            ], force: true)
+        } catch {
+            // 拉取失败必须可见（T016 同款纪律）：waiter 超时只会返回 nil，
+            // 没有这条 note 时跳转静默落空，无法分辨"没拉到"还是"没等到"。
+            ViewportProbe.note("search.rebase.failed", [
+                "seq": String(seq), "range": "\(lower)-\(upper)",
+                "reason": String(describing: error),
+            ], force: true)
+        }
         if let windowOldest, upper + 1 <= windowOldest - 1 {
             await session.abandonGap((upper + 1)...(windowOldest - 1))
         }

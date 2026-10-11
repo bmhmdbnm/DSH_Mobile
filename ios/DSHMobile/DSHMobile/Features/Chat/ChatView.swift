@@ -86,6 +86,8 @@ struct ChatView: View {
     /// 新宿主（uikit）的跳转目标：换窗口之后由宿主的 `scrollToItem` 落点，
     /// 不再走 SwiftUI 的 `ScrollViewProxy`（spec 008 的 US2）。
     @State private var listJumpId: String?
+    /// uikit 跳转的重试令牌：同一行 id 也要能再次触发（落地被布局抖动冲掉时）。
+    @State private var listJumpNonce = 0
     /// 新宿主的引用（回收/水合要从外面把行交回去）。
     @State private var listHostRef: TranscriptListHost?
     /// 宿主正在执行"我们发起的滚动"（回到底部/打开钉底）时为真：这期间不要把它当成"读者滚走了"。
@@ -495,6 +497,10 @@ struct ChatView: View {
                         let items = await model.items(forSeqs: seqs)
                         guard !items.isEmpty else { return }
                         listHostRef?.rehydrate(items: items)
+                        // 水合完立刻再查一轮：附近还有回收行（上一轮没取全、或新滚进来
+                        // 一段）就连着补——静止的视口不会再有滚动事件触发扫描，等它会
+                        // 把可见带白在那儿（用例 57 的 ~1s 残白）。
+                        listHostRef?.scheduleReclaimCheck()
                     }
                 },
                 onBottomChanged: { atBottom in  // 几何驱动
@@ -987,14 +993,18 @@ struct ChatView: View {
         model.noteJumpToReading()
         // 命中可能在窗口**之外**（搜索是全会话的，时间线只装一窗）：先换窗口再滚，
         // 否则"按 seq 解析行"只会解析到窗口的第一行，怎么滚都落不到目标上（T068）。
-        let windowOldest = model.timeline.firstSeq ?? Int.max
-        if hit.seq < windowOldest {
-            rebalancing = true
-            _ = await model.rebaseWindow(around: hit.seq)
-            rebalancing = false
-        } else if TranscriptHitLocator.row(forSeq: hit.seq, in: model.timeline.items) == nil,
-                  !model.timeline.items.contains(where: { $0.id == hit.id }) {
-            _ = model.commitSearchHistory()
+        // 命中归属只认**精确行**：窗口边界的启发式（windowOldest）在缺口行、
+        // 搜索上下文 prepend、管道 refold 三层叠加下不可靠（009 场景⑥三轮实测：
+        // 1631 的窗口下界把 1685 的命中判成"在窗口内"，rebase 永不触发）。
+        // 不在时间线里就让管道把目标页拉进来（本地有则 bridge 直接返回）。
+        if TranscriptHitLocator.row(exactlyForSeq: hit.seq, in: model.timeline.items) == nil {
+            if model.pipelineActive {
+                rebalancing = true
+                _ = await model.rebaseWindow(around: hit.seq)
+                rebalancing = false
+            } else if !model.timeline.items.contains(where: { $0.id == hit.id }) {
+                _ = model.commitSearchHistory()
+            }
         }
         ViewportProbe.note("search.jump", ["item": hit.id, "seq": String(hit.seq)], force: true)
         Task { @MainActor in
@@ -1006,13 +1016,21 @@ struct ChatView: View {
                 guard let row = TranscriptHitLocator.row(exactlyForSeq: hit.seq, in: model.timeline.items) else {
                     continue
                 }
-                proxy.scrollTo(row.id, anchor: .center)
+                if ProbeVariants.listHost == "uikit" {
+                    // uikit 下 ScrollViewProxy 不在宿主的视图树里（无效调用）；
+                    // 交给宿主滚，且 nonce 递增让同一目标也能重试（布局未稳会落空）。
+                    listJumpNonce += 1
+                    listJumpId = "\(row.id)#\(listJumpNonce)"
+                } else {
+                    proxy.scrollTo(row.id, anchor: .center)
+                }
             }
             let visible = ViewportProbe.visibleRowIds()
             let target = TranscriptHitLocator.row(exactlyForSeq: hit.seq, in: model.timeline.items)?.id ?? hit.id
             if ProbeVariants.listHost == "uikit" {
                 // 新宿主：把目标交给它滚过去（同一次更新里定位，不经过 ScrollViewProxy）。
-                listJumpId = target
+                listJumpNonce += 1
+                listJumpId = "\(target)#\(listJumpNonce)"
                 return
             }
             ViewportProbe.note("search.jump.settle", [

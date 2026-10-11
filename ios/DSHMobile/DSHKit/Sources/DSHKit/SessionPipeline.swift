@@ -41,7 +41,7 @@ public actor SessionPipeline {
         }
     }
 
-    public typealias PageFetch = @Sendable (ClosedRange<Int>) async throws -> FetchPage
+    public typealias PageFetch = @Sendable (ClosedRange<Int>, FetchPriority) async throws -> FetchPage
 
     /// 拉取优先级（沿用 InFlightPageTable：prefetch < userVisible < jump）。
     public typealias FetchPriority = InFlightPageTable<Int>.Priority
@@ -316,7 +316,7 @@ public actor SessionPipeline {
             // 任务本体包含回包合并：搭车者 await 到的一定是「合并后」。
             let task = Task<Void, Error> {
                 do {
-                    let result = try await fetch(page)
+                    let result = try await fetch(page, priority)
                     self.completeFetch(result, key: key, generation: generation, requested: page)
                 } catch {
                     self.failFetch(error, key: key, generation: generation)

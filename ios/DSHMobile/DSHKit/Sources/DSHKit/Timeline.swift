@@ -585,6 +585,11 @@ public struct ChatTimeline: Sendable {
     /// a local read-back.
     public var firstSeq: Int? { items.first?.seq }
 
+    /// 窗口里第一条**数据行**的 seq（跳过缺口占位行）。
+    /// 顶部合成缺口行 `gap:0-0` 的 seq 是 0——拿 firstSeq 当窗口下界会让
+    /// 「命中在窗口之外」的判定永远为假（009 场景⑥回归：rebase 永不触发）。
+    public var firstContentSeq: Int? { items.first(where: { $0.kind.isContentRow })?.seq }
+
     // MARK: - 缺口行（spec 009 / tasks T013/T014）
 
     /// 造一行缺口占位项：身份 `gap:<start>-<end>`（与区间集派生一致，spec 009

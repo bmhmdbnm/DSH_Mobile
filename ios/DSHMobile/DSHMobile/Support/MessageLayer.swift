@@ -73,8 +73,12 @@ final class MessageLayer {
         pipeline = MessagePipeline(
             store: store,
             fetchFactory: { ref in
-                { range in
-                    if pageFailures.shouldFail() { throw PageFailureInjected() }
+                { range, priority in
+                    // 只对用户驱动的取页注入失败：预取/冷启动吃配额会让慢闸
+                    // 场景③永远等不到可见失败（007 的 PageFailureInjector 头注）。
+                    if priority == .userVisible, pageFailures.shouldFail() {
+                        throw PageFailureInjected()
+                    }
                     guard let client = client() else { throw FetchFailure.notConnected }
                     guard let address = addresses.address(for: ref.sessionId) else {
                         throw FetchFailure.noAddress

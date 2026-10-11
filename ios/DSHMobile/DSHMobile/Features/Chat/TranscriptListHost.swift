@@ -107,11 +107,15 @@ struct TranscriptListRepresentable: UIViewRepresentable {
         // 强制水合要等**真有行被回收**之后才有东西可水合：`makeUIView` 那一刻还没回收，
         // 所以在每次更新时也问一次（2026-10-08 实测：只在 makeUIView 里问 ⇒ request=0）。
         context.coordinator.maybeForceRehydrate(host: host)
-        if let target = jumpToId, target != context.coordinator.lastJumped,
-           items.contains(where: { $0.id == target }) {
-            context.coordinator.lastJumped = target
-            host.scrollTo(id: target)
-            onDiagnostic("search.jump", ["item": target, "via": "list-host"])
+        // 跳转请求形如 "id#nonce"：nonce 让同一行的重试也能触发（009 场景⑥：
+        // 首次滚动常被未落定的布局冲掉，只认 id 变化会让重试全部失效）。
+        if let request = jumpToId, request != context.coordinator.lastJumped {
+            let target = request.split(separator: "#").first.map(String.init) ?? request
+            if items.contains(where: { $0.id == target }) {
+                context.coordinator.lastJumped = request
+                host.scrollTo(id: target)
+                onDiagnostic("search.jump", ["item": target, "via": "list-host"])
+            }
         }
         // 跟随尾部时按预算丢最老端：宿主做原子丢弃（同一批 id），模型同步丢。
         // 只调一次：`onBudgetCheck` **有副作用**（它会把模型端该丢的行也丢掉），
@@ -232,7 +236,9 @@ struct TranscriptListRepresentable: UIViewRepresentable {
                     try? await Task.sleep(for: .seconds(3))
                     // 驱动还要能"滑回被回收的那一段"：只在两端跳的话，被回收的往往在中间，
                     // `near` 永远是 0，水合这条路在仿真器里就永远验不到（2026-10-08 实测）。
-                    if let reclaimed = host.rows.first(where: { $0.isReclaimed })?.id {
+                    // 胶囊类用例用 -DSHProbeOlderNoReclaim 关掉这段绕行（它会把视口带回底部）。
+                    if !ViewportProbe.olderDriveSkipsReclaimed,
+                       let reclaimed = host.rows.first(where: { $0.isReclaimed })?.id {
                         self.onDiagnostic?("older.drive", ["round": String(round), "phase": "reclaimed"])
                         host.scrollTo(id: reclaimed)
                         try? await Task.sleep(for: .milliseconds(2000))
@@ -321,6 +327,8 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
     /// 这些 seq 需要把内容要回来（调用方从本地库读，0 网络）。
     var onNeedRehydrate: (([Int]) -> Void)?
     private var reclaimCheckTask: Task<Void, Never>?
+    /// 排着的检查是不是「即查」（程序化跳落触发的 60ms 版）。
+    private var reclaimCheckIsImmediate = false
     /// 最近一次补页后的残差（用来把 007 的 `older.pump kept` 等价出来）。
     private(set) var lastSettle: (moved: CGFloat, ok: Bool)?
     private var nearTopArmed = true
@@ -397,15 +405,16 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         case .dropOldest(let count):
             dropOldest(count)
         case .reclaim(let ids):
-            for index in rows.indices where ids.contains(rows[index].id) {
-                noteLaidOutHeight(at: index)
-                rows[index].reclaim()
-            }
-            diagnostic("list.reclaim", ["rows": String(ids.count),
-                                        "bytes": String(payloadBytes()),
-                                        "totalBytes": String(payloadBytes())])
+            reclaim(ids: ids)
         case .rehydrate(let ids):
-            for index in rows.indices where ids.contains(rows[index].id) { rows[index].contentVersion += 1 }
+            var touched = Set<String>()
+            for index in rows.indices where ids.contains(rows[index].id) {
+                rows[index].contentVersion += 1
+                touched.insert(rows[index].id)
+            }
+            // 与 rehydrate(items:) 同一条纪律：身份不变内容变，必须 reload，
+            // 否则 cell 停在旧配置。
+            applySnapshot(reloading: touched)
             diagnostic("list.rehydrate", ["rows": String(ids.count), "ms": "0", "net": "0"])
         case .reconcile(let items, let reason):
             reconcile(items, reason: reason)
@@ -601,9 +610,12 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
 
     /// 回收一批行（只换载荷，不动身份与高度）。
     func reclaim(ids: [String]) {
-        let freed = rows.filter { ids.contains($0.id) && !$0.isReclaimed }
+        let wanted = Set(ids)
+        // 只算真正从 full → reclaimed 的行：已经回收的行重复进名单时
+        // freed 必须是 0，记账才看得出"重复回收"（用例 57 的 bytes=0 迷雾）。
+        let freed = rows.filter { wanted.contains($0.id) && !$0.isReclaimed }
             .reduce(0) { $0 + $1.payloadBytes }
-        for index in rows.indices where ids.contains(rows[index].id) {
+        for index in rows.indices where wanted.contains(rows[index].id) {
             noteLaidOutHeight(at: index)
             rows[index].reclaim()
         }
@@ -617,12 +629,17 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
     func rehydrate(items: [TimelineItem]) {
         let started = CFAbsoluteTimeGetCurrent()
         var rehydrated = 0
+        var touched = Set<String>()
         for item in items {
             guard let index = rows.firstIndex(where: { $0.id == item.id }), rows[index].isReclaimed else { continue }
             rows[index].rehydrate(with: item)
+            touched.insert(item.id)
             rehydrated += 1
         }
-        applySnapshot()
+        // 水合回来的行必须 reload：diffable 数据源对"身份没变"的行不重配 cell，
+        // 不 reload 的话 cell 永远停在回收时那份 Color.clear 占位——数据回来了
+        // 屏幕还是白的（用例 57 间歇性全白、用例 49 跳到命中行后一片空白的根因）。
+        applySnapshot(reloading: touched)
         collectionView.layoutIfNeeded()
         diagnostic("list.rehydrate", [
             "rows": String(rehydrated),
@@ -671,8 +688,14 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
 
     /// 驱动用：把视口送到内容顶端（`-DSHProbeOlderScroll` 的 uikit 版）。
     func scrollToTop() {
+        // 程序化"离开底部"要撤销钉底意图：驱动每轮开头会 scrollToBottom() 把
+        // wantsBottom 武装起来，不清掉的话下一条新消息经 pinAfterUpdate 又把
+        // 视口拽回底部（2026-10-11 胶囊用例复跑实测）。生产语义同理：搜索跳转
+        //  scrollTo(id:) 离开底部时也不该再挂着一个"回到底部"的意图。
+        wantsBottom = false
         collectionView.setContentOffset(CGPoint(x: 0, y: -collectionView.adjustedContentInset.top),
                                         animated: false)
+        scheduleReclaimCheck(immediate: true)
     }
 
     /// 钉到底部（打开会话、跟随中、以及"回到底部"按钮）。
@@ -731,19 +754,37 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
     }
 
     /// 离视口超过 `screens` 屏、且还没回收的行 —— 可以回收。
+    ///
+    /// 保护带 = 布局点带（视口 ± screens 屏）∪ 行数带（与水合同一把尺子，
+    /// `ViewportBandPlanner`）：修复前回收只用点带、水合只用下标带，行高悬殊时
+    /// 两把尺子量的不是同一段，水合刚要回来的行下一轮又被抽走（用例 57 的
+    /// 「回收 → 水合 → 又回收」乒乓）；可见带退化（`visible=2`）时点带错位，
+    /// 曾一次把正在读的 135 行抽走（`bytes=0 rows=135`）。
     func rowsToReclaim(screens: Int) -> [String] {
         guard !rows.isEmpty, collectionView.bounds.height > 0 else { return [] }
+        let visible = visibleRange()
+        // 布局剧烈变动期量不出可见带：宁可不回收，也不猜着收（2026-10-11 用例 57）。
+        guard !visible.isEmpty else { return [] }
         let band = bandWithMargin(screens: screens)
-        var picked: [String] = []
-        for index in rows.indices where !rows[index].isReclaimed {
-            // 缺口行不回收：载荷几乎为零，且它没有磁盘记录可取——水合要不回
-            // spinner/重试态，只会留下一条永久空白占位。
-            if let item = rows[index].item, !item.kind.isContentRow { continue }
+        var pointProtected = Set<Int>()
+        for index in rows.indices {
             guard let attributes = collectionView.collectionViewLayout
                 .layoutAttributesForItem(at: IndexPath(item: index, section: 0)) else { continue }
-            if !attributes.frame.intersects(band) { picked.append(rows[index].id) }
+            if attributes.frame.intersects(band) { pointProtected.insert(index) }
         }
-        return picked
+        let indices = ViewportBandPlanner.reclaimCandidates(
+            rowCount: rows.count,
+            visible: visible,
+            pointProtected: pointProtected,
+            screens: screens
+        ) { index in
+            guard !rows[index].isReclaimed else { return false }
+            // 缺口行不回收：载荷几乎为零，且它没有磁盘记录可取——水合要不回
+            // spinner/重试态，只会留下一条永久空白占位。
+            if let item = rows[index].item, !item.kind.isContentRow { return false }
+            return true
+        }
+        return indices.map { rows[$0].id }
     }
 
     /// 已被回收、但已经回到视口 `screens` 屏以内的行 —— 需要把内容要回来（seq 列表）。
@@ -751,19 +792,21 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         guard !rows.isEmpty else { return [] }
         // 用**下标**判近远，不用布局属性：被回收的行往往没被渲染，
         // `layoutAttributesForItem` 对它们返回 nil，于是"近"永远判不出来（2026-10-08 实测 `near=0`）。
-        // 下标按"可见行数"换算：可见 n 行 ⇒ 1 屏 ≈ n 行，所以 screens 屏 ≈ screens × max(n, 4) 行。
+        // 与回收共用 `ViewportBandPlanner` 的行数带：水合带（2 屏）严格小于
+        // 回收保护带（5 屏），要回来的行不会在下一轮又被回收（乒乓修复）。
         let visible = visibleRange()
-        guard !visible.isEmpty else { return [] }
-        let perScreen = max(visible.count, 4)
-        let span = screens * perScreen
-        let lower = max(0, visible.lowerBound - span)
-        let upper = min(rows.count, visible.upperBound + span)
-        var seqs: [Int] = []
-        for index in rows.indices {
-            guard case .reclaimed(let seq, _, _) = rows[index].state else { continue }
-            if index >= lower, index < upper { seqs.append(seq) }
+        let indices = ViewportBandPlanner.rehydrateCandidates(
+            rowCount: rows.count,
+            visible: visible,
+            screens: screens
+        ) { index in
+            if case .reclaimed = rows[index].state { return true }
+            return false
         }
-        return seqs
+        return indices.compactMap { index in
+            guard case .reclaimed(let seq, _, _) = rows[index].state else { return nil }
+            return seq
+        }
     }
 
     /// 契约里的两个距离（spec 008 的 clarify 决定：5 屏回收 / 2 屏水合）。
@@ -773,8 +816,12 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
 
     func scrollTo(id: String, animated: Bool = false) {
         guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
+        // 程序化"跳走"同样撤销钉底意图（与 scrollToTop 同一条纪律）：
+        // 搜索命中跳转停在中间时，挂着 wantsBottom 会让下一条新消息把读者拽回底部。
+        wantsBottom = false
         collectionView.scrollToItem(at: IndexPath(item: index, section: 0),
                                     at: .centeredVertically, animated: animated)
+        scheduleReclaimCheck(immediate: true)
     }
 
     /// 记录"锚点位移"，用例据此判定（≤8pt 为 `ok=1`）。
@@ -907,11 +954,25 @@ extension TranscriptListHost {
 extension TranscriptListHost {
 
     /// 滚动里顺手做一次回收/水合判定，但**延后 400ms 且合并**：不与滚动抢主线程。
-    func scheduleReclaimCheck() {
+    /// 程序化跳落（`scrollTo`/`scrollToTop`）用 immediate：落点常常是被回收的段，
+    /// 等 400ms 会把可见带白在那儿半秒以上（用例 57 的瞬态白段），60ms 内把水合
+    /// 发出去，像素采样（500ms 一拍）就不会连着两拍看到空白。
+    func scheduleReclaimCheck(immediate: Bool = false) {
+        if immediate, reclaimCheckTask != nil, !reclaimCheckIsImmediate {
+            // 已排的长延时检查升级成即查：跳落之后不需要再等满 400ms。
+            reclaimCheckTask?.cancel()
+            reclaimCheckTask = nil
+        }
         guard reclaimCheckTask == nil else { return }
+        reclaimCheckIsImmediate = immediate
+        let delay = immediate ? 60 : 400
         reclaimCheckTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(400))
+            try? await Task.sleep(for: .milliseconds(delay))
+            // 被「升级成即查」取消的旧任务直接退场：不许清引用（指向新任务），
+            // 也不许再跑一遍检查。
+            guard !Task.isCancelled else { return }
             self?.reclaimCheckTask = nil
+            self?.reclaimCheckIsImmediate = false
             guard let self, self.window != nil else { return }
             let reclaim = self.rowsToReclaim(screens: Self.reclaimDistanceScreens)
             if !reclaim.isEmpty { self.onReclaim?(reclaim) }
