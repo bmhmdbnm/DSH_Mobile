@@ -550,6 +550,20 @@ enum ProbeVariants {
         return Int(arguments[index + 1]) ?? 0
     }
 
+    /// 故障注入：让前 N 次**往更早方向**的取页回空包（records 空 + hasMore=true），
+    /// 设备层验「空页即异常 → 可重试失败 → 点重试仍能拉」（用例 80，T038/T041）。
+    ///
+    /// 方向判据在 `EmptyPageInjector` 里，与管道判失败用的是同一份
+    ///（`SessionPipeline.isNewerDirectionProbe`）：往更新方向探空是正常形态
+    ///（adeb3aa 的语义），注入打上去只会把正常路径记成失败。
+    static var emptyPageAttempts: Int {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-DSHProbeEmptyPage"),
+              index + 1 < arguments.count
+        else { return 0 }
+        return Int(arguments[index + 1]) ?? 0
+    }
+
     /// `-DSHProbeFailPageOnDrive`：故障注入只在翻页驱动开始之后生效（用例 48）。
     ///
     /// 打开会话时的可见取页按竞争拿到 `.userVisible` / `.prefetch` 不一，会提前吃掉
@@ -770,6 +784,7 @@ enum ProbeVariants {
     static var reclaimScreens: Int { 5 }
     static var rehydrateScreens: Int { 4 }
     static var failPageAttempts: Int { 0 }
+    static var emptyPageAttempts: Int { 0 }
     static var failPageOnDrive: Bool { false }
     static func noteDriveBegan() {}
     static var failPageArmed: Bool { false }

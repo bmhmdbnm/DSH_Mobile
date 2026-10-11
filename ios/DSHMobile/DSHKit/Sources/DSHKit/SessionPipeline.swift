@@ -324,9 +324,11 @@ public actor SessionPipeline {
     /// 空回包发生在「往更新方向探」时是正常形态：窗口尾部之上还没有新内容，
     /// 不是缺历史。只有往更早方向拉空才是异常（T038）。
     /// 判据：请求区间整体在当前热窗口最新 seq 之上。
+    /// 共用判据（`isNewerDirectionProbe(pageLowerBound:hotNewest:)`）与热窗口读数
+    /// 在 `+Paging` 扩展里——App 侧的空回包注入也用它，两处必须同一份。
     private func isNewerDirectionProbe(_ page: ClosedRange<Int>) -> Bool {
-        guard let newest = hotWindow.keys.max() else { return false }
-        return page.lowerBound > newest
+        Self.isNewerDirectionProbe(pageLowerBound: page.lowerBound,
+                                   hotNewest: hotWindow.keys.max())
     }
 
     /// 回包核销 + 合并（代数不符 = 已被取消，丢弃）。

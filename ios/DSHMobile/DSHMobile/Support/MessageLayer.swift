@@ -47,6 +47,9 @@ final class MessageLayer {
     private var clientProvider: (@Sendable () -> DSHClient?)?
     /// DEBUG 故障注入：前 N 次取页失败（`-DSHProbeFailPage <n>`）。release 恒 0。
     private let pageFailures = PageFailureInjector(remaining: ProbeVariants.failPageAttempts)
+    /// DEBUG 故障注入：前 N 次**往更早方向**的取页回空包（`-DSHProbeEmptyPage <n>`）。
+    /// release 恒 0。
+    private let emptyPages = EmptyPageInjector(remaining: ProbeVariants.emptyPageAttempts)
 
     /// 注册一批会话的拉取地址（列表刷新后、进会话前各喂一次）。
     func registerAddresses(_ summaries: [SessionSummary]) {
@@ -67,6 +70,7 @@ final class MessageLayer {
         // T028：`-DSHProbeFailPage` 重接到 009 链路——包在 PageFetch 外层，
         // 前 N 次取页直接抛错，驱动慢闸场景③（断网缺口失败重试）。
         let pageFailures = self.pageFailures
+        let emptyPages = self.emptyPages
         // T026：热窗口按 spec 裁决的 500 条裁剪（US2 期间为避免淘汰后回看
         // 静默丢行临时放宽到 5000；空白带根因——磁盘水合不发 diff——已在
         // SessionPipeline 修复，这里调回预算值）。
@@ -74,6 +78,17 @@ final class MessageLayer {
             store: store,
             fetchFactory: { ref in
                 { range, priority in
+                    // T041：空回包注入（`-DSHProbeEmptyPage`）。方向只认热窗口：
+                    // 请求区间落在最新 seq 之下（更早方向）才吃配额；往更新方向
+                    // 探空是产品语义里的正常形态，不许被打成失败。
+                    if await emptyPages.shouldEmpty(page: range,
+                                                    hotNewest: emptyPages.hotNewest(for: ref),
+                                                    priority: priority) {
+                        await ViewportProbe.note("pager.empty.injected", [
+                            "start": String(range.lowerBound), "end": String(range.upperBound),
+                        ], force: true)
+                        return SessionPipeline.FetchPage(records: [], hasMore: true, clamped: false)
+                    }
                     // 只对用户驱动的取页注入失败：预取/冷启动吃配额会让慢闸
                     // 场景③永远等不到可见失败（007 的 PageFailureInjector 头注）。
                     // failPageArmed：带 -DSHProbeFailPageOnDrive 时再等驱动开始，
@@ -123,6 +138,9 @@ final class MessageLayer {
             },
             hotLimit: 500
         )
+        // 注入器要现读热窗口判方向，而管道是它自己创建之后才存在的：这里补一次绑定
+        //（弱引用，不把 MessageLayer 挂在自身管道的闭包上）。
+        if let pipeline { emptyPages.bind(pipeline: pipeline) }
     }
 
     // MARK: - T033 用户输入灌库（三表终局，spec 009 data-model v3）

@@ -173,6 +173,15 @@ public actor MessagePipeline {
         return pipeline
     }
 
+    /// 某会话热窗口的最新 seq（nil = 还没建管道/还没有窗口）。
+    ///
+    /// 给 App 侧的空回包注入判方向用（`-DSHProbeEmptyPage`）：注入只许打在
+    /// 「往更早方向」的请求上，而那件事只有热窗口知道。
+    public func hotNewest(for session: SessionRef) async -> Int? {
+        guard let pipeline = pipelines[session] else { return nil }
+        return await pipeline.hotNewestSeq
+    }
+
     // MARK: - 快照订阅（契约面）
 
     /// 订阅某会话的快照流。首帧是当前快照（可能只有 gap 行），之后是增量。

@@ -39,6 +39,22 @@ extension SessionPipeline {
         requested.lowerBound == 1 && (page.hasMore == false || page.clamped)
     }
 
+    // MARK: - 空回包的方向判据（T038 / adeb3aa）
+
+    /// 「往更新方向探空」的判据（**唯一一份**）：请求区间整体在热窗口最新 seq 之上。
+    ///
+    /// 管道用它决定空回包算不算失败；App 侧的空回包注入（`-DSHProbeEmptyPage`，
+    /// 设备层验「更早方向拉空 = 失败」）也用它决定该不该打在这一次请求上——
+    /// 两处必须同口径，否则注入会打在正常形态上，验到的东西就不是要看的那一条。
+    /// 热窗口还没建立（冷启动首拉就是最新页）时恒为 false：那不是"探"。
+    public static func isNewerDirectionProbe(pageLowerBound: Int, hotNewest: Int?) -> Bool {
+        guard let hotNewest else { return false }
+        return pageLowerBound > hotNewest
+    }
+
+    /// 热窗口最新 seq（nil = 这个会话还没有窗口）：App 侧注入判方向要读。
+    public var hotNewestSeq: Int? { hotWindow.keys.max() }
+
     // MARK: - gap 行派生（从主文件拆出，同一 500 行上限）
 
     /// 缺口行由区间集派生（spec「缺口行的生命周期」）：窗口 = 最老…最新。
