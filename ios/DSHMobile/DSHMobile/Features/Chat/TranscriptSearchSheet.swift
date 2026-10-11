@@ -55,6 +55,15 @@ struct TranscriptSearchSheet: View {
     @State var searchTask: Task<Void, Never>?
     /// 已经搜过的"筛选 + 关键词"指纹：没变就不重搜（用户要求"有变更再触发"）。
     @State var lastSearchKey = ""
+    /// **正在执行**的那次搜索的指纹（防抖走完、真正开始查之后才置上，落地即清）。
+    /// 后台刷新（时间线变大、范围版本 +1）不许取消同 key 的在飞搜索——用例 49 的
+    /// 回归就是连接器往返被这一刀砍掉的。
+    @State var runningSearchKey: String?
+    /// 最近一次**成功落地**的指纹与来源：连接器命中覆盖整个会话，本地范围变大
+    /// 不需要重跑（重跑就是白打一次 2 秒往返，还会把列表换掉）。
+    @State var landedKey = ""
+    /// 在飞期间来过同 key 的范围刷新：落地后补一次（只对依赖本地窗口的来源）。
+    @State var pendingScopeRefresh = false
     /// 最新排队的指纹；只有它对应的那次搜索有权把 `isSearchPending` 放下来。
     @State var latestSearchKey = ""
     /// 正在搜（打字期间为真）：这段时间里不预读、不追加行，免得和输入抢主线程。

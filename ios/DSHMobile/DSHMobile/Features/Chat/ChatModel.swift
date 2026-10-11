@@ -579,6 +579,10 @@ final class ChatModel {
         noteJumpToReading()
         // T013：跳转 = 管道的 .jump（抢占在途低优预取，只拉目标对齐页）。
         if let bridge = pipelineBridge {
+            // 先问**本机库**：命中往往就是从它里面搜出来的（「只看我的提问」读的就是
+            // `record` 表），这时换窗口完全不必联网——`absorb` 并进管道就够，几百毫秒
+            // 内梯子就能解析到行。库里那一段不含目标（命中在更远处）才让管道走网络。
+            if await hydrateLocally(around: seq, leading: leading, limit: limit) { return nil }
             return await bridge.rebase(around: seq, leading: leading, limit: limit)
         }
         guard let sessionId = session?.sessionId, let scope = sessionScope else { return nil }
@@ -615,6 +619,33 @@ final class ChatModel {
             "landed": landed ?? "-",
         ], force: true)
         return landed
+    }
+
+    /// 换窗口前先问本机库（0 网络）：把目标附近一段读回来并并进管道。
+    ///
+    /// 返回 true = 这一段**含目标本身**，等这次 refold 落地就够（梯子按 seq 逐枪解析），
+    /// 不必联网；false = 库里没有目标（命中在更远处 / 这段从没读过），交给管道走网络。
+    ///
+    /// 为什么值得这一步：`pipelineActive` 之后换窗口只有"跟连接器要一窗"一条路，
+    /// 而「只看我的提问」的命中就是从本机 `record` 表搜出来的——目标记录明明在手上，
+    /// 却要等一次网络往返（用例 44 run 20261011-211620：点下去到断言之间只有 2 秒，
+    /// 联网那一枪还没回来）。
+    private func hydrateLocally(around seq: Int, leading: Int, limit: Int) async -> Bool {
+        guard let sessionId = session?.sessionId, let scope = sessionScope,
+              let store = messageStore, let bridge = pipelineBridge else { return false }
+        let before = max(0, seq + leading + 1)
+        let records = (try? await store.windowBefore(
+            scope: scope, sessionId: sessionId, seq: before, limit: limit)) ?? []
+        guard !records.isEmpty else { return false }
+        // 目标上面还有一段（`leading` 行）才有滚动余量；顺序按 seq 升序给管道。
+        await bridge.absorb(records: records.sorted { $0.event.seq < $1.event.seq })
+        let covers = records.contains { $0.event.seq == seq }
+        ViewportProbe.note("search.rebase.local", [
+            "seq": String(seq), "records": String(records.count), "covers": covers ? "1" : "0",
+            "oldest": String(records.first?.event.seq ?? -1),
+            "newest": String(records.last?.event.seq ?? -1),
+        ], force: true)
+        return covers
     }
 
     /// 按行载荷预算算出"最老端该丢几行"（spec 008 的 FR-004a）。
@@ -710,8 +741,15 @@ final class ChatModel {
         guard !records.isEmpty else { return }
         let change = timeline.prepend(older: records)
         if case .none = change {} else { prependSignal += 1 }
+        // 管道是活动数据源时，这一段也必须进管道：`refold` 是
+        // `timeline.reset(with: 管道 records)`，只 prepend 进时间线的行会被下一次
+        // 折叠整段抹掉——跳转目标行随之消失、视口掉回尾部（2026-10-11 用例 49
+        // run 20261011-210558：`list.settle anchor=reasoning-1643-0` 之后 rows 100→98）。
+        // 本地库读出来的记录是"已经存在的事实"，交给管道与磁盘水合同一条理（0 网络）。
+        await pipelineBridge?.absorb(records: records)
         ViewportProbe.note("search.context", [
             "around": String(lowest), "records": String(records.count),
+            "pipeline": pipelineBridge == nil ? "0" : "1",
         ], force: true)
     }
 

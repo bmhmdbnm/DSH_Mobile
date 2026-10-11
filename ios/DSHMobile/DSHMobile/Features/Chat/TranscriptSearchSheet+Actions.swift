@@ -17,8 +17,39 @@ extension TranscriptSearchSheet {
 
     /// 排一次搜索。打字时每敲一下都会把上一次排的取消掉，所以只有停下来那一次会真的跑；
     /// 指纹没变（比如只是内容变大）也走这条路，但 `immediate` 之外的重复输入不会重搜。
+    ///
+    /// 三类重复调度在这里被挡掉（前两类是 2026-10-11 用例 49 的回归根因）：
+    ///
+    ///   * **同 key 正在飞**：`scheduleSearch()` 原来无条件 `cancel()`，而时间线
+    ///     一变大（`.onChange(of: items.count)`）或范围版本 +1 就会再排一次——
+    ///     连接器搜索要 2 秒往返，这一刀正好砍在它身上，`performSearch` 落到
+    ///     `Task.isCancelled` 静默返回，命中列表永远不出现（run 20261011-204147：
+    ///     4 条 schedule 互相取消，0 条 `search.run`）。现在同 key 不打断在飞的那次，
+    ///     只记一个"落地后补一次"（仅本地窗口来源需要，见 `finishSearch`）。
+    ///   * **同 key 已落地且来源是连接器**：连接器命中覆盖整个会话，和本地读到
+    ///     多远无关，重跑只会再打一次 2 秒往返、把读者正看着的列表换掉。
+    ///   * **同 key 已经排上但还没开跑**：点胶囊会同时走按钮动作与
+    ///     `.onChange(of: onlyMine)`，两条都排一次，后一条把前一条取消掉
+    ///     （run 20261011-211413 的 `search.cancelled key=mine|`）——等着就行。
     func scheduleSearch(immediate: Bool = false) {
         let key = searchKey
+        if runningSearchKey == key {
+            pendingScopeRefresh = true
+            ViewportProbe.note("search.dedup", ["key": key, "immediate": immediate ? "1" : "0"],
+                               force: true)
+            return
+        }
+        if isSearchPending, latestSearchKey == key {
+            // 已经排上、还没开跑的同一次搜索（点胶囊的双触发）：后一条不该把前一条
+            // 取消重排——它跑的就是同一个指纹，等着就行，不置补跑标记。
+            ViewportProbe.note("search.dedup", ["key": key, "queued": "1"], force: true)
+            return
+        }
+        if !immediate, key == landedKey, searchSource == .connector {
+            ViewportProbe.note("search.skip", ["key": key, "reason": "connector-covers-all"],
+                               force: true)
+            return
+        }
         searchTask?.cancel()
         latestSearchKey = key
         isSearchPending = true
@@ -50,6 +81,7 @@ extension TranscriptSearchSheet {
     @MainActor
     func performSearch(key: String) async {
         lastSearchKey = key
+        runningSearchKey = key
         let items = model.searchItems
         let query = self.query
         let mine = onlyMine
@@ -68,11 +100,15 @@ extension TranscriptSearchSheet {
         } else if model.connectorSearchesWholeSession, keyword.count >= 2 {
             // 只有"搜全部内容"才走连接器；`onlyMine` 恒为 false（上面已独占），
             // 所以这里不再带 roles 过滤。
+            //
+            // 来源同样**先落定再 await**（原来放在 await 之后）：这段时间里
+            // `.onChange(items.count)` 会把这一次判成"本地窗口来源"，而
+            // `requestLoad()`/`loadMore` 也会按上一次的来源去分页。
+            searchSource = .connector
             let page = await model.searchPage(query: query, onlyMine: false, limit: 50)
             found = page?.hits ?? []
             searchCursor = page?.cursor
             pageHasMore = page?.hasMore ?? false
-            searchSource = .connector
         } else {
             // 没有这个能力：老办法（本地、只搜已加载的那一段），并且**离开主线程**匹配。
             found = await Task.detached(priority: .userInitiated) {
@@ -82,7 +118,27 @@ extension TranscriptSearchSheet {
             pageHasMore = false
             searchSource = .localWindow
         }
-        if Task.isCancelled { return }
+        finishSearch(key: key, found: found, items: items, started: started)
+    }
+
+    /// 一次搜索的收口：先撤在飞标记，再按"取消 / 落地"两种结局分别留痕。
+    ///
+    /// `Task.isCancelled` 这条出口原来是**静默**的（probe 都不打）：2026-10-11
+    /// 用例 49 的两次复跑里 `search.run` 一次都没出现，光看日志分不清"没跑"还是
+    /// "跑到一半被取消"。现在补 `search.cancelled`。
+    private func finishSearch(key: String, found: [TranscriptSearchHit],
+                              items: [TimelineItem], started: Date) {
+        if runningSearchKey == key { runningSearchKey = nil }
+        // 范围变大（补页 / 往前翻历史）触发的补跑：只有本地窗口来源的结果依赖
+        // "读到了多远"，连接器命中覆盖整个会话、本地全量库与窗口无关，都不补跑。
+        let rerun = pendingScopeRefresh && searchSource == .localWindow && latestSearchKey == key
+        pendingScopeRefresh = false
+        if Task.isCancelled {
+            ViewportProbe.note("search.cancelled", [
+                "key": key, "source": searchSource.rawValue,
+            ], force: true)
+            return
+        }
         ViewportProbe.note("search.run", [
             "key": key,
             "source": searchSource.rawValue,
@@ -92,9 +148,16 @@ extension TranscriptSearchSheet {
         ], force: true)
         if latestSearchKey == key { isSearchPending = false }
         guard latestSearchKey == key else { return }
+        landedKey = key
         hits = found
         // 结果集换了（切筛选、改关键词、缓冲变大）：可见集合按 id 保留，余量重算一次。
         visibleHitIds = visibleHitIds.filter { id in found.contains { $0.id == id } }
+        if rerun {
+            ViewportProbe.note("search.rerun", ["key": key, "items": String(items.count)],
+                               force: true)
+            scheduleSearch(immediate: true)
+            return
+        }
         prefetchIfRunningLow()
     }
 
@@ -193,6 +256,11 @@ extension TranscriptSearchSheet {
         // 必须始终不变——这是"加载无感、列表不跳"的机器判据（`firstBefore == firstAfter`）。
         let firstBefore = hits.first?.id
         let countBefore = hits.count
+        // 起跑时的指纹。取页是网络动作，期间读者可能切了筛选 / 改了关键词——那之后
+        // 这一页属于**上一个**结果集，追进去就是"列表被换掉"（2026-10-11 用例 44
+        // run 20261011-211807：切到「只看我的提问」之后，上一轮 `circleboom` 的
+        // 连接器续页把 4 条命中又塞回了刚清空的列表，空态文案因此没出现）。
+        let key = searchKey
         switch searchSource {
         case .localStore:
             // 正常路径到不了这里（`requestLoad` 已挡掉 onlyMine）：万一别人改了调用点，
@@ -200,8 +268,10 @@ extension TranscriptSearchSheet {
             await performSearch(key: searchKey)
         case .connector:
             // 连接器分页：直接要下一页命中（它自己扫整个会话），不走本地缓冲。
-            if let page = await model.searchPage(query: self.query, onlyMine: false,
-                                                 cursor: searchCursor, limit: 50) {
+            let page = await model.searchPage(query: self.query, onlyMine: false,
+                                              cursor: searchCursor, limit: 50)
+            guard searchKey == key else { return dropStalePage(key) }
+            if let page {
                 let existing = Set(hits.map(\.id))
                 hits.append(contentsOf: page.hits.filter { !existing.contains($0.id) })
                 searchCursor = page.cursor
@@ -209,7 +279,8 @@ extension TranscriptSearchSheet {
             }
         case .localWindow:
             await model.extendSearchHistory()
-            await performSearch(key: searchKey)
+            guard searchKey == key else { return dropStalePage(key) }
+            await performSearch(key: key)
         }
         lastRowCount = hits.count
         isLoadingMore = false
@@ -224,5 +295,11 @@ extension TranscriptSearchSheet {
         // 不够就接着读（"触发了就继续预加载"）。放在 `isLoadingMore` 放下之后，
         // 否则会被自己的 guard 挡掉（上一版就是这样：连读其实是靠别的行事件凑出来的）。
         prefetchIfRunningLow()
+    }
+
+    /// 这一页取回来时结果集已经换了：丢弃，不追加进新列表（留一条探针，别静默）。
+    private func dropStalePage(_ key: String) {
+        isLoadingMore = false
+        ViewportProbe.note("search.page.dropped", ["key": key], force: true)
     }
 }

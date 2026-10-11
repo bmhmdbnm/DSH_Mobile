@@ -999,7 +999,23 @@ struct ChatView: View {
     /// 梯子里的重试全部直接 return，视口就停在合并把它挤到的位置上）。
     /// 这里每一枪都重新按 seq 解析一次行，解析不到才退回去用面板给的那个 id。
     private func jumpToHit(_ hit: TranscriptSearchHit, proxy: ScrollViewProxy) async {
-        guard ownsTranscript else { return }
+        // 这条路的**每个**出口都要留痕（T037 同款纪律）：原来只有"滚完了"的那一条
+        // 才有 `search.jump`，2026-10-11 用例 49 两次复跑里它一次都没出现，凭日志
+        // 分不清是"根本没进这个函数"还是"卡在换窗口上"（run 20261011-204318：
+        // 面板关掉了、视口留在底部、探针里既没有 search.jump 也没有 search.rebase*）。
+        ViewportProbe.note("search.jump.begin", [
+            "item": hit.id, "seq": String(hit.seq),
+            "owner": ownsTranscript ? "1" : "0",
+            "inWindow": TranscriptHitLocator.row(exactlyForSeq: hit.seq,
+                                                 in: model.timeline.items) == nil ? "0" : "1",
+            // 行在时间线里 ≠ 在**管道窗口**里：搜索上下文 prepend 的行会被下一次
+            // refold 抹掉，跳转必须按后者判（见 ChatPipelineBridge.holds）。
+            "inPipeline": model.pipelineHolds(seq: hit.seq) ? "1" : "0",
+        ], force: true)
+        guard ownsTranscript else {
+            ViewportProbe.note("search.jump.skip", ["reason": "not-owner"], force: true)
+            return
+        }
         isFollowing = false
         userScrolled = true
         // 命中在窗口内时不走 rebaseWindow，模型侧也要强制「阅读中」（spec 场景 9：
@@ -1007,20 +1023,34 @@ struct ChatView: View {
         model.noteJumpToReading()
         // 命中可能在窗口**之外**（搜索是全会话的，时间线只装一窗）：先换窗口再滚，
         // 否则"按 seq 解析行"只会解析到窗口的第一行，怎么滚都落不到目标上（T068）。
-        // 命中归属只认**精确行**：窗口边界的启发式（windowOldest）在缺口行、
-        // 搜索上下文 prepend、管道 refold 三层叠加下不可靠（009 场景⑥三轮实测：
-        // 1631 的窗口下界把 1685 的命中判成"在窗口内"，rebase 永不触发）。
-        // 不在时间线里就让管道把目标页拉进来（本地有则 bridge 直接返回）。
-        if TranscriptHitLocator.row(exactlyForSeq: hit.seq, in: model.timeline.items) == nil {
-            if model.pipelineActive {
+        // 归属判据是**管道窗口**（`pipelineHolds`），不是"时间线里凑巧有这一行"：
+        // 搜索命中会把命中附近的一段从本地库 prepend 进时间线，那段不在管道的
+        // records 里，下一次 refold 就把目标行拿掉、视口掉回尾部（2026-10-11
+        // 用例 49 run 20261011-210558 实测）。管道窗口里真没有才让管道拉目标页。
+        if model.pipelineActive {
+            if !model.pipelineHolds(seq: hit.seq) {
+                // **不等它**：换窗口是网络动作（丢回包时 unary 要等 60 秒超时），
+                // 跳转不能跟着一起卡住——命中行可能已经在时间线里（搜索上下文
+                // prepend 的那一段），梯子照旧一枪枪试，换窗口落地后后面的枪会
+                // 打在正确的行上（`search.jump.rebase` 留痕，2026-10-11 用例 49
+                // run 20261011-210945 实测：await 换窗口把 `search.jump` 整条吞掉）。
+                ViewportProbe.note("search.jump.rebase", ["seq": String(hit.seq)], force: true)
                 rebalancing = true
-                _ = await model.rebaseWindow(around: hit.seq)
-                rebalancing = false
-            } else if !model.timeline.items.contains(where: { $0.id == hit.id }) {
-                _ = model.commitSearchHistory()
+                Task { @MainActor in
+                    _ = await model.rebaseWindow(around: hit.seq)
+                    rebalancing = false
+                }
             }
+        } else if TranscriptHitLocator.row(exactlyForSeq: hit.seq, in: model.timeline.items) == nil,
+                  !model.timeline.items.contains(where: { $0.id == hit.id }) {
+            _ = model.commitSearchHistory()
         }
-        ViewportProbe.note("search.jump", ["item": hit.id, "seq": String(hit.seq)], force: true)
+        ViewportProbe.note("search.jump", [
+            "item": hit.id, "seq": String(hit.seq),
+            // 换窗口之后目标解析到了没有：`-` = 没有可指向的行，梯子每一枪都会跳过。
+            "resolved": TranscriptHitLocator.row(exactlyForSeq: hit.seq,
+                                                in: model.timeline.items)?.id ?? "-",
+        ], force: true)
         Task { @MainActor in
             for delay in [0, 120, 300, 600, 1000, 1800, 2600] {
                 if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }

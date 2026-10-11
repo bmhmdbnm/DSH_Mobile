@@ -51,6 +51,12 @@ extension ChatModel {
     func retryGap(start: Int, end: Int) async {
         await pipelineBridge?.retryGap(start: start, end: end)
     }
+
+    /// 管道窗口里真的有这条 seq 吗（跳转要不要换窗口；见 `ChatPipelineBridge.holds`）。
+    /// 管道没起来（老路径）时恒 false——那种情况由本地窗口/搜索缓冲决定。
+    func pipelineHolds(seq: Int) -> Bool {
+        pipelineBridge?.holds(seq: seq) ?? false
+    }
 }
 
 /// 每会话一份的 009 接线状态：快照里的有序记录、缺口行、折叠代数。
@@ -313,6 +319,38 @@ final class ChatPipelineBridge {
 
     // MARK: - 用户动作（转发管道）
 
+    /// 把**本地库**读出来的一段并进管道（搜索上下文用，0 网络）。
+    ///
+    /// 走与 follow 下行同一条合并路径（`SessionPipeline.apply(events:)`：热窗口 +
+    /// 区间集 + 一次 diff）。为什么非并不可：`refold` 是
+    /// `timeline.reset(with: 管道 records)`，只 prepend 进时间线的行会被下一次折叠
+    /// 整段抹掉——命中行随之消失，跳转过去之后视口又掉回尾部
+    ///（2026-10-11 用例 49 run 20261011-210558：`list.settle anchor=reasoning-1643-0`
+    /// 之后紧接的 refold 把 rows 从 100 收到 98）。本地库里的记录是"已经存在的事实"，
+    /// 并进管道与磁盘水合同一条理，不发网络、不改身份。
+    func absorb(records: [SessionRecord]) async {
+        guard let session, !records.isEmpty else { return }
+        await session.apply(events: records.map(\.event))
+    }
+
+    /// 管道窗口里**真的装着**这条 seq 吗——跳转要不要换窗口的判据。
+    ///
+    /// 只看管道自己的 `records`（+ 缺口），**不看** `model.timeline.items`：
+    /// 搜索命中会把命中附近的一段 prepend 进时间线（`loadContextForHits`），
+    /// 那一段在 `absorb` 之前并不属于管道，下一次折叠就被抹掉。
+    ///
+    /// 2026-10-11 用例 49 的「点结果后视口停在 seq≈2400」就是这么来的
+    ///（run 20261011-210558）：命中 1685 靠这段临时的 prepend 被判成"窗口内"，
+    /// 跳转跳过换窗口、梯子也确实滚过去了（`list.settle anchor=reasoning-1643-0`），
+    /// 但紧接着的 refold（rows 100→98）把目标行从时间线里拿掉，视口掉回尾部。
+    func holds(seq: Int) -> Bool {
+        guard let oldest = records.keys.min(), let newest = records.keys.max(),
+              seq >= oldest, seq <= newest else { return false }
+        // 窗口内的缺口不算"装着"：那一行 refold 之后是缺口占位，没有内容行可跳。
+        // 顶部合成行（`gap:0-0`）不在 seq 正区间里，不参与。
+        return !gaps.contains { seq >= $0.start && seq <= $0.end }
+    }
+
     /// 跳转（.jump）：抢占在途低优预取，只拉目标附近一段；返回命中行的 id。
     ///
     /// 等待是**事件驱动**而非轮询（T023 收口）：本地命中直接返回行 id；否则先
@@ -322,10 +360,14 @@ final class ChatPipelineBridge {
     /// 超时返回 nil，视图侧的滚动梯子照旧兜底。
     func rebase(around seq: Int, leading: Int, limit: Int) async -> String? {
         guard let model, let session else { return nil }
-        // 本地命中（行已在时间线里）直接渲染，不等水合（spec「搜索策略」2）。
+        // 本地命中（行已在**管道窗口**里）直接渲染，不等水合（spec「搜索策略」2）。
         // 必须精确归属：`row(forSeq:)` 把窗口外命中钳到窗口第一行，误当本地
         // 命中会跳过换窗口拉取——搜索跳转因此成为空操作（009 场景⑥）。
-        if let row = TranscriptHitLocator.row(exactlyForSeq: seq, in: model.timeline.items) {
+        // 归属判据必须用 `holds(seq:)`（只看管道自己的 records），不能用
+        // `model.timeline.items`：搜索上下文 prepend 进去的行不在管道里，
+        // refold 一到就没了（见 `holds` 的头注）。
+        if holds(seq: seq),
+           let row = TranscriptHitLocator.row(exactlyForSeq: seq, in: model.timeline.items) {
             return row.id
         }
         let upper = seq + leading
