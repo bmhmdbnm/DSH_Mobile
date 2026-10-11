@@ -332,9 +332,11 @@ public struct ChatTimeline: Sendable {
         case .assistantMessage(let message):
             // The committed message supersedes any provisional streaming bubble.
             streaming = nil
-            // 009 T020：`stream` 非空 = 管道流式合并产出的 provisional 记录，
-            // 折出来的行标 isStreaming（渲染降级），提交记录覆盖时标记消失。
-            let provisional = message.stream != nil
+            // 009 T020 / 011：只有**本机** provisional 记录折出的行标 isStreaming
+            // （渲染降级为纯文本），提交记录覆盖时标记消失。
+            // 判据是本机私有标记，不是宿主字段：宿主的 `data.stream` 是原始模型块日志，
+            // 拿它当判据会让每条提交记录都降级（本次故障的根因）。
+            let provisional = message.isProvisional
             var change: Change = .none
             for (index, block) in message.content.enumerated() {
                 switch block {

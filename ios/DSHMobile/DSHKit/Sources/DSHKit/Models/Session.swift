@@ -288,6 +288,25 @@ public struct SessionEvent: Sendable, Codable {
     public let data: JSONValue
     public let surfaceOp: JSONValue?
 
+    /// The mark this app puts on **its own** provisional (still-streaming) record,
+    /// written by `SessionPipeline+Streaming` and read by the fold and the bridge.
+    ///
+    /// Why it exists: the host's own `assistant/message` already carries a `stream`
+    /// field, but that is the raw model output log (an array of chunks) — it says
+    /// nothing about whether the record is still streaming. Treating "`stream` is
+    /// present" as the mark made every committed record provisional, so every
+    /// answer rendered through the streaming plain-text fallback and its Markdown
+    /// never appeared. This key carries a leading underscore and a name only this
+    /// app uses, so the two meanings can no longer be confused. See
+    /// `specs/011-transcript-markdown-render/contracts/provisional-mark.md`.
+    public static let provisionalKey = "_dshMobileProvisional"
+
+    /// Whether this record was synthesised locally and is still streaming.
+    ///
+    /// The single judgement: only the boolean `true` counts. A missing key, a
+    /// non-boolean value, and any host field (including `stream`) all read false.
+    public var isProvisional: Bool { data[Self.provisionalKey]?.boolValue == true }
+
     public var date: Date? {
         guard let time, time > 0 else { return nil }
         // DSH emits epoch milliseconds.

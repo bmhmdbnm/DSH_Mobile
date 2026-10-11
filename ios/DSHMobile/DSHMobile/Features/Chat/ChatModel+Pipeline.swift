@@ -235,10 +235,12 @@ final class ChatPipelineBridge {
     }
 
     /// provisional 记录的流式内容（text/reasoning）；非流式记录返回 nil。
-    /// 判定只看 `stream` 标记——管道在 SessionPipeline+Streaming 里打的。
+    /// 判定只看**本机**标记（`AssistantMessage.isProvisional`）——管道在
+    /// SessionPipeline+Streaming 里打的；宿主的 `data.stream` 是原始模型块日志，
+    /// 不是流式标记（spec 011）。
     private static func streamingContent(of record: SessionRecord) -> (text: String, reasoning: String)? {
         guard case .assistantMessage(let message) = ChatEventDecoder.decode(record.event),
-              message.stream != nil else { return nil }
+              message.isProvisional else { return nil }
         var text = ""
         var reasoning = ""
         for block in message.content {

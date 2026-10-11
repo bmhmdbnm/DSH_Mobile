@@ -227,12 +227,12 @@ final class TimelineTests: XCTestCase {
         XCTAssertEqual(text, "正在处理", "the committed text must be the authoritative one")
     }
 
-    /// T020：带 stream 标记的 provisional 记录折出 isStreaming 行；
+    /// T020 / 011：带**本机**标记的 provisional 记录折出 isStreaming 行；
     /// 单行增量更新只改写该行文本（不动其它行）；提交记录覆盖后标记消失。
     func testProvisionalRecordFoldsAsStreamingAndUpdatesInPlace() throws {
         let provisional = try event("""
         {"type":"assistant/message","seq":41,"time":1789276359000,
-         "data":{"turn":1,"step":1,"stream":true,
+         "data":{"turn":1,"step":1,"_dshMobileProvisional":true,
                  "message":{"role":"assistant","content":[
                    {"type":"reasoning","text":"想"},
                    {"type":"text","text":"答了一半"}]}}}
@@ -259,12 +259,49 @@ final class TimelineTests: XCTestCase {
         // 不在窗口的 seq → false（调用方回退整树重折）。
         XCTAssertFalse(timeline.applyStreamingUpdate(seq: 99, text: "x", reasoning: ""))
 
-        // 提交记录（无 stream 标记）同 seq 同块形覆盖：身份一致、原地替换、标记消失。
+        // 提交记录（无本机标记）同 seq 同块形覆盖：身份一致、原地替换、标记消失。
         _ = timeline.apply(try assistantMessage(seq: 41, turn: 1, step: 1,
                                                 blocks: #"{"type":"reasoning","text":"想完了"},{"type":"text","text":"答完了"}"#))
         XCTAssertEqual(timeline.items.count, 3, "the committed record replaces the provisional rows in place")
         XCTAssertFalse(timeline.items[1].isStreaming, "the committed record lifts the streaming mark")
         XCTAssertFalse(timeline.items[2].isStreaming)
+        XCTAssertFalse(
+            timeline.applyStreamingUpdate(seq: 41, text: "再改", reasoning: "再想"),
+            "committed rows must never be updated through the streaming fast path")
+    }
+
+    /// 011 根因回归：宿主的 `assistant/message` 自带 `data.stream`，那是**原始模型输出
+    /// 块日志**（数组：block-start / text-chunks / block-end / finish …），不是「还在流式」
+    /// 的标记。拿「`stream` 非空」当判据时，每条提交记录都被折成 isStreaming 行，回答整条
+    /// 按流式纯文本渲染——加粗、行内代码、表格全部退化成源文本（owner 2026-10-12 报的故障）。
+    ///
+    /// 这条用例同时是「把判定改回 `message.stream != nil` 就会红」的反向验证载体。
+    func testHostChunkLogDoesNotMakeACommittedMessageStreaming() throws {
+        let committed = try event("""
+        {"type":"assistant/message","seq":61,"time":1789276400000,
+         "data":{"turn":1,"step":1,"usage":{"totalTokens":10},
+                 "stream":[
+                   {"type":"chunk","time":1,"chunk":{"index":0,"type":"block-start","blockType":"text"}},
+                   {"type":"chunk","time":2,"chunk":{"index":0,"type":"text-chunks","texts":["**粗体**"]}},
+                   {"type":"chunk","time":3,"chunk":{"index":0,"type":"block-end",
+                     "block":{"type":"text","text":"**粗体**"}}},
+                   {"type":"chunk","time":4,"chunk":{"type":"finish","reason":{"kind":"stop"}}}],
+                 "message":{"role":"assistant","content":[{"type":"text","text":"**粗体**"}]}}}
+        """)
+        var timeline = ChatTimeline()
+        _ = timeline.apply(try userMessage(seq: 60, text: "问"))
+        _ = timeline.apply(committed)
+
+        XCTAssertEqual(timeline.items.count, 2, "一条提交记录只折出一行")
+        XCTAssertFalse(timeline.items[1].isStreaming,
+                       "宿主的块日志不能让一条提交记录进入流式降级")
+        guard case .assistantText(let text) = timeline.items[1].kind else {
+            return XCTFail("expected the answer row")
+        }
+        XCTAssertEqual(text, "**粗体**", "行里保留的是原文，Markdown 由渲染层解析")
+        XCTAssertFalse(
+            timeline.applyStreamingUpdate(seq: 61, text: "半截", reasoning: ""),
+            "提交流不得被单行增量快进路接管")
     }
 
     /// 慢闸场景⑤（run 20261011-105530）根因：思考先行、正文后到的流式里，
@@ -277,7 +314,7 @@ final class TimelineTests: XCTestCase {
         // 思考先行：provisional 记录的正文块为空（折叠跳过），只有 reasoning 行。
         let reasoningOnly = try event("""
         {"type":"assistant/message","seq":41,"time":1789276359000,
-         "data":{"turn":1,"step":1,"stream":true,
+         "data":{"turn":1,"step":1,"_dshMobileProvisional":true,
                   "message":{"role":"assistant","content":[
                     {"type":"reasoning","text":"想了一段"},
                     {"type":"text","text":""}]}}}
@@ -304,7 +341,7 @@ final class TimelineTests: XCTestCase {
         // 对称情形：正文先行、思考后到，缺 reasoning 行同样要 false。
         let textOnly = try event("""
         {"type":"assistant/message","seq":51,"time":1789276360000,
-         "data":{"turn":1,"step":1,"stream":true,
+         "data":{"turn":1,"step":1,"_dshMobileProvisional":true,
                   "message":{"role":"assistant","content":[
                     {"type":"text","text":"正文半段"}]}}}
         """)
@@ -319,7 +356,7 @@ final class TimelineTests: XCTestCase {
         // 行齐了，快进路恢复 true 且只原地改写。
         let grown = try event("""
         {"type":"assistant/message","seq":41,"time":1789276361000,
-         "data":{"turn":1,"step":1,"stream":true,
+         "data":{"turn":1,"step":1,"_dshMobileProvisional":true,
                   "message":{"role":"assistant","content":[
                     {"type":"reasoning","text":"想了一段"},
                     {"type":"text","text":"第一段正文"}]}}}

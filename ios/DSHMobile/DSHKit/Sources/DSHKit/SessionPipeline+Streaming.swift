@@ -91,8 +91,13 @@ extension SessionPipeline {
         emit(diff)
     }
 
-    /// provisional 记录：与提交记录同形（`message.content`），`stream: true`
-    /// 是「还在流式」的唯一标记（折叠→isStreaming，桥→单行增量路径）。
+    /// provisional 记录：与提交记录同形（`message.content`），外加上本机私有标记
+    /// `SessionEvent.provisionalKey`——它是「还在流式」的唯一标记（折叠→isStreaming，
+    /// 桥→单行增量路径）。
+    ///
+    /// 这个键必须是本机自己的：宿主下发的 `assistant/message` 另有一个 `stream`
+    /// 字段（原始模型块日志），曾经被当成同一个意思，于是每条提交记录都被降级成
+    /// 纯文本（spec 011）。
     private static func provisionalEvent(_ buffer: StreamBuffer) -> SessionEvent {
         var content: [JSONValue] = []
         if !buffer.reasoning.isEmpty {
@@ -104,7 +109,7 @@ extension SessionPipeline {
             data: .object([
                 "turn": .int(buffer.turn),
                 "step": .int(buffer.step),
-                "stream": .bool(true),
+                SessionEvent.provisionalKey: .bool(true),
                 "message": .object(["content": .array(content)]),
             ]),
             surfaceOp: nil)

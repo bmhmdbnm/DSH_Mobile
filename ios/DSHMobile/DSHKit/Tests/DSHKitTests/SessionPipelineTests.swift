@@ -192,9 +192,12 @@ final class SessionPipelineTests: XCTestCase {
         let first = await iterator.next()
         XCTAssertEqual(first?.inserted.count, 1)
         XCTAssertEqual(first?.inserted.first?.event.seq, 41)
-        // T020：provisional 记录与提交的 assistant/message 同形，带 stream 标记。
+        // T020 / 011：provisional 记录与提交的 assistant/message 同形，带**本机**
+        // 标记（不是宿主那个同名的 `stream` 块日志字段）。
         let provisional = first?.inserted.first?.event
-        XCTAssertEqual(provisional?.data["stream"], .bool(true))
+        XCTAssertEqual(provisional?.data[SessionEvent.provisionalKey], .bool(true))
+        XCTAssertTrue(provisional?.isProvisional == true)
+        XCTAssertNil(provisional?.data["stream"], "宿主字段不得被本机管道占用")
         let block = provisional?.data["message"]?["content"]?.arrayValue?.first
         XCTAssertEqual(block?["type"]?.stringValue, "text")
         XCTAssertEqual(block?["text"]?.stringValue, "hello!")
@@ -259,9 +262,9 @@ final class SessionPipelineTests: XCTestCase {
         await pipeline.apply(stream: .end(attemptId: "a2", revision: 1, index: 1, committedSeq: 31))
         let stillThere = await pipeline.snapshot()
         XCTAssertEqual(stillThere.records.first(where: { $0.event.seq == 31 })?
-            .event.data["stream"], .bool(true))
+            .event.data[SessionEvent.provisionalKey], .bool(true))
 
-        // 提交事件到达：同 seq 覆盖，stream 标记消失。
+        // 提交事件到达：同 seq 覆盖，本机标记消失。
         let committed = SessionEvent(
             type: "assistant/message", seq: 31, time: nil,
             data: .object(["message": .object(["content": .array([
@@ -271,7 +274,8 @@ final class SessionPipelineTests: XCTestCase {
         await pipeline.apply(event: committed)
         let committedDiff = await iterator.next()
         XCTAssertEqual(committedDiff?.updated.count, 1)
-        XCTAssertNil(committedDiff?.updated.first?.event.data["stream"])
+        XCTAssertNil(committedDiff?.updated.first?.event.data[SessionEvent.provisionalKey])
+        XCTAssertFalse(committedDiff?.updated.first?.event.isProvisional == true)
         let final = await pipeline.snapshot()
         XCTAssertEqual(final.records.first(where: { $0.event.seq == 31 })?
             .event.data["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue, "ok!")
