@@ -114,9 +114,9 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   rm -rf "$ARCHIVE" "$EXPORT_DIR"
   # 签名（Manual + Apple Development + 描述文件）不在命令行给：全局覆盖会误伤
   # SPM 依赖 target（GRDB 不接受手动描述文件，归档报错）。签名在
-  # ios/DSHMobile/Config.local.xcconfig 的 [config=Release] 段，只挂 App target。
+  # ios/DSHMobile/Config.local.xcconfig 的 [config=OTA] 段，只挂 App target。
   xcodebuild -project "$PROJECT_DIR/DSHMobile.xcodeproj" -scheme DSHMobile \
-    -configuration Release -destination 'generic/platform=iOS' \
+    -configuration OTA -destination 'generic/platform=iOS' \
     -archivePath "$ARCHIVE" \
     CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
     DEVELOPMENT_TEAM="$TEAM_ID" \
