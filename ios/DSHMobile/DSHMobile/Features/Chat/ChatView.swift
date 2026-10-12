@@ -56,6 +56,8 @@ struct ChatView: View {
     @State private var completionBanner: String?
     /// 打开成「单条全文」的那条消息（长按正文 → 选择文本）。
     @State private var readingMessage: MessageSelection?
+    /// 正在被长按的那一行。非 nil 就显示动作单（013：自己画，见 `MessageActionSheet`）。
+    @State private var askingItem: TimelineItem?
     /// 顶部哨兵是否已经（或即将）进入视口。见 `evaluateTopDistance`。
     @State private var sentinelNearTop = false
     /// 最近一次量到的"视口顶部离内容顶部还有多远"。
@@ -188,6 +190,28 @@ struct ChatView: View {
         }
         .sheet(item: $readingMessage) { message in
             MessageTextSheet(message: message)
+        }
+        // 013：长按一行 → 动作单。手势由宿主报上来（`onRowAsk`），UI 在这里画。
+        //
+        // 不用系统 `contextMenu`/`confirmationDialog` 的理由写在 `MessageActionSheet` 顶部：
+        // 前者在这个宿主里预览与背板几何是错的（owner 截图），后者在本机根本看不到上屏。
+        .overlay {
+            if let item = askingItem, let payload = item.selectableMessage {
+                MessageActionSheet(
+                    title: payload.title,
+                    onSelect: {
+                        readingMessage = item.messageSelection
+                        withAnimation(.snappy(duration: 0.18)) { askingItem = nil }
+                    },
+                    onCopy: {
+                        item.copyTextToPasteboard()
+                        withAnimation(.snappy(duration: 0.18)) { askingItem = nil }
+                    },
+                    onCancel: {
+                        withAnimation(.snappy(duration: 0.18)) { askingItem = nil }
+                    }
+                )
+            }
         }
     }
 
@@ -553,6 +577,10 @@ struct ChatView: View {
                 },
                 jumpToId: listJumpId,
                 hostRef: $listHostRef,
+                onRowAsk: { id in
+                    guard let item = model.timeline.items.first(where: { $0.id == id }) else { return }
+                    withAnimation(.snappy(duration: 0.18)) { askingItem = item }
+                },
                 // 009（T013/T015）：管道快照的每次变化都是多段混合变更，
                 // 必须作为一次原子更新提交（统一锚位移修正）。
                 atomicApply: model.pipelineActive
@@ -745,11 +773,14 @@ struct ChatView: View {
             .probed("row:\(item.id)")
             // 长按 = 这一行的文字入口：全文/选择文本、拷贝整条。
             //
-            // 为什么长按菜单而不是长按选中：转写容器是 `List`，长按会被 cell
-            // 先接走，行上声明的 `textSelection` 根本到不了手指；选中改在打开的
-            // 全文页里做（那里由文本视图自己接管手势）。`contextMenu` 在 List 行上
-            // 是稳的，且不引入任何新的滚动手势——转写容器刚因跳白/闪退加固过。
-            .modifier(MessageActions(item: item) { readingMessage = $0 })
+            // 长按 = 这一行的文字入口：全文/选择文本、拷贝整条。
+            //
+            // 013：UIKit 宿主下长按由宿主的手势认（见 `TranscriptListHost.onRowAsk`），
+            // 这里只负责另一条宿主分支的 `contextMenu`。
+            .modifier(MessageActions(item: item,
+                                     hostOwnsLongPress: ProbeVariants.listHost == "uikit") {
+                readingMessage = $0
+            })
     }
 
     /// 尾部那块（等待提示或流式气泡）。

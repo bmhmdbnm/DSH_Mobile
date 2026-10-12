@@ -50,6 +50,12 @@ struct TranscriptListRepresentable: UIViewRepresentable {
     let jumpToId: String?
     /// 把宿主实例交回给 `ChatView`（回收/水合要用它把行交回来）。
     let hostRef: Binding<TranscriptListHost?>
+    /// 长按了某一行（行 id）。宿主只负责"谁被长按了"，弹什么由 SwiftUI 决定。
+    ///
+    /// 为什么手势在宿主里：`UIHostingConfiguration` 里的 SwiftUI `onLongPressGesture`
+    /// **收不到长按**（2026-10-12 用唯一串实测：按满 1 秒回调也不跑）；而系统
+    /// `contextMenu` 在这个宿主里的预览/背板几何是错的（抬起来的整行压住导航栏、遮罩只盖一半）。
+    let onRowAsk: (String) -> Void
     /// 009 数据源（MessagePipeline 快照）模式：每次 `items` 变化都是一次多段
     /// 混合变更，必须作为**一次原子更新**提交（统一锚位移修正，tasks T015），
     /// 不再走「prepend / setRows 二选一」的启发式（那会拆成两次提交或误锚尾部）。
@@ -71,6 +77,7 @@ struct TranscriptListRepresentable: UIViewRepresentable {
         context.coordinator.host = host
         context.coordinator.onNearTop = onNearTop
         context.coordinator.onDiagnostic = onDiagnostic
+        host.onRowAsk = onRowAsk
         host.onReclaim = onReclaim
         host.onNeedRehydrate = { [weak coordinator = context.coordinator] seqs in
             coordinator?.onNeedRehydrate?(seqs)
@@ -331,6 +338,8 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
 
     /// 该回收这些行（由调用方决定最终是否回收）。
     var onReclaim: (([String]) -> Void)?
+    /// 长按了某一行（行 id）。只报给调用方；这一层不弹任何东西。
+    var onRowAsk: ((String) -> Void)?
     /// 这些 seq 需要把内容要回来（调用方从本地库读，0 网络）。
     var onNeedRehydrate: (([Int]) -> Void)?
     private var reclaimCheckTask: Task<Void, Never>?
@@ -370,6 +379,17 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         // 三处一起关：不参与选中、不高亮、cell 背景配置清空（正常态也一并不画）。
         // 长按菜单不受影响——`contextMenu` 走的是另一条手势，不经过 cell 的高亮。
         collectionView.allowsSelection = false
+        // 长按一行 = 打开这一行的动作单（SwiftUI 画）。
+        //
+        // 手势放在宿主里，有两个实测理由（2026-10-12，spec 013）：`UIHostingConfiguration`
+        // 里的 SwiftUI `onLongPressGesture` 收不到长按；系统 `contextMenu` 在这个宿主里的
+        // 预览与背板几何是错的（被长按的一行常常比屏幕还高，抬起来压住导航栏、遮罩只盖一部分）。
+        // `cancelsTouchesInView` 保持默认 true：长按已经成立时，不该再让手指底下的按钮也响应。
+        let rowLongPress = UILongPressGestureRecognizer(
+            target: self, action: #selector(handleRowLongPress(_:))
+        )
+        rowLongPress.minimumPressDuration = 0.4
+        collectionView.addGestureRecognizer(rowLongPress)
         addSubview(collectionView)
         NSLayoutConstraint.activate([
             collectionView.topAnchor.constraint(equalTo: topAnchor),
@@ -406,6 +426,20 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         ) { view, indexPath, id in
             view.dequeueConfiguredReusableCell(using: registration, for: indexPath, item: id)
         }
+    }
+
+    /// 长按落在哪一行：交给调用方。
+    ///
+    /// 只认 `.began`（一个手势只报一次）；落在没有可拷贝文本的行上就不报——那类行本来就没有
+    /// 动作单（分隔、提示、缺口）。
+    @objc private func handleRowLongPress(_ recognizer: UILongPressGestureRecognizer) {
+        guard recognizer.state == .began else { return }
+        let point = recognizer.location(in: collectionView)
+        guard let indexPath = collectionView.indexPathForItem(at: point),
+              let id = dataSource?.itemIdentifier(for: indexPath),
+              let item = rows.first(where: { $0.id == id })?.item,
+              item.selectableMessage != nil else { return }
+        onRowAsk?(id)
     }
 
     // MARK: - UICollectionViewDelegate
