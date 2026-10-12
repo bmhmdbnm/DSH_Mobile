@@ -15,6 +15,14 @@
 `-DSHOpenScreen` 支持的值由 `RootView.swift` 的 `automationScreen()` 决定，
 新增页面时同时改这里和 `test/cases/fixed/01-全部独立页面逐屏核对.md`。
 
+## 与页面无关、可叠在任何一次启动上的钩子
+
+用例里写成 `打开页面 <页面> args=<参数>,<值>`；`args` 的值用逗号分隔，含逗号的参数要加引号。
+
+| 参数 | 值 | 用途 |
+|---|---|---|
+| `-DSHInstallChannel` | `overTheAir` / `appStore` / `development` | 手动指定「这份 App 是怎么装的」。用来核对「有新版本可安装」横幅只发给 OTA 装法：仿真器里既没有内嵌描述文件也没有 App Store 收据，真实判定永远是 `development`，不给这个钩子就看不到横幅该出现的那一屏 |
+
 ## 诊断屏
 
 | 页面 | 根标识 | 启动参数 | 说明 |

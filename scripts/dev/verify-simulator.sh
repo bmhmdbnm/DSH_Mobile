@@ -20,6 +20,10 @@
 #   -DSHForgetDirect           先删掉遗留的直连 profile，只留中转
 #   -DSHUploadFile <路径>       走一次文件上传
 #   -DSHDraftImage <路径>       往输入框塞一张待发图片
+#   -DSHInstallChannel <装法>   手动指定装法判定（overTheAir / appStore / development），
+#                              用来核对「有新版本可安装」横幅只发给 OTA 装法；
+#                              仿真器里真实判定永远是 development（既没有内嵌描述文件
+#                              也没有 App Store 收据，见 Support/InstallChannel.swift）
 #
 # 用法: ./scripts/dev/verify-simulator.sh [截图输出目录]
 # ============================================================

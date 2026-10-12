@@ -9,6 +9,10 @@ import Observation
 /// not hypothetical: every build used to carry the same version, so iOS treated
 /// each update as "already installed" and skipped it, and there was no way to
 /// notice from the phone.
+///
+/// 只对 **OTA 装法**成立：这个 feed 描述的是 OTA 包，横幅也指回 OTA 安装页。
+/// TestFlight / App Store 装的包是苹果分发签名，装不上 OTA 包，点了横幅只会被要求先删
+/// 掉 App（2026-10-11 的 TestFlight 反馈），所以那些装法连查都不查（见 `InstallChannel`）。
 @MainActor
 @Observable
 final class UpdateChecker {
@@ -24,6 +28,8 @@ final class UpdateChecker {
     private(set) var available: Published?
 
     private let feed: URL
+    /// 这份安装是靠哪条路来的；不是 OTA 就不查也不提示（见类型注释）。
+    private let channel: InstallChannel
     /// Guards against overlapping fetches, not against checking again: the
     /// check has to repeat, because a user who updated while the app was in the
     /// background would otherwise keep seeing "update available" for a build
@@ -31,8 +37,9 @@ final class UpdateChecker {
     private var isChecking = false
 
     /// 地址来自构建配置（Config.xcconfig / 本机 Config.local.xcconfig），见 AppConfig。
-    init(feed: URL = URL(string: AppConfig.updateFeed)!) {
+    init(feed: URL = URL(string: AppConfig.updateFeed)!, channel: InstallChannel = .current) {
         self.feed = feed
+        self.channel = channel
     }
 
     /// The build this process was launched from.
@@ -42,6 +49,12 @@ final class UpdateChecker {
 
     /// Fetches the published stamp and updates what the banner should say.
     func refresh() async {
+        // 先看装法再看别的：TestFlight / App Store 装法下这份 feed 无论说什么都不该
+        // 变成一条提示，连请求也不发。
+        guard channel.acceptsInAppUpdate else {
+            available = nil
+            return
+        }
         guard !isChecking else { return }
         isChecking = true
         defer { isChecking = false }
