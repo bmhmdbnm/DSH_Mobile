@@ -32,6 +32,12 @@ struct MarkdownText: View {
     }
 
     private var blocks: some View {
+        // 这些块**不开**文本选择（`.textSelection(.enabled)`），2026-10-12 去掉：
+        // 转写页的行住在 `List` 里，长按会被 cell 先接走，声明在这里的选择能力根本到不了
+        // 手指（见 MessageTextSheet 的说明），用户真正能用的选择入口是"长按一行 → 选择文本"
+        // 打开的那一页（那里由 `UITextView` 自己接管手势）。留着它不但没有用处，还会与
+        // cell 的高亮叠加：轻点回答正文后整块矩形留下灰色"选中"底（owner 2026-10-12 截图）。
+        // 所以这里一律不声明选择，选择只留在全文页。
         VStack(alignment: .leading, spacing: DSHTheme.Spacing.tight) {
             ForEach(MarkdownBlock.parse(text)) { block in
                 switch block.kind {
@@ -43,14 +49,12 @@ struct MarkdownText: View {
                         // leading is noticeably tighter and makes CJK prose
                         // feel cramped.
                         .lineSpacing(4)
-                        .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
 
                 case .heading(let level, let content):
                     InlineMarkdown(text: content)
                         .font(.system(size: level <= 2 ? 18 : 16, weight: .semibold))
                         .foregroundStyle(DSHTheme.labelPrimary)
-                        .textSelection(.enabled)
                         .padding(.top, level <= 2 ? DSHTheme.Spacing.hairline : 0)
 
                 case .code(let language, let code):
@@ -66,7 +70,6 @@ struct MarkdownText: View {
                             .font(DSHTheme.Typography.body)
                             .foregroundStyle(DSHTheme.labelPrimary)
                             .lineSpacing(4)
-                            .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
@@ -79,7 +82,6 @@ struct MarkdownText: View {
                             .font(DSHTheme.Typography.body)
                             .foregroundStyle(DSHTheme.labelSecondary)
                             .lineSpacing(4)
-                            .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
@@ -171,7 +173,6 @@ private struct CodeBlock: View {
                      : ChatCodeHighlight.highlighted(code: code, language: language, cacheKey: cacheKey))
                     .font(DSHTheme.Typography.code)
                     .foregroundStyle(DSHTheme.labelPrimary)
-                    .textSelection(.enabled)
                     .padding(DSHTheme.Spacing.tight)
             }
         }
