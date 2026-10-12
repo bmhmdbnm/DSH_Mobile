@@ -21,10 +21,10 @@ they differ only in who runs the relay.
    [issue #1](https://github.com/jayantTang/DSH_Mobile/issues/1) — one code enrols one computer,
    and the connector prints the enrolment command when it starts without an identity.
 4. **Restart DSH** so the connector picks up its new identity. After that it reconnects by itself.
-5. **Pair the phone:** open `/mobile-link/qr` in DSH (or the mobile-connection page) and scan the
-   QR code in the app, or type the pairing code by hand. Relay addresses look like
-   `wss://relay.example.com/dsh-link` — whoever hands out the invite also hands out the address to
-   use with it.
+5. **Pair the phone:** click **移动端连接** at the bottom of the sidebar in DSH and scan the QR
+   code it shows; the relay address and the one-time pairing code are both inside that code, so
+   nothing has to be typed. (With no GUI around, `node scripts/dev/show-pair-qr.mjs` prints the
+   same code as an image.)
 6. **Check the link:** the app's status chip turns green and the session list fills in.
 
 ## B · Run your own relay (20 minutes)

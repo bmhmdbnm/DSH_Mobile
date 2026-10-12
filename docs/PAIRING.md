@@ -23,7 +23,7 @@
 | 中转 `agents` 表 | 存在，且 `agentSecret` **只存哈希** |
 | 中转 `accounts` 表 | 存在（`agents_account` 索引），但**未启用** |
 | 配对码 | 中转 `POST /pair/code` 签发（一次性、默认 10 分钟）；连接器 `/mobile-link/pair-code` 取用，手机 `/pair/claim` 兑换 |
-| 二维码 | 连接器 `GET /mobile-link/qr` 出图，内容是 `dsh://pair?relay=…&code=…`；App 扫码或手输配对码。同一张码会一直留在页面上（刷新不换），图案下方写明有效期；它被兑换掉或快过期时页面才换新的 |
+| 二维码 | 连接器 `POST /mobile-link/pair-code` 一次返回码、payload 与图案（`dsh://pair?relay=…&code=…`）；DSH 界面左下角「移动端连接」小窗展示它，App 扫码或手输配对码。取码接口**每次调用都新签一张**，小窗在码被兑换（在线手机台数增长）或剩余不足 1 分钟时自动换，也可手动换（spec 010）。旧的浏览器页面 `GET /mobile-link/qr` 已删除 |
 | 设备令牌 | 已签发，按 agent 归属，长期有效并随 `/pair/refresh` 轮换 |
 | 设备管理 | 中转 `GET /devices`、`POST /devices/revoke` + `admin.py device-list`；**App 设置页已可看已配对设备并撤销** |
 | 直连入口 | App 连接页**已去掉**，只保留中转配对；`dsh://direct` 仅 DEBUG 参数 |
@@ -39,7 +39,7 @@
 ② 首次启动，连接器向中转「登记」，拿到 agentId + agentSecret
         │        （需要账号或邀请码，不能完全开放）
         ▼
-③ 连接器在桌面显示一个二维码（含 relayUrl + 一次性配对码）
+③ 连接器在 DSH 界面（侧栏底部「移动端连接」）显示一个二维码（含 relayUrl + 一次性配对码）
         │
 ④ 手机 App 扫码 → POST /pair/claim → 拿到 deviceToken
         │
@@ -69,7 +69,7 @@
 | 项 | 说明 | 状态 |
 |---|---|---|
 | 连接器自助登记 | 用邀请码换 agentId/secret；`admin.py` 保留为运营工具 | 未做（公开分发前必做）|
-| 二维码 | 连接器 `GET /mobile-link/qr` 出图；App 扫码 | ✅ 已具备 |
+| 二维码 | 连接器出图（`POST /mobile-link/pair-code` 带 `svg`），DSH 界面「移动端连接」小窗展示 | ✅ 已具备（010 起在界面里）|
 | 设备自助管理 | App 内可看已配对设备、可撤销 | ✅ 已具备 |
 | App 去掉直连入口 | 连接页只保留「中转配对」 | ✅ 已具备 |
 | 能力探测 | 连接器 `status` 回报 `capabilities`，App 据此显示/隐藏功能 | ✅ 已具备 |

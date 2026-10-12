@@ -41,8 +41,9 @@ function readManifestVersion() {
  * - `events`         the per-device `$events` stream is served
  * - `session-streams` logical streams (`session/follow`, …) are served
  * - `pair-code`      this connector can mint a pairing code on request
- * - `qr-pairing`     this connector can render the pairing QR itself
- *                    (`GET /mobile-link/qr`), so the desktop needs no client
+ * - `qr-pairing`     this connector renders the pairing QR itself (the `svg`
+ *                    field of `POST /mobile-link/pair-code`), so the DSH client
+ *                    needs no QR library of its own
  * - `self-enroll`    this connector can register itself with an invite code
  * - `git`            git status / diff / log / show can be read from the work
  *                    tree on this computer (see git.js)

@@ -7,12 +7,15 @@
  *      never been registered, redeem the invite code from the environment (or
  *      the config) first, so a fresh install becomes usable without the relay
  *      operator provisioning anything by hand.
- *   2. Three routes under `/mobile-link` behind DSH's own connection fence:
+ *   2. Two routes under `/mobile-link` behind DSH's own connection fence:
  *      GET  /status     — is the link up, which devices are attached, and is
  *                         this computer registered yet
- *      POST /pair-code  — mint a pairing code + QR payload through the relay
- *      GET  /qr         — the same code rendered as a scannable QR SVG
+ *      POST /pair-code  — mint a pairing code through the relay, with the QR
+ *                         payload and the symbol rendered alongside it
  *
+ * The pairing screen itself lives in the client half (`lib/client.js`, spec 010):
+ * a standing button in the sidebar plus a panel that shows the code, its QR and
+ * the paired phones. There is no browser page for pairing any more.
  * Deliberate design choices:
  *   * The plugin declares **no required services** (`inject` is empty). The DLP
  *     agent must run even if a future DSH renames or drops `webServer` /

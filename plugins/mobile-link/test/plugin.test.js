@@ -110,7 +110,7 @@ test('the plugin advertises no required services', () => {
 test('apply registers every route through ctx.inject and starts the agent', () => {
   const { ctx, routes, effects, injected } = fakeContext()
   plugin.apply(ctx, BASE_CONFIG)
-  assert.deepEqual([...routes.keys()].sort(), ['/mobile-link/pair-code', '/mobile-link/qr', '/mobile-link/status'])
+  assert.deepEqual([...routes.keys()].sort(), ['/mobile-link/pair-code', '/mobile-link/status'])
   // `sessionQuery` is injected **optionally**: history reads fall back to
   // `session/page` when the Host does not have the service (spec 007 FR-002).
   assert.deepEqual(injected, [['webServer'], ['webServer', 'connection'], ['sessionQuery']])
@@ -203,13 +203,16 @@ test('wrong HTTP methods get a 405 with Allow', async () => {
   assert.equal(pair.headers.allow, 'POST')
 })
 
-// ── GET /mobile-link/qr ────────────────────────────────────────────────────
+// ── POST /mobile-link/pair-code ────────────────────────────────────────────
 //
-// The pairing screen is one URL: open it, see a scannable code, with no desktop
-// client involvement. `?format=json` is the same content for the tests.
+// This one route now serves the pairing panel in the DSH client (spec 010): the
+// code, its QR payload and the symbol come back together. There is no browser
+// pairing page any more, so the properties that used to belong to it — "the
+// picture and the code are the same", "a code that was spent is never shown
+// again" — are properties of this response.
 //
 // The relay is unreachable here, so `mintPairCode` is stubbed on the prototype:
-// the routes call exactly that one method, and standing up a fake relay would
+// the route calls exactly that one method, and standing up a fake relay would
 // test the relay instead of the route.
 
 /** Runs `fn` with every agent's `mintPairCode` replaced. */
@@ -232,129 +235,72 @@ const MINTED = {
   qrPayload: 'dsh://pair?relay=wss%3A%2F%2Frelay.test%2Fdsh-link&code=JKMN-PQRS-TUVW-XYZ2',
 }
 
-test('GET /mobile-link/qr renders an SVG when the relay mints a code', async () => {
+/** Calls the pair-code route with its stub in place and parses the answer. */
+function pairBody(routes, stub = async () => ({ ...MINTED })) {
+  const res = fakeResponse()
+  return withMint(stub, async () => {
+    await routes.get('/mobile-link/pair-code').handler(fakeRequest('POST', {}), res)
+    return { res, body: res.body ? JSON.parse(res.body) : undefined }
+  })
+}
+
+test('POST /mobile-link/pair-code returns the symbol with the code it belongs to', async () => {
   const { ctx, routes } = fakeContext()
   plugin.apply(ctx, BASE_CONFIG)
-  const res = fakeResponse()
-  await withMint(async () => MINTED, () =>
-    routes.get('/mobile-link/qr').handler(fakeRequest('GET', undefined, '/mobile-link/qr'), res))
+  const { res, body } = await pairBody(routes)
 
   assert.equal(res.statusCode, 200)
-  assert.equal(res.headers['content-type'], 'image/svg+xml; charset=utf-8')
-  assert.equal(res.headers['cache-control'], 'no-store')
-  assert.match(res.body, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/)
-  assert.match(res.body, /<path d="M/)
-})
-
-test('GET /mobile-link/qr?format=json returns the payload and the SVG', async () => {
-  const { ctx, routes } = fakeContext()
-  plugin.apply(ctx, BASE_CONFIG)
-  const res = fakeResponse()
-  await withMint(async () => MINTED, () =>
-    routes.get('/mobile-link/qr').handler(
-      fakeRequest('GET', undefined, '/mobile-link/qr?format=json'), res))
-
-  assert.equal(res.statusCode, 200)
-  const body = JSON.parse(res.body)
+  assert.equal(res.headers['content-type'], 'application/json; charset=utf-8')
   assert.equal(body.ok, true)
   assert.equal(body.code, MINTED.code)
   assert.equal(body.qrPayload, MINTED.qrPayload)
-  assert.match(body.svg, /^<svg /)
+  assert.equal(body.expiresAt, MINTED.expiresAt)
+  // The pre-existing field set, unchanged (宪法原则 IV): an older App reads
+  // exactly these. `svg` above is the only addition.
+  assert.equal(body.ttlMs, MINTED.ttlMs)
+  assert.equal(body.relayUrl, MINTED.relayUrl)
+  assert.equal(body.agentId, MINTED.agentId)
+  assert.deepEqual(Object.keys(body).sort(),
+    ['agentId', 'code', 'expiresAt', 'ok', 'qrPayload', 'relayUrl', 'svg', 'ttlMs'])
+  // Same answer, same symbol: the panel must never show a picture from one
+  // response and a code from another.
+  assert.match(body.svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/)
+  assert.match(body.svg, /<path d="M/)
 })
 
-test('GET /mobile-link/qr fails closed when the relay is unreachable', async () => {
+test('the symbol carries no caption (the panel runs its own countdown)', async () => {
   const { ctx, routes } = fakeContext()
   plugin.apply(ctx, BASE_CONFIG)
-  const res = fakeResponse()
-  await withMint(async () => { throw new Error('fetch failed') }, () =>
-    routes.get('/mobile-link/qr').handler(fakeRequest('GET', undefined, '/mobile-link/qr'), res))
-
-  assert.equal(res.statusCode, 502)
-  assert.equal(JSON.parse(res.body).code, 'relay/unavailable')
+  const { body } = await pairBody(routes)
+  assert.equal(body.svg.includes('<text'), false, '服务端渲染的"还剩 N 分钟"会随窗口打开而失真')
 })
 
-test('GET /mobile-link/qr refuses to mint without the DSH fence', async () => {
-  const { ctx, routes } = fakeContext({ fence: 'missing' })
-  plugin.apply(ctx, BASE_CONFIG)
-  const res = fakeResponse()
-  await routes.get('/mobile-link/qr').handler(fakeRequest('GET', undefined, '/mobile-link/qr'), res)
-  assert.equal(res.statusCode, 403)
-})
-
-test('GET /mobile-link/qr rejects other methods', async () => {
-  const { ctx, routes } = fakeContext()
-  plugin.apply(ctx, BASE_CONFIG)
-  const res = fakeResponse()
-  await routes.get('/mobile-link/qr').handler(fakeRequest('POST', {}), res)
-  assert.equal(res.statusCode, 405)
-  assert.equal(res.headers.allow, 'GET')
-})
-
-// 屏幕上那张码只在该换的时候换：刷新页面不该换掉它，被用掉或快过期了才换。
-// 这条是"扫了没反应"的一半原因——页面上那张和手机扫到的那张不是同一个状态。
-
-/** Runs `fn` with the prototype's `devices` map reporting a fixed size. */
-async function withDeviceCount(read, fn) {
-  const proto = plugin.MobileLinkAgent.prototype
-  const original = Object.getOwnPropertyDescriptor(proto, 'devices')
-  Object.defineProperty(proto, 'devices', { configurable: true, get: () => ({ size: read() }) })
-  try {
-    return await fn()
-  } finally {
-    Object.defineProperty(proto, 'devices', original)
-  }
-}
-
-test('GET /mobile-link/qr keeps one code until it is spent, then mints the next', async () => {
+test('every call mints a fresh code, so a spent one is never handed out again', async () => {
   const { ctx, routes } = fakeContext()
   plugin.apply(ctx, BASE_CONFIG)
   let mints = 0
-  let devices = 0
-  // 第二张码只剩 30 秒：不足以再扫一次，页面应该自己换掉它。
   const stub = async () => {
     mints += 1
-    return {
-      ...MINTED,
-      expiresAt: Date.now() + (mints === 2 ? 30_000 : 600_000),
-      qrPayload: `${MINTED.qrPayload}-${mints}`,
-    }
-  }
-  const render = async () => {
-    const res = fakeResponse()
-    await routes.get('/mobile-link/qr').handler(fakeRequest('GET', undefined, '/mobile-link/qr'), res)
-    return res.body
+    return { ...MINTED, code: `CODE-000${mints}`, qrPayload: `${MINTED.qrPayload}-${mints}` }
   }
 
-  await withMint(stub, () => withDeviceCount(() => devices, async () => {
-    const first = await render()
-    assert.equal(mints, 1)
-    assert.match(first, /有效期至 \d\d:\d\d/, '页面上要写清楚这张码还能用多久')
-    assert.equal(await render(), first, '同一张码在刷新时被换掉，人就会去扫屏幕上那张旧的')
-    assert.equal(mints, 1)
-
-    devices = 1 // 一台手机用它配上来了
-    const second = await render()
-    assert.equal(mints, 2, '码被用掉之后必须换一张')
-    assert.notEqual(second, first)
-
-    await render()
-    assert.equal(mints, 3, '剩下的时间不够再扫一次时也要换一张')
-  }))
+  const first = await pairBody(routes, stub)
+  const second = await pairBody(routes, stub)
+  assert.equal(mints, 2, '取码接口不许复用上一张：复用正是"扫到废码"的来源')
+  assert.equal(first.body.code, 'CODE-0001')
+  assert.equal(second.body.code, 'CODE-0002')
+  assert.notEqual(first.body.svg, second.body.svg, '换码必须换图')
 })
 
-test('GET /mobile-link/qr?format=json says whether the code was re-used', async () => {
+test('POST /mobile-link/pair-code fails closed when the relay is unreachable', async () => {
   const { ctx, routes } = fakeContext()
   plugin.apply(ctx, BASE_CONFIG)
-  const render = async () => {
-    const res = fakeResponse()
-    await routes.get('/mobile-link/qr').handler(
-      fakeRequest('GET', undefined, '/mobile-link/qr?format=json'), res)
-    return JSON.parse(res.body)
-  }
-  await withMint(async () => ({ ...MINTED }), async () => {
-    assert.equal((await render()).reused, false)
-    assert.equal((await render()).reused, true)
-  })
+  const { res, body } = await pairBody(routes, async () => { throw new Error('fetch failed') })
+
+  assert.equal(res.statusCode, 502)
+  assert.equal(body.ok, false)
+  assert.equal(body.code, 'relay/unavailable')
+  assert.equal(body.svg, undefined, '拿不到码就不许给半张图')
 })
 
 test('detectHostForm reads evidence from the process, never from inherited env', () => {
@@ -394,31 +340,27 @@ test('the status snapshot carries the host form the plugin set', () => {
 test('with no connection service the routes stay registered and the privileged ones fail closed', async () => {
   const { ctx, routes } = fakeContext({ fence: 'missing' })
   assert.doesNotThrow(() => plugin.apply(ctx, BASE_CONFIG))
-  assert.equal(routes.size, 3, 'connection 缺失不该让路由消失')
+  assert.equal(routes.size, 2, 'connection 缺失不该让路由消失')
 
   const status = fakeResponse()
   await routes.get('/mobile-link/status').handler(fakeRequest('GET'), status)
   assert.equal(status.statusCode, 200, '/status 是诊断用的，栅栏缺失时仍要能读')
 
-  const qr = fakeResponse()
-  await routes.get('/mobile-link/qr').handler(fakeRequest('GET'), qr)
-  assert.equal(qr.statusCode, 403, '铸造凭据的路由必须失败关闭')
-  assert.match(qr.body, /connection service is unavailable/)
+  const pair = fakeResponse()
+  await routes.get('/mobile-link/pair-code').handler(fakeRequest('POST', {}), pair)
+  assert.equal(pair.statusCode, 403, '铸造凭据的路由必须失败关闭')
+  assert.match(pair.body, /connection service is unavailable/)
 })
 
 test('a fence that says yes (undefined) is a pass, not a missing service', async () => {
   // 回归：DSH 放行时返回 undefined。以前这条被当成"栅栏服务不存在"，
-  // 结果是浏览器带着正确凭据打开 `/mobile-link/qr` 永远 403。
+  // 结果是浏览器带着正确凭据打开配对页面永远 403。
   const { ctx, routes } = fakeContext({ fence: 'allow' })
   plugin.apply(ctx, BASE_CONFIG)
   await withMint(async () => ({ ...MINTED }), async () => {
-    const qr = fakeResponse()
-    await routes.get('/mobile-link/qr').handler(fakeRequest('GET', undefined, '/mobile-link/qr'), qr)
-    assert.equal(qr.statusCode, 200, '栅栏放行就必须放行')
-    assert.match(qr.body, /^<svg /)
-
     const pair = fakeResponse()
     await routes.get('/mobile-link/pair-code').handler(fakeRequest('POST', {}), pair)
-    assert.equal(pair.statusCode, 200, 'pair-code 同样必须能过')
+    assert.equal(pair.statusCode, 200, '栅栏放行就必须放行')
+    assert.match(JSON.parse(pair.body).svg, /^<svg /)
   })
 })

@@ -25,9 +25,9 @@ stored on the relay — it forwards frames and keeps daily byte counters.
 
 ## Pairing
 
-On the computer, open `/mobile-link/qr` in DSH (or the mobile-connection page) to show a QR code,
-then scan it in the app: **Scan QR code**. If you would rather type it, the same screen shows a
-pairing code.
+On the computer, click **移动端连接** at the bottom of the sidebar in DSH: the panel shows the QR
+code, the pairing code and how long it stays valid. Scan it in the app (**Scan QR code**); if the
+camera is unavailable, the same panel shows the code to type by hand.
 
 Once paired, the app lists that computer's sessions. It works the same way as the desktop client:
 open a session to read its transcript, type to continue it, and answer whenever the agent asks for

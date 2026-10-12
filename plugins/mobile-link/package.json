@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-mobile-link",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Put your PC's DeepSeek Harness in your pocket: dials a relay over WSS so the native iOS client reaches this machine even without a public IP.",
   "keywords": [
     "dsh",
@@ -30,6 +30,7 @@
   },
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./dlp": "./lib/dlp.js",
     "./link": "./lib/link.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
@@ -49,6 +50,9 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   }
 }

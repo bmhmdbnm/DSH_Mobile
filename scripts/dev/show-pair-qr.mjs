@@ -10,9 +10,8 @@
  *   node scripts/dev/show-pair-qr.mjs --no-open  # 只写文件，打印路径与码
  *   node scripts/dev/show-pair-qr.mjs --ttl 600000   # 自定义有效期（毫秒）
  *
- * 也可以不开脚本，直接在浏览器里打开 DSH 自己的这个路由（需已登录 DSH）：
- *   http://127.0.0.1:<port>/mobile-link/qr
- * 端口看宿主启动时打印的那一行，或状态里的 dsh.port。
+ * 也可以在 DSH 界面里直接看：侧栏底部的「移动端连接」入口点开就是二维码（spec 010）。
+ * 这个脚本走的是连接器的 CLI，不依赖界面，适合无 GUI 的环境或排障。
  */
 
 import { execFileSync } from 'node:child_process'

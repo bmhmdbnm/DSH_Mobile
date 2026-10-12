@@ -275,10 +275,10 @@ cat > "$STAGE_DIR/index.html" <<HTML
     <li>电脑上装连接器：<code>dsh plugin --profile web add dsh-plugin-mobile-link</code></li>
     <li>用邀请码把这台电脑登记到中转（邀请码与中转地址是发本链接给你的人一起给的）：
       <code>dsh-mobile-link enroll --invite &lt;邀请码&gt; --relay &lt;中转地址&gt;</code></li>
-    <li>重启 DSH，让连接器加载；然后在这台电脑的浏览器里打开二维码页：
-      <code>http://127.0.0.1:&lt;端口&gt;/mobile-link/qr</code>（端口启动时会打印，也在
+    <li>重启 DSH，让连接器加载；然后在 DSH 界面<strong>左下角点「移动端连接」</strong>，
+      小窗里就是配对二维码（连接器的带令牌地址也在
       <code>~/.dsh/mobile-link/endpoint.json</code> 里）。</li>
-    <li>手机 App 底部 <strong>扫码配对</strong> → 扫它。连上之后就能看到电脑上的会话。</li>
+    <li>手机 App 的 <strong>扫码配对</strong> → 扫它。连上之后就能看到电脑上的会话。</li>
   </ol>
 </div>
 <script>

@@ -1,5 +1,5 @@
 /**
- * The QR encoder behind `GET /mobile-link/qr`.
+ * The QR encoder behind the pairing panel (`POST /mobile-link/pair-code` 的 `svg`).
  *
  * The golden vectors are byte-for-byte matrices produced by `python-qrcode`
  * (error-correction level L, byte mode, pinned mask). Two independent decoders

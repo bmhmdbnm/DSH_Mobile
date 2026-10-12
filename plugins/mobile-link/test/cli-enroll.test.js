@@ -81,8 +81,9 @@ test('enroll ends with the two remaining steps, not just "登记完成"', async 
   assert.match(stdout, /接下来还有两步/)
   assert.match(stdout, /重启 DSH/)
   assert.match(stdout, /扫码配对/)
-  // And a way back to a fresh code if this one expires.
-  assert.match(stdout, /mobile-link\/qr/)
+  // And a way back to a fresh code if this one expires: the panel in the DSH
+  // client (spec 010), not a browser route any more.
+  assert.match(stdout, /移动端连接/)
   assert.match(stdout, /endpoint\.json/)
 })
 
@@ -108,6 +109,6 @@ test('a refused pairing code does not make a successful enroll look failed', asy
   const { stdout } = await enrollAgainst({ mintFails: true })
   assert.match(stdout, /这台电脑已登记/)
   assert.match(stdout, /这次没能预先申请配对码/)
-  assert.match(stdout, /mobile-link\/qr/)
+  assert.match(stdout, /移动端连接/)
   assert.doesNotMatch(stdout, /[▀▄█]/, '失败时不该画出半个二维码')
 })

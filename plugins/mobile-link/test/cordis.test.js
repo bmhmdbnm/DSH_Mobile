@@ -79,7 +79,7 @@ test('the plugin joins a real cordis tree and registers its routes', async (t) =
   root.provide('logger', logger)
 
   const fiber = await root.plugin({ name: pluginName, apply }, CONFIG)
-  assert.deepEqual([...routes.keys()].sort(), ['/mobile-link/pair-code', '/mobile-link/qr', '/mobile-link/status'])
+  assert.deepEqual([...routes.keys()].sort(), ['/mobile-link/pair-code', '/mobile-link/status'])
 
   const res = {
     statusCode: 200,

@@ -88,7 +88,8 @@ dsh plugin --profile web add ./plugins/mobile-link
    dsh-mobile-link --mint-pair-code        # prints JSON: code + relay + agentId
    ```
 
-   Or open `/mobile-link/qr` on the local DSH (behind DSH's own authentication).
+   Or open the **移动端连接** panel at the bottom of the sidebar in the DSH client
+   (spec 010) — same code, same QR, with the validity countdown.
 
 3. Scan it in the iOS app. After that the phone reconnects on its own — nothing
    else has to be run by hand.

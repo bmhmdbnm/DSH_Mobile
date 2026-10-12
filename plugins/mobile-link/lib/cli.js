@@ -100,22 +100,22 @@ async function main() {
     //
     // 反正人已经坐在终端前、手机就在手边，索性把配对码也申请出来、画成终端二维码：
     // 扫这一屏等于在 App 里填「中转服务器 + 配对码」，少一次开页面找端口的往返。
-    // 申请失败不算失败——登记本身已经成功，退回到"去二维码页取"的说法。
+    // 申请失败不算失败——登记本身已经成功，退回到"去界面里的连接入口取"的说法。
     process.stdout.write('这台电脑已登记。接下来还有两步：\n'
       + '  1. 重启 DSH，让连接器用上这个身份；\n'
-      + '  2. 手机 App 底部「扫码配对」扫下面的二维码（等同于点开二维码页取码）。\n')
+      + '  2. 手机 App 的「扫码配对」扫下面的二维码（与 DSH 界面左下角「移动端连接」里那张等价）。\n')
     try {
       const identity = await resolveIdentity({ stateFile: settled.stateFile })
       const minted = await mintPairCode({ identity, ttlMs: 10 * 60 * 1000 })
       const minutes = Math.round((minted.expiresAt - Date.now()) / 60000)
       process.stdout.write('\n' + qrTerminal(minted.qrPayload) + '\n')
       process.stdout.write(`配对码 ${minted.code}（约 ${minutes} 分钟有效，一次性）\n`)
-      process.stdout.write('也可以在这台电脑上打开 http://127.0.0.1:<DSH 端口>/mobile-link/qr 取新码；\n'
-        + '端口在 DSH 启动时打印；连接器还会把带令牌地址写进 ~/.dsh/mobile-link/endpoint.json。\n')
+      process.stdout.write('也可以在这台电脑上点 DSH 界面左下角的「移动端连接」取新码；\n'
+        + '连接器还会把带令牌地址写进 ~/.dsh/mobile-link/endpoint.json。\n')
     } catch (error) {
       process.stdout.write('（这次没能预先申请配对码：' + (error?.message ?? error) + '）\n'
-        + '重启 DSH 后，在这台电脑的浏览器里打开 http://127.0.0.1:<DSH 端口>/mobile-link/qr，'
-        + '用手机 App 的「扫码配对」扫它。\n')
+        + '重启 DSH 后，在这台电脑的 DSH 界面左下角点「移动端连接」，'
+        + '用手机 App 的「扫码配对」扫里面的二维码。\n')
     }
     return 0
   }
