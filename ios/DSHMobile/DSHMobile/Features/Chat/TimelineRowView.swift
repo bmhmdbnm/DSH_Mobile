@@ -218,9 +218,7 @@ private struct UserMessageRow: View {
                         Text(text)
                             .font(DSHTheme.Typography.body)
                             .foregroundStyle(DSHTheme.labelPrimary)
-                            // 不声明就地选字：这一行挂着长按菜单，长按先被 cell 接走，
-                            // 声明了也到不了手指，还会在轻点后留下灰色的"选中"底。
-                            // 选择入口是长按菜单里的「选择文本」（见 MessageActions）。
+                            .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -488,7 +486,7 @@ struct ToolCallRow: View {
                 Text(Self.prettyPrinted(invocation.arguments))
                     .font(DSHTheme.Typography.code)
                     .foregroundStyle(DSHTheme.labelSecondary)
-                    // 就地选字同上：这张卡片有长按菜单，选择走「选择文本」那一页。
+                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(DSHTheme.Spacing.tight)
                     .background(DSHTheme.codeBackground)
@@ -581,8 +579,7 @@ private struct ToolOutputView: View {
         .padding(DSHTheme.Spacing.tight)
         .background(DSHTheme.codeBackground)
         .clipShape(RoundedRectangle(cornerRadius: DSHTheme.Radius.medium, style: .continuous))
-        // 这里原先给整块开了 `.textSelection(.enabled)`；一并去掉：这张卡片有长按菜单，
-        // 就地选字到不了手指（见 MessageActions），留着只会留下灰色"选中"底。
+        .textSelection(.enabled)
     }
 
     /// Unwraps nested tool-result envelopes into a flat block list.
@@ -710,11 +707,8 @@ private struct DiffLine: View {
             .background(tone ?? .clear)
         // No per-line `textSelection` here. A tool result can be hundreds of
         // lines, and a selectable `Text` per line is enough layout work to
-        // stall the main thread while scrolling. The block above does not
-        // declare selection either (2026-10-12): this card's long press opens
-        // the menu, so in-place selection never reaches the finger and the
-        // declaration only left a grey "selected" band behind. Selection lives
-        // in the full-text page the menu opens.
+        // stall the main thread while scrolling. Selection is enabled once on
+        // the surrounding block instead.
     }
 }
 
