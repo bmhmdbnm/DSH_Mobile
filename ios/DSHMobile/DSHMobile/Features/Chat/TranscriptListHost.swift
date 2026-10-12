@@ -363,6 +363,13 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         collectionView.translatesAutoresizingMaskIntoConstraints = false
         collectionView.alwaysBounceVertical = true
         collectionView.delegate = self
+        // 转写行没有"选中"这个语义：`UICollectionView` 默认允许选中，而
+        // `UICollectionViewListCell` 的默认背景配置会在**按下与选中**两态给整行铺一层系统灰
+        // （实测色值 #D1D0D5，满宽、高度正好一个 item）。owner 两次截图指的就是它：
+        // 手指落在一条回答上，整块矩形变灰，而且松手后还留着。
+        // 三处一起关：不参与选中、不高亮、cell 背景配置清空（正常态也一并不画）。
+        // 长按菜单不受影响——`contextMenu` 走的是另一条手势，不经过 cell 的高亮。
+        collectionView.allowsSelection = false
         addSubview(collectionView)
         NSLayoutConstraint.activate([
             collectionView.topAnchor.constraint(equalTo: topAnchor),
@@ -374,6 +381,9 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         let registration = UICollectionView.CellRegistration<UICollectionViewListCell, String> {
             [weak self] cell, _, id in
             guard let self, let payload = self.rows.first(where: { $0.id == id }) else { return }
+            // 行自己画自己那块（工具卡片、气泡、代码块都有自己的底色）；cell 一律不画，
+            // 于是按下/选中都不会留下灰色底（见 setUp 里的说明）。
+            cell.backgroundConfiguration = .clear()
             if let item = payload.item {
                 cell.contentConfiguration = UIHostingConfiguration {
                     self.makeRow?(item) ?? AnyView(Color.clear)
@@ -396,6 +406,18 @@ final class TranscriptListHost: UIView, UICollectionViewDelegate {
         ) { view, indexPath, id in
             view.dequeueConfiguredReusableCell(using: registration, for: indexPath, item: id)
         }
+    }
+
+    // MARK: - UICollectionViewDelegate
+
+    /// 行不高亮。
+    ///
+    /// `allowsSelection = false` 只关掉"选中"，按下时的高亮是另一条路径：cell 的
+    /// `isHighlighted` 仍会置位，默认背景配置就会铺一层灰。转写行没有任何"我按住了"
+    /// 需要表达的语义，所以显式关掉；长按菜单（`contextMenu`）不经过它。
+    func collectionView(_ collectionView: UICollectionView,
+                        shouldHighlightItemAt indexPath: IndexPath) -> Bool {
+        false
     }
 
     // MARK: - 指令
