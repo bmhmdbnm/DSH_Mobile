@@ -122,12 +122,6 @@
     },
     {
       "rule": "unlocalized-binding",
-      "file": "ios/DSHMobile/DSHMobile/Features/Connection/ConnectionView.swift",
-      "reason": "连接管理页的文案出口，本轮只改了行内按钮的源文案（design 接口-A），其余不动",
-      "backlog": "i18n-backlog-app-connectionview"
-    },
-    {
-      "rule": "unlocalized-binding",
       "file": "ios/DSHMobile/DSHMobile/Features/Files/CodeHighlighting.swift",
       "reason": "代码高亮的语言名文案，不在本轮范围（G5 backlog）",
       "backlog": "i18n-backlog-app-codehighlighting"
