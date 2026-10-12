@@ -27,7 +27,7 @@
 | 组件 | 当前版本 | 分发方式 |
 |---|---|---|
 | iOS App | 1.0 | TestFlight 公开测试（[加入](https://testflight.apple.com/join/tHKQsbCk)）；需先安装 TestFlight，构建 90 天后过期 |
-| 连接器 `dsh-plugin-mobile-link` | 0.3.1 | npm |
+| 连接器 `dsh-plugin-mobile-link` | 0.6.0 | npm |
 | 中转（DLP v1） | 本仓库 `relay/` | 自行部署 |
 
 三者的版本组合与发布策略见 [`docs/VERSIONING.md`](docs/VERSIONING.md)。

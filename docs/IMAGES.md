@@ -112,7 +112,7 @@ skill 需要先被发现和加载。对于一个「用户就是要看到这张�
 **测试**：
 
 ```bash
-cd plugins/send-image && npm test   # 11 个用例
+cd plugins/send-image && npm test   # 47 个用例（2026-10-12 实测）
 ```
 
 ### Skill 形态（保留）
