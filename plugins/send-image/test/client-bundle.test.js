@@ -161,6 +161,10 @@ test('the button carries the same hover/focus treatment as the official composer
   assert.match(css, /\.dsh-send-image-button:hover:not\(:disabled\)\{[^}]*--dsw-alias-interactive-bg-hover/)
   assert.match(css, /\.dsh-send-image-button:focus-visible\{[^}]*--dsw-focus-ring-color/)
   assert.match(css, /\.dsh-send-image-button\{[^}]*--dsw-radius-sm/)
+  // 与官方「权限档位」触发器同色：拿 primary 会让这一个按钮成为整行最亮的一块。
+  assert.match(css, /\.dsh-send-image-button\{[^}]*--dsw-alias-label-secondary/,
+    '文字色必须是官方次要色，与旁边官方控件一致')
+  assert.match(css, /\.dsh-send-image-button:disabled\{[^}]*--dsw-alias-label-dimmed/)
   assert.doesNotMatch(css, /dsh-send-image-button[^}]*background:#/, '别写死颜色，跟随主题变量')
 })
 

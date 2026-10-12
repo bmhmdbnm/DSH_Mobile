@@ -64,13 +64,19 @@ const CSS = [
   'bottom:88px;max-width:min(560px,86vw);padding:10px 14px;border-radius:10px;',
   'background:rgba(32,32,36,.96);color:#fff;font-size:13px;line-height:1.5;',
   'box-shadow:0 8px 28px rgba(0,0,0,.28)}',
-  '.dsh-send-image-button{border-radius:var(--dsw-radius-sm,8px);min-height:28px;',
-  'color:var(--dsw-alias-label-primary,inherit);background:none;border:none;cursor:pointer;',
+  // 与输入区里官方那个「权限档位」触发器**逐条对齐**（`ui-permission-presets` 的 `.trigger`）：
+  // 圆角/高度/字号/字重/内距都一样，文字用 `--dsw-alias-label-secondary`（不是 primary——
+  // 用 primary 会让这一个按钮成为整行最亮的一块，与旁边的官方控件明显不是一套），`hover` 用
+  // 官方的 `--dsw-alias-interactive-bg-hover`，键盘聚焦用同一条 focus ring，禁用态用
+  // `--dsw-alias-label-dimmed`。用官方 CSS 变量而不是写死颜色，深浅色主题都跟着走；
+  // 变量缺失时有兜底值（插件是独立发布的，可能装在没有这些 token 的宿主上）。
+  '.dsh-send-image-button{border-radius:var(--dsw-radius-sm,8px);height:28px;',
+  'color:var(--dsw-alias-label-secondary,inherit);background:none;border:none;cursor:pointer;',
   'align-items:center;gap:4px;padding:0 8px;font:inherit;font-size:13px;font-weight:500;',
   'line-height:20px;display:inline-flex}',
   '.dsh-send-image-button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(15,17,21,.06))}',
   '.dsh-send-image-button:focus-visible{outline:none;box-shadow:0 0 0 2px var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4176e6))}',
-  '.dsh-send-image-button:disabled{color:var(--dsw-alias-label-quaternary,inherit);cursor:default}',
+  '.dsh-send-image-button:disabled{color:var(--dsw-alias-label-dimmed,inherit);cursor:default}',
 ].join('')
 
 /** 出问题时只写日志，绝不把异常抛出插件边界。 */
