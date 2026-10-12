@@ -1,6 +1,6 @@
 # 版本与部署策略
 
-> 面向：维护者与部署方 · 状态：stable · 最近核对：2026-09-20
+> 面向：维护者与部署方 · 状态：stable · 最近核对：2026-10-12
 >
 > 日期只表示最后一次人工过目，**内容是否仍然成立以本文件内的 `文件:行` 引用与
 > 第六节那几条命令为准**（见「六、本篇的结论怎么自己验」）。
@@ -41,7 +41,8 @@
 | 部署目标 | 代码来源 | 发布命令 | 生效方式 | 版本标识 |
 |---|---|---|---|---|
 | **iOS App** | `ios/DSHMobile/` | `./scripts/release/deploy-ota.sh` | 手机 Safari 装 OTA | `CFBundleVersion`（时间戳） |
-| **电脑端连接器 + 插件** | `plugins/` | `./scripts/install/install-plugin.sh` | **重启 DSH** | 无（见缺口 1） |
+| **电脑端连接器 + 插件（本机）** | `plugins/` | `./scripts/install/install-plugin.sh` | **重启 DSH** | 各自 `package.json` 的语义化版本，连接器把它当 `SERVER_VERSION` 回显给 App |
+| **电脑端连接器 + 插件（发给别人）** | npm 上的同名包 | `scripts/release/publish-plugins.sh --publish` | 对方 `dsh plugin add` | 同上；线上真值以 `npm view <name> version` 为准 |
 | **公网中转** | `relay/` | `relay/deploy/deploy.sh` | 服务重启 | `/healthz` 的 `version` |
 | skill | `skills/` | `./scripts/install/install-skills.sh` | 重启 DSH | 无 |
 
@@ -82,6 +83,8 @@
 4. 按需部署：
    - 只改了 App      → ./scripts/release/deploy-ota.sh
    - 改了连接器/插件 → ./scripts/install/install-plugin.sh 然后**重启 DSH**
+   - 要把插件发给别人 → 升各自 package.json 的版本，scripts/release/publish-plugins.sh --publish
+                        （发之前先 --staged 看 npm 的暂存队列，同名旧暂存会挡住发布）
    - 改了中转        → relay/deploy/deploy.sh
 5. 真机验证（手机端）
 6. 记一行三方版本（App / 连接器 / 中转协议），发布记录在部署方内部维护
