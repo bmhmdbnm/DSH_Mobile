@@ -4,6 +4,11 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。三处部署（App / 连接器 / 中转）的组合见
 [`docs/VERSIONING.md`](docs/VERSIONING.md)。
 
+## 豆包图片 0.2.0 — 2026-10-12
+
+- **默认保留「豆包AI生成」角标**：`stripWatermark` 的默认值从 true 改成 false，只有显式传 true 才去水印（0.1.1 的默认相反，升级后同一段调用拿到的图不一样）。命令行 `generate.mjs` 相应新增 `--strip-watermark`，不加就保留角标。
+- 只改注释与文案的部分：`dsh-install.mjs` 记下「第四份、也是唯一随包发布的那份锚点阶梯在 `plugins/mobile-link/lib/ws.js`」，`cordis.patch.yml` 不再点名 macOS 外壳（自研外壳已删除，只剩官方桌面版与命令行 web 版两个宿主）。运行时行为未变。
+
 ## 测试台与发布脚本 — 2026-10-12
 
 - **构建号与时间口径统一到北京时间**：构建号一直是 `yyyyMMdd.HHmm`，但用的是 UTC，而安装页那行「构建于」用本机时间、CHANGELOG 与提交信息又是本地日期——同一个发布在两处能差 8 小时，跨零点还差一天。现在构建号、安装页、`version.json` 同源，规则与用例在 `scripts/release/ota-version.mjs`。
