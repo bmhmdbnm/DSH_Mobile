@@ -95,7 +95,7 @@
 
 | 部件 | 编号方式 | 说明 |
 |---|---|---|
-| iOS App | `yyyyMMddHHmm`（UTC） | 由 `deploy-ota.sh` 自动打；单调递增，iOS 才肯装 |
+| iOS App | `yyyyMMdd.HHmm`（**北京时间**） | 由 `deploy-ota.sh` 自动打（规则与用例在 `scripts/release/ota-version.mjs`）：两段整数、都在 `CFBundleVersion` 上限内（早先那个 12 位时间戳越界，iOS 会静默不装，看起来像「必须先删掉旧 App」）；拿线上 `version.json` 的号当下界保证严格递增；安装页、`version.json`、CHANGELOG 与提交信息一律北京时间 |
 | 连接器 / 插件 | 语义化 `0.x.y` | 写在各自 `package.json`；连接器把它当 `SERVER_VERSION` 回显给 App（缺口 1 已解决）。线上真值以 `npm view <name> version` 为准 |
 | 中转 | 整数协议版本 + 部署时间 | `/healthz` 暴露协议版本 |
 

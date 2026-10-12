@@ -6,7 +6,8 @@
 # 之后在手机上打开安装链接点一下即可，不需要数据线，也不需要 Mac 与手机
 # 在同一个 Wi-Fi：安装包和清单都放在公网服务器上。
 #
-# 用法: ./scripts/release/deploy-ota.sh [--no-build] [--skip-profile]
+# 用法: ./scripts/release/deploy-ota.sh [--no-build] [--skip-profile] [--plan]
+#   --plan          只算这次的构建号（对着线上 version.json 校准）并打印，不归档不上传
 #   --no-build      复用已有的 .ipa，只重新上传（改安装页文案时用）
 #   --skip-profile  直接用 Xcode 里已装好的那张开发描述文件，不找 ASC 要新的。
 #                   ASC 侧协议到期/未签时（`REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED`）
@@ -47,8 +48,10 @@ OTA_PROFILE_NAME="${DSH_OTA_PROFILE:-DSH Mobile Development Push}"
 
 SKIP_BUILD=0
 SKIP_PROFILE=0
+PLAN_ONLY=0
 for arg in "$@"; do
   case "$arg" in
+    --plan) PLAN_ONLY=1 ;;
     --no-build) SKIP_BUILD=1 ;;
     --skip-profile) SKIP_PROFILE=1 ;;
     *) printf 'error: 未知参数 %s\n' "$arg" >&2; exit 2 ;;
@@ -60,23 +63,34 @@ die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 mkdir -p "$BUILD_DIR"
 
-# Stamp every publish with its own build number.
+# 构建号：**北京时间**的 `yyyyMMdd.HHmm`，并且严格大于线上已经发布的那个。
 #
-# Without this the build number stayed at 1 forever, so "which version is on the
-# phone?" could not be answered from the app, from the relay's device record, or
-# from the install page — and a stale install was indistinguishable from a fresh
-# one. A UTC timestamp fixes that permanently.
-#
-# The shape matters as much as the uniqueness. `CFBundleVersion` is defined as
-# 1–3 period-separated integers, each at most 4294967295, and the previous
-# 12-digit stamp (`202609161637`) blew past that ceiling. With it, iOS fetched
-# the manifest and probed the package — then installed nothing, silently, while
-# a *fresh* install of the very same build worked. An out-of-range build number
-# is the one thing in the chain that differs between "nothing installed yet" and
-# "something already installed", so the stamp is now `yyyyMMdd.HHmm`: in range,
-# still monotonic, still readable.
-BUILD_NUMBER="$(date -u +%Y%m%d).$(date -u +%H%M)"
-step "构建号 $BUILD_NUMBER"
+# 三件事都踩过坑，规则与用例在 `scripts/release/ota-version.mjs`：
+#   1. 形状与取值范围：`CFBundleVersion` 规定 1–3 段、每段 ≤ 4294967295。早先那个 12 位
+#      时间戳越界之后，iOS 会拉 manifest、探包，然后**静默不装**——只有删掉 App 才装得上。
+#   2. 时区：以前构建号是 UTC，安装页那行「构建于」是本机时间，同一个发布在两处差 8 小时、
+#      跨零点还差一天；CHANGELOG 与提交信息又都是本地日期。现在一律北京时间。
+#   3. 递增：iOS 只肯装比已装的更新的构建。同一分钟发两次、或用 `--no-build` 复用旧归档时，
+#      号不增就等于白发——用户点了安装没反应，看着像"非要先删掉旧 App"。所以这里拿线上
+#      `version.json` 的号当下界，不够就往前挪一分钟。
+NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
+[ -n "$NODE_BIN" ] || die "PATH 上找不到 node（生成构建号要用）"
+OTA_VERSION="$ROOT/scripts/release/ota-version.mjs"
+
+# 线上正在发的那个号。拿不到（首次发布、网络抖动、站点没起来）就当没有，不阻断发布。
+published_build() {
+  curl -fsS -m 10 "$PUBLIC_BASE/version.json" 2>/dev/null \
+    | "$NODE_BIN" "$OTA_VERSION" --read-published 2>/dev/null || true
+}
+
+PUBLISHED_BUILD="$(published_build)"
+BUILD_NUMBER="$("$NODE_BIN" "$OTA_VERSION" --published "$PUBLISHED_BUILD")"
+step "构建号 ${BUILD_NUMBER}（北京时间）· 线上 ${PUBLISHED_BUILD:-无}"
+
+if [ "$PLAN_ONLY" -eq 1 ]; then
+  echo "（--plan：只算号，不归档、不上传）"
+  exit 0
+fi
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
   # 推送描述文件先备好，再归档。
@@ -142,6 +156,12 @@ APP_PLIST="$ARCHIVE/Products/Applications/DSHMobile.app/Info.plist"
 SHORT_VERSION=$(plutil -extract CFBundleShortVersionString raw -o - "$APP_PLIST")
 BUILD_VERSION=$(plutil -extract CFBundleVersion raw -o - "$APP_PLIST")
 echo "版本 $SHORT_VERSION ($BUILD_VERSION)"
+
+# 真正决定"装得上装不上"的是归档里那个号（`--no-build` 时它来自旧归档，可能没变）。
+# 不大于线上就当场停下：发上去的结果是用户点了安装什么都不发生，而原因在服务器上看不出来。
+if [ -n "$PUBLISHED_BUILD" ] && ! "$NODE_BIN" "$OTA_VERSION" --compare "$BUILD_VERSION" "$PUBLISHED_BUILD"; then
+  die "这次要发的构建号 ${BUILD_VERSION} 不大于线上 ${PUBLISHED_BUILD}：iOS 只会静默不装（看起来像「必须先删掉旧 App」）。去掉 --no-build 重新归档，或先确认线上 version.json。"
+fi
 
 step "生成 manifest 与安装页"
 rm -rf "$STAGE_DIR"; mkdir -p "$STAGE_DIR"
@@ -256,7 +276,7 @@ cat > "$STAGE_DIR/index.html" <<HTML
 </style>
 <div class="card">
   <h1>${APP_NAME}</h1>
-  <div class="meta">版本 ${SHORT_VERSION} (${BUILD_VERSION})<br>构建于 $(date '+%Y-%m-%d %H:%M')</div>
+  <div class="meta">版本 ${SHORT_VERSION} (${BUILD_VERSION})<br>构建于 $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')（北京时间）</div>
   <a class="install" data-build="${BUILD_VERSION}" href="itms-services://?action=download-manifest&amp;url=${PUBLIC_BASE}/${MANIFEST_NAME}">安装 / 更新</a>
   <ol>
     <li>用 <strong>Safari</strong> 打开本页（微信、Chrome 内不支持直接安装）。</li>
@@ -317,7 +337,7 @@ cat > "$STAGE_DIR/version.json" <<JSON
 {
   "shortVersion": "${SHORT_VERSION}",
   "build": "${BUILD_VERSION}",
-  "publishedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "publishedAt": "$(TZ=Asia/Shanghai date +%Y-%m-%dT%H:%M:%S+08:00)",
   "installPage": "${PUBLIC_BASE}/"
 }
 JSON
