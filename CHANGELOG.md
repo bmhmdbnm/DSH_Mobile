@@ -14,6 +14,8 @@
 - **构建号与时间口径统一到北京时间**：构建号一直是 `yyyyMMdd.HHmm`，但用的是 UTC，而安装页那行「构建于」用本机时间、CHANGELOG 与提交信息又是本地日期——同一个发布在两处能差 8 小时，跨零点还差一天。现在构建号、安装页、`version.json` 同源，规则与用例在 `scripts/release/ota-version.mjs`。
 - **「删掉旧 App 才能装新版」在发布环节被拦下**：iOS 只肯装比已装的更新的构建，而以前同一分钟发两次、或用 `--no-build` 复用旧归档时，脚本照样把包传上去，用户点了安装什么都不发生（这跟更早那个 12 位构建号越界是同一类症状）。现在脚本拿线上 `version.json` 的号当下界：构建号不够新就自动往前挪；`--no-build` 复用出来的号不够新就当场报错停下（实测：本机归档与线上同号时脚本拒绝上传并说明原因）。
 - 新增 `--plan`：只算这次的构建号（对着线上校准）并打印，不归档、不上传，发版前先看一眼用哪个号。
+- **发布脚本认识 npm 的「暂存发布」（staged publishing）**：npm 现在会先把版本放进待批准队列，同名版本没被批准也没被删掉之前，再发就回 409 `Cannot publish over previously staged version`——而队列里那条可能是几天前留下的旧包。2026-10-12 发 send-image 0.2.0 时就卡在这里：队列里躺着 10-07 那条同名记录，`npm publish` 一路跑到最后才回 409。现在 `scripts/release/publish-plugins.sh` 在发布前先查 registry 的 `/-/stage`，有同名记录就当场停下并打出 stage-id 与两种删法；新增 `--staged` 只列队列。
+- **插件发布的凭据口径改成「网页认证」**：账号的 2FA 是 security key，没有 6 位码可填。`npm publish` 会打印一条 `https://www.npmjs.com/auth/cli/<uuid>`，CLI 轮询 registry 的 `doneUrl` 拿凭据，所以那条链接换到手机浏览器确认也能发布（不要求在本机浏览器里点）。这一点写进了脚本头部与 `AGENTS.md` 的凭据表——之前那里写的是「token 失效，`npm login` 之后就好了」，与实际不符。
 
 ## 连接器 0.6.0 — 2026-10-12
 
