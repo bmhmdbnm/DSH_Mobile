@@ -70,6 +70,13 @@ test/fixtures/media/
 # specs/006-verify-lanes/contracts/verdict.schema.json。
 .lanes/
 
+# 架构快照（docs/arch/）的生成产物：`npm run arch` 每次覆盖，逐版归档也只是过程记录。
+# 手写的那部分照常入库：README.md（怎么用）与 flows/*.json（流程定义由人维护）。
+docs/arch/index.html
+docs/arch/latest.json
+docs/arch/deep.json
+docs/arch/v*/
+
 # 密钥与私钥文件：任何目录都不入库（含 sidecars/ 下 llm-key-router 的 keys*.txt）
 # 注意：不要用 credentials* / *secret* 这类宽泛模式——
 # docs/artifacts/samples/credentials_describe.json 是入库样本，会被误伤。

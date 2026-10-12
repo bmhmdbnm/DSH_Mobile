@@ -13,6 +13,9 @@
  *   docs/arch/vNNN/graph.json   该版本的原始扫描结果
  *   docs/arch/vNNN/diff.json    与上一版的差异
  *
+ * 深查询（真实调用关系）来自 `npm run arch:deep` 写下的 docs/arch/deep.json；
+ * 本命令只读缓存，所以快路径不依赖 sourcekit-lsp。
+ *
  * 只读扫描、零新增依赖；工具自身出错才返回非零。
  */
 
@@ -21,9 +24,12 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { buildGraph, ROOT } from './scan.mjs'
+import { loadFlows } from './flows.mjs'
+import { loadCache, markStale } from './deep.mjs'
 import { renderPage } from './render.mjs'
 
 const ARCH_DIR = join(ROOT, 'docs/arch')
+const CLIENT_SRC = join(ROOT, 'scripts/arch/client.js')
 const argv = process.argv.slice(2)
 const has = (name) => argv.includes(`--${name}`)
 const valueOf = (name) => {
@@ -76,8 +82,84 @@ function computeDiff(previous, graph, previousVersion) {
   }
 }
 
+/** 落盘：归档副本 + 稳定入口 + 原始数据。 */
+function writeVersion({ graph, version, allVersions, diff }) {
+  const versionDir = join(ARCH_DIR, version)
+  mkdirSync(versionDir, { recursive: true })
+  // graph.json 是逐版对比用的，不放深查询明细（明细在 docs/arch/deep.json）
+  const { deep, ...archived } = graph
+
+  // 归档副本：路径多一层，版本下拉要回到上级目录；交互脚本随版本一起冻结
+  writeFileSync(join(versionDir, 'client.js'), readFileSync(CLIENT_SRC, 'utf8'))
+  writeFileSync(join(versionDir, 'index.html'), renderPage({
+    graph, versions: allVersions, current: version, diff, linkPrefix: '../', assetPrefix: './',
+  }))
+  writeFileSync(join(versionDir, 'graph.json'), `${JSON.stringify(archived, null, 2)}\n`)
+  if (diff) writeFileSync(join(versionDir, 'diff.json'), `${JSON.stringify(diff, null, 2)}\n`)
+
+  // 稳定入口：始终是最新一版，浏览器停在这里刷新即可；脚本指到该版本目录，避免重复拷贝
+  writeFileSync(join(ARCH_DIR, 'index.html'), renderPage({
+    graph, versions: allVersions, current: version, diff, linkPrefix: './', assetPrefix: `./${version}/`,
+  }))
+  writeFileSync(join(ARCH_DIR, 'latest.json'),
+    `${JSON.stringify({ version, generatedAt: graph.meta.generatedAt, commit: graph.meta.commit }, null, 2)}\n`)
+}
+
+/** 终端汇总：只讲变了什么、哪里要人看。 */
+function report(graph, version, diff) {
+  console.log(`已生成 ${version}：${graph.meta.groupCount} 模块 / ${graph.meta.edgeCount} 边 / ${graph.meta.cycleCount} 处循环`)
+  if (diff) {
+    console.log(`与 ${diff.previous} 相比：新增边 ${diff.addedEdges.length}，消失边 ${diff.removedEdges.length}，模块增删 ${diff.addedNodes.length}/${diff.removedNodes.length}`)
+  } else {
+    console.log('这是第一版，没有可对比的上一版')
+  }
+  if (graph.flows.length) {
+    const broken = graph.meta.flowBrokenCount
+    console.log(`流程 ${graph.flows.length} 条${broken ? `，其中 ${broken} 处符号校验失败（页面会标红）` : '，符号校验全部通过'}`)
+  }
+  if (graph.meta.deepCallCount) {
+    console.log(`深查询缓存：${graph.meta.deepCallCount} 条真实调用${graph.meta.deepStaleCount ? `，其中 ${graph.meta.deepStaleCount} 条目标符号已改名（页面会标出）` : ''}`)
+  }
+  if (graph.meta.droppedEdges?.length) {
+    console.log(`已丢弃结构性不可能的边：${graph.meta.droppedEdges.join('、')}`)
+  }
+  console.log(`打开：${join(ARCH_DIR, 'index.html')}`)
+}
+
+/**
+ * 附上深查询结果。缓存里的目标符号可能已被改名，这里用当前声明清单核对，
+ * 核对不上的边标 stale，页面会提示而不是装作有效。
+ */
+function attachDeep(graph) {
+  const cache = loadCache()
+  const ids = Object.keys(cache.files || {})
+  if (!ids.length) return
+  const deep = { generatedAt: cache.generatedAt, files: {} }
+  let calls = 0
+  let stale = 0
+  let system = 0
+  for (const id of ids) {
+    const entry = markStale(cache.files[id], graph.declarations)
+    // 页面只放跨文件调用：同文件内的调用对架构判断没用，放进页面只是把 HTML 撑大
+    const crossFile = entry.calls.filter((call) => call.toFile !== id)
+    deep.files[id] = { calls: crossFile }
+    calls += crossFile.length
+    stale += crossFile.filter((call) => call.stale).length
+    system += entry.systemCalls || 0
+  }
+  graph.deep = deep
+  graph.meta.deepGeneratedAt = cache.generatedAt
+  graph.meta.deepCallCount = calls
+  graph.meta.deepStaleCount = stale
+  graph.meta.deepSystemCallCount = system
+}
+
 function main() {
   const graph = buildGraph()
+  graph.flows = loadFlows(graph.declarations)
+  graph.meta.flowCount = graph.flows.length
+  graph.meta.flowBrokenCount = graph.flows.reduce((sum, flow) => sum + flow.steps.filter((step) => !step.ok).length, 0)
+  attachDeep(graph)
   const versions = existingVersions()
 
   if (has('json')) {
@@ -97,31 +179,8 @@ function main() {
   if (valueOf('note')) graph.meta.note = valueOf('note')
 
   const allVersions = [...new Set([...versions, version])].sort()
-  const versionDir = join(ARCH_DIR, version)
-  mkdirSync(versionDir, { recursive: true })
+  writeVersion({ graph, version, allVersions, diff })
+  report(graph, version, diff)
 
-  // 归档副本：路径多一层，版本下拉要回到上级目录
-  writeFileSync(join(versionDir, 'index.html'), renderPage({
-    graph, versions: allVersions, current: version, diff, linkPrefix: '../',
-  }))
-  writeFileSync(join(versionDir, 'graph.json'), `${JSON.stringify(graph, null, 2)}\n`)
-  if (diff) writeFileSync(join(versionDir, 'diff.json'), `${JSON.stringify(diff, null, 2)}\n`)
-
-  // 稳定入口：始终是最新一版，浏览器停在这里刷新即可
-  writeFileSync(join(ARCH_DIR, 'index.html'), renderPage({
-    graph, versions: allVersions, current: version, diff, linkPrefix: './',
-  }))
-  writeFileSync(join(ARCH_DIR, 'latest.json'), `${JSON.stringify({ version, generatedAt: graph.meta.generatedAt, commit: graph.meta.commit }, null, 2)}\n`)
-
-  const added = diff ? diff.addedEdges.length : 0
-  const removed = diff ? diff.removedEdges.length : 0
-  console.log(`已生成 ${version}：${graph.meta.groupCount} 模块 / ${graph.meta.edgeCount} 边 / ${graph.meta.cycleCount} 处循环`)
-  if (diff) console.log(`与 ${diff.previous} 相比：新增边 ${added}，消失边 ${removed}，模块增删 ${diff.addedNodes.length}/${diff.removedNodes.length}`)
-  else console.log('这是第一版，没有可对比的上一版')
-  console.log(`打开：${join(ARCH_DIR, 'index.html')}`)
-  if (graph.meta.droppedEdges?.length) {
-    console.log(`已丢弃结构性不可能的边：${graph.meta.droppedEdges.join('、')}`)
-  }
 }
-
 main()

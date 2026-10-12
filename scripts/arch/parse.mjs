@@ -104,6 +104,55 @@ export function parseSwift(abs) {
   }
 }
 
+/** 继承/协议实现子句：逗号分隔，去掉泛型参数与 `@unchecked` 这类修饰。 */
+function parseInheritance(clause) {
+  return (clause ?? '')
+    .split(',')
+    .map((part) => part.trim().replace(/^@\w+\s+/, '').split('<')[0].split('(')[0].trim())
+    .filter((name) => /^[A-Z][A-Za-z0-9_]*$/.test(name))
+}
+
+/**
+ * Swift 声明清单：类型（含继承/协议实现）与函数，都带行号。
+ * 供页面从"文件"再下钻一层到"声明"。
+ */
+export function parseSwiftDeclarations(abs) {
+  const lines = readFileSync(abs, 'utf8').split('\n')
+  const types = []
+  const funcs = []
+  const modifiers = '(?:(?:public|internal|private|fileprivate|final|open|indirect|static|class|override|mutating|nonisolated|@\\w+(?:\\([^)]*\\))?)\\s+)*'
+  const typeRe = new RegExp(`^\\s*${modifiers}(struct|class|enum|actor|protocol|typealias)\\s+([A-Za-z_]\\w*)([^{=\\n]*)`)
+  const extRe = new RegExp(`^\\s*${modifiers}extension\\s+([A-Za-z_][\\w.]*)\\s*([^{=\\n]*)`)
+  const funcRe = new RegExp(`^\\s*${modifiers}func\\s+([A-Za-z_]\\w*)`)
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]
+    const match = typeRe.exec(line)
+    if (match) {
+      types.push({ name: match[2], kind: match[1], line: i + 1, inherits: parseInheritance(match[3].match(/:\s*([^=]+)/)?.[1]) })
+      continue
+    }
+    const extension = extRe.exec(line)
+    if (extension) {
+      types.push({ name: extension[1], kind: 'extension', line: i + 1, inherits: parseInheritance(extension[2].match(/:\s*([^=]+)/)?.[1]) })
+      continue
+    }
+    const func = funcRe.exec(line)
+    if (func) funcs.push({ name: func[1], line: i + 1 })
+  }
+  return { types, funcs }
+}
+
+/**
+ * 文件里"像类型"的候选名字。
+ * 先按词扫描出首字母大写的标识符，再用 swiftUsesType 逐个确认。
+ * 直接拿全仓类型索引去 regex 每个文件，在文件级会慢到不能用——这一步是必须的。
+ */
+export function swiftCandidateNames(code) {
+  const names = new Set()
+  for (const match of code.matchAll(/\b([A-Z][A-Za-z0-9_]{3,})\b/g)) names.add(match[1])
+  return names
+}
+
 /** JS：取 import / require 的裸说明符。 */
 export function parseJs(abs) {
   const text = readFileSync(abs, 'utf8')

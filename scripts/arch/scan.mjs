@@ -17,6 +17,7 @@
 import { existsSync } from 'node:fs'
 import { extname, join } from 'node:path'
 
+import { buildFileLayer } from './files.mjs'
 import {
   ROOT, walk, dirsIn, rel, countLines, parseSwift, parseJs, parsePy,
   swiftUsesType, swiftShadowsName, SWIFT_TYPE_STOPLIST, swiftPackageTargets,
@@ -24,6 +25,50 @@ import {
 } from './parse.mjs'
 
 export { ROOT }
+
+/**
+ * 部署角色：模块图按这个分带，而不是按语言。
+ * 语言（Swift / JS / Python）是实现细节，看架构时要先能分清
+ * 「手机侧 / 中转 / 电脑侧 DSH / 仓库自身工具」这四块。
+ */
+const BANDS = [
+  {
+    id: 'ios',
+    label: 'iOS 侧（iPhone App）',
+    match: (id) => id.startsWith('ios/'),
+    sections: [
+      { id: 'ios-shell', label: 'App 壳与入口', match: (id) => id === 'ios/app/App' },
+      { id: 'ios-features', label: 'Features（页面模块）', match: (id) => id.startsWith('ios/app/Features/') },
+      { id: 'ios-support', label: '基础支撑（Support）', match: (id) => id === 'ios/app/Support' },
+      { id: 'ios-design', label: '设计系统（Design）', match: (id) => id === 'ios/app/Design' },
+      { id: 'ios-protocol', label: '协议与数据层（DSHKit）', match: (id) => id === 'ios/kit/DSHKit' },
+      { id: 'ios-relaykit', label: '中转客户端（RelayKit）', match: (id) => id === 'ios/kit/RelayKit' },
+    ],
+  },
+  { id: 'relay', label: '中转（公网主机）', match: (id) => id === 'relay', sections: [] },
+  {
+    id: 'dsh',
+    label: '电脑侧 DSH',
+    match: (id) => id.startsWith('plugin/') || id.startsWith('skill/') || id.startsWith('sidecar/'),
+    sections: [
+      { id: 'connector', label: '连接器', match: (id) => id === 'plugin/mobile-link' },
+      { id: 'plugin', label: '其它插件', match: (id) => id.startsWith('plugin/') },
+      { id: 'skill', label: '技能', match: (id) => id.startsWith('skill/') },
+      { id: 'sidecar', label: 'sidecar 服务（独立进程）', match: (id) => id.startsWith('sidecar/') },
+    ],
+  },
+  { id: 'repo', label: '仓库工程（不进产品链路）', match: () => true, sections: [] },
+]
+
+/** 一个模块属于哪个大带、带内哪个子块；子块匹配不上时归到带本身。 */
+function bandOf(groupId) {
+  const band = BANDS.find((item) => item.match(groupId))
+  if (!band) return { band: 'repo', section: 'repo', role: 'repo' }
+  const section = band.sections.find((item) => item.match(groupId))
+  // role 就是子块 id：页面按它上色、标短标签，同一大带里的不同子块要有区别
+  const role = section ? section.id : band.id
+  return { band: band.id, section: role, role }
+}
 
 /** 定义分组：每个分组是一个人能叫出名字的架构单元。 */
 function defineGroups() {
@@ -139,6 +184,7 @@ function collectNodes(groups, nodes) {
     }
     nodes.set(group.id, {
       id: group.id,
+      ...bandOf(group.id),
       layer: group.layer,
       dir: group.dir,
       note: group.note ?? '',
@@ -149,8 +195,25 @@ function collectNodes(groups, nodes) {
       pyModules: [...pyModules].sort(),
     })
   }
-  // 空目录（只有 markdown 之类的）不构成架构单元
-  for (const [id, node] of [...nodes]) if (node.files === 0) nodes.delete(id)
+  // 空目录（只有 SKILL.md / README 之类的）没有代码可连，不进图，但要如实记下来，
+  // 否则"技能是不是漏了"这种问题只能靠人猜。
+  const empty = []
+  for (const [id, node] of [...nodes]) {
+    if (node.files === 0) { empty.push(id); nodes.delete(id) }
+  }
+  return empty
+}
+
+function dropEmpty(groups, nodes) {
+  for (let i = groups.length - 1; i >= 0; i -= 1) if (!nodes.has(groups[i].id)) groups.splice(i, 1)
+}
+
+/**
+ * 空目录（只有 markdown 之类的）不构成架构单元
+ * @deprecated 见 collectNodes 返回值
+ */
+function unusedLegacy() {
+  for (const [, node] of []) void node
   for (let i = groups.length - 1; i >= 0; i -= 1) if (!nodes.has(groups[i].id)) groups.splice(i, 1)
 }
 
@@ -257,7 +320,7 @@ function dropImpossible(edges, nodes) {
   return dropped
 }
 
-function finalize(nodes, edges, externals, spm, dropped) {
+function finalize(nodes, edges, externals, spm, dropped, fileLayer, emptyGroups) {
   const edgeList = edges.values()
     .map((edge) => ({ ...edge, samples: [...edge.samples].slice(0, 4) }))
     .sort((a, b) => (a.from === b.from ? a.to.localeCompare(b.to) : a.from.localeCompare(b.from)))
@@ -289,11 +352,21 @@ function finalize(nodes, edges, externals, spm, dropped) {
       droppedEdges: dropped,
       fileCount: nodeList.reduce((sum, node) => sum + node.files, 0),
       lineCount: nodeList.reduce((sum, node) => sum + node.lines, 0),
+      fileEdgeCount: Object.values(fileLayer.byGroup).reduce((sum, group) => sum + group.edges.length, 0),
+      declarationCount: Object.values(fileLayer.declarations).reduce((sum, file) => sum + file.types.length, 0),
+      emptyGroups,
+      bands: BANDS.map((band) => ({
+        id: band.id,
+        label: band.label,
+        sections: band.sections.map((section) => ({ id: section.id, label: section.label })),
+      })),
     },
     nodes: nodeList,
     edges: edgeList.map((edge) => ({ ...edge, cyclic: cycleEdges.has(`${edge.from}->${edge.to}`) })),
     cycles: cycles.map((component) => ({ members: component, size: component.length })).sort((a, b) => b.size - a.size),
     externals: externalList.slice(0, 60),
+    files: fileLayer.byGroup,
+    declarations: fileLayer.declarations,
   }
 }
 
@@ -306,15 +379,17 @@ export function buildGraph() {
   const edges = new EdgeBag()
   const spm = swiftPackageTargets()
 
-  collectNodes(groups, nodes)
+  const emptyGroups = collectNodes(groups, nodes)
+  dropEmpty(groups, nodes)
   addSwiftImportEdges(groups, nodes, edges, externals)
   addHeuristicEdges(groups, edges, typeIndex)
   addSpmEdges(nodes, edges, spm)
   addJsEdges(groups, edges, externals)
   addPyEdges(groups, edges, nodes, externals)
   const dropped = dropImpossible(edges, nodes)
+  const fileLayer = buildFileLayer(groups)
 
-  return finalize(nodes, edges, externals, spm, dropped)
+  return finalize(nodes, edges, externals, spm, dropped, fileLayer, emptyGroups)
 }
 
 if (process.argv[1] && process.argv[1].endsWith('scan.mjs')) {
