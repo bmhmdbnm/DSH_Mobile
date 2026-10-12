@@ -771,6 +771,23 @@ final class Engine: XCTestCase {
             + "webViews=\(app.webViews.count)"]
         lines.append("命中「已配对的设备」=\(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "已配对")).count)"
             + " 「关于」=\(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "关于")).count)")
+        // 选中的单元格数。
+        //
+        // 转写页那层整行灰底就是 `UICollectionViewListCell` 的选中态（2026-10-12 的 012：
+        // 点一条回答，整块矩形变灰，松手还留着）。这个数是"有没有那个无意义选中态"的
+        // 可断言证据：期望恒为 0。做成探针而不断言，是因为出问题时它同时要能被人读出来。
+        var selectedCells = 0
+        var seenCells = 0
+        for container in [app.collectionViews, app.tables] {
+            for section in 0..<min(container.count, 8) {
+                let cells = container.element(boundBy: section).cells
+                for index in 0..<min(cells.count, 200) {
+                    seenCells += 1
+                    if cells.element(boundBy: index).isSelected { selectedCells += 1 }
+                }
+            }
+        }
+        lines.append("选中单元格=\(selectedCells)/\(seenCells)")
         for kind in [XCUIElement.ElementType.scrollView, .table, .collectionView, .other] {
             let query = app.descendants(matching: kind)
             for index in 0..<min(query.count, 3) {
